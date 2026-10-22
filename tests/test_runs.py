@@ -468,6 +468,25 @@ class RunFailureTests(TaskRunTestCase):
         self.assertEqual(self.task_status(), "FAILED")
         self.assertFalse(self.worktree().exists())
 
+    def test_retry_refuses_when_the_base_branch_was_removed(self):
+        self.make_task()
+        self.env["ACTL_FAKE_RUN_EXIT"] = "1"
+        self.assertNotEqual(self.run_task("t1").returncode, 0)
+        before = self.rev("actl/t1")
+        self.assertEqual(len(self.worker_calls()), 1)
+
+        # The base disappears between attempts: the retry must fail before
+        # launching another worker, not after the run.
+        self.git("checkout", "-b", "feature")
+        self.git("branch", "-D", "main")
+        self.env["ACTL_FAKE_RUN_EXIT"] = "0"
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("'main' does not exist", result.stderr)
+        self.assertEqual(len(self.worker_calls()), 1, "no worker may be launched")
+        self.assertEqual(self.rev("actl/t1"), before)
+        self.assertEqual(self.task_status(), "FAILED")
+
     def test_invalid_base_branch_in_metadata_is_rejected(self):
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         metadata["base_branch"] = "main^"

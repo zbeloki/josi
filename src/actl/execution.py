@@ -87,7 +87,12 @@ def ensure_worktree(
     execution. An explicit retry reuses the registered worktree as-is - never
     resetting, cleaning, or checking out anything - and re-attaches an
     existing branch when the worktree directory was removed.
+
+    The base branch is validated before any worktree is created or reused, so
+    a retry fails before the worker starts when the base was deleted since
+    the previous attempt.
     """
+    _require_base(root, base_branch)
     branch = branch_name(task.id)
     path = actl_dir / WORKTREES_DIR / ("t" + str(task.id))
     registered = _registered_worktrees(root)
@@ -120,7 +125,6 @@ def ensure_worktree(
             )
         _git(root, "worktree", "add", str(path), branch)
         return Worktree(branch=branch, path=path, created=True)
-    _require_base(root, base_branch)
     _git(
         root, "worktree", "add", "-b", branch, str(path),
         "refs/heads/" + base_branch,
@@ -129,9 +133,14 @@ def ensure_worktree(
 
 
 def repo_has_commits(root: Path) -> bool:
-    """Return whether the repository's ``HEAD`` has at least one commit."""
-    proc = _git(root, "rev-parse", "--verify", "--quiet", "HEAD", check=False)
-    return proc.returncode == 0
+    """Return whether the repository contains at least one commit.
+
+    ``HEAD`` alone is not enough: after ``git checkout --orphan`` it is
+    unborn even though other branches still hold commits. The repository is
+    only treated as empty when nothing reachable has ever been committed.
+    """
+    proc = _git(root, "rev-list", "--all", "--max-count=1", check=False)
+    return bool(proc.stdout.strip())
 
 
 def unborn_branch(root: Path):
@@ -147,11 +156,21 @@ def unborn_branch(root: Path):
 
 
 def local_branches(root: Path) -> list:
-    """Return every local branch name, sorted."""
+    """Return every local branch name, sorted.
+
+    Full ref names are used and the ``refs/heads/`` prefix is stripped in
+    Python: the short form would pick an unambiguous abbreviation such as
+    ``heads/main`` when a tag shadows the branch name.
+    """
     output = _git(
-        root, "for-each-ref", "--format=%(refname:short)", "refs/heads/"
+        root, "for-each-ref", "--format=%(refname)", "refs/heads/"
     ).stdout
-    return [line for line in output.splitlines() if line]
+    prefix = "refs/heads/"
+    return [
+        line[len(prefix):]
+        for line in output.splitlines()
+        if line.startswith(prefix)
+    ]
 
 
 def branch_exists(root: Path, branch: str) -> bool:

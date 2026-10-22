@@ -94,6 +94,25 @@ class BaseBranchInitTests(ActlTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.metadata()["base_branch"], "topic")
 
+    def test_init_ignores_an_unborn_checkout_when_branches_exist(self):
+        # A repository is only empty when nothing was ever committed; an
+        # orphan checkout must not hide the existing branches.
+        self.start_repo("main")
+        self.git("checkout", "-q", "--orphan", "scratch")
+        result = self.run_actl("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.metadata()["base_branch"], "main")
+
+    def test_init_ignores_a_tag_that_shadows_a_branch_name(self):
+        # The listed names must be real branch names, not unambiguous
+        # abbreviations such as "heads/main".
+        self.start_repo("master")
+        self.git("branch", "main")
+        self.git("tag", "main")
+        result = self.run_actl("init", input_text="1\n")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.metadata()["base_branch"], "main")
+
     def test_init_prompts_when_main_and_master_are_ambiguous(self):
         self.start_repo("master")
         self.git("branch", "main")
@@ -138,6 +157,16 @@ class BaseBranchInitTests(ActlTestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("does not exist", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(self.metadata_path().exists())
+
+    def test_explicit_base_must_exist_in_an_unborn_checkout(self):
+        # An orphan checkout in a non-empty repository is not an empty
+        # repository, so --base must still name an existing branch.
+        self.start_repo("main")
+        self.git("checkout", "-q", "--orphan", "scratch")
+        result = self.run_actl("init", "--base", "missing")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("does not exist", result.stderr)
         self.assertFalse(self.metadata_path().exists())
 
     def test_explicit_base_rejects_invalid_branch_names(self):

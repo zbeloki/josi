@@ -35,6 +35,7 @@ from pathlib import Path
 LOCK_NAME = "execution.lock"
 WORKTREES_DIR = "worktrees"
 REVIEW_DIR = "review"
+BASE_DIR = "base"
 RUNS_DIR = "runs"
 DEFAULT_BASE_CANDIDATES = ("main", "master")
 
@@ -94,6 +95,10 @@ def ensure_worktree(
     resetting, cleaning, or checking out anything - and re-attaches an
     existing branch when the worktree directory was removed.
 
+    Creating the branch also records the commit it was created from (see
+    :func:`record_branch_base`), so the cumulative review diff keeps the
+    original base even if the project's base branch is reconfigured later.
+
     The base branch is validated before any worktree is created or reused, so
     a retry fails before the worker starts when the base was deleted since
     the previous attempt.
@@ -135,6 +140,7 @@ def ensure_worktree(
         root, "worktree", "add", "-b", branch, str(path),
         "refs/heads/" + base_branch,
     )
+    record_branch_base(actl_dir, task.id, ref_commit(root, "refs/heads/" + branch))
     return Worktree(branch=branch, path=path, created=True)
 
 
@@ -317,6 +323,33 @@ def commit_diff(cwd: Path, base_commit: str, commit: str) -> str:
 def add_review_worktree(root: Path, path: Path, commit: str) -> None:
     """Create a detached temporary worktree at ``commit`` for the reviewer."""
     _git(root, "worktree", "add", "--detach", str(path), commit)
+
+
+def record_branch_base(actl_dir: Path, task_id: int, commit: str) -> None:
+    """Record the commit a task branch was created from."""
+    path = actl_dir / BASE_DIR / ("t" + str(task_id))
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(commit + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise ExecutionError(
+            "cannot record the branch base " + str(path) + " (" + str(exc) + ")"
+        )
+
+
+def branch_base(actl_dir: Path, task_id: int):
+    """Return the recorded branch-creation commit, or None.
+
+    Branches created before actl recorded this (Stage 4 projects) have no
+    record; the caller falls back to the merge base with the configured base
+    branch.
+    """
+    path = actl_dir / BASE_DIR / ("t" + str(task_id))
+    try:
+        commit = path.read_text(encoding="utf-8").strip()
+    except (OSError, UnicodeDecodeError):
+        return None
+    return commit or None
 
 
 def remove_review_worktree(root: Path, path: Path) -> str:

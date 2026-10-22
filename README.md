@@ -252,6 +252,10 @@ Validation commands are project configuration in `.actl/project.json`:
   shell), and stop at the first non-zero exit.
 - Output, exit codes, and the overall result are recorded in the validation
   log; a failed command fails the task (`FAILED`) and no reviewer starts.
+- After every successful command, actl immediately re-checks the recorded
+  commit and the tracked files. A command that modifies tracked files or
+  moves `HEAD` fails the task right there, so a later command cannot validate
+  the modified state and restore the original before a final check.
 - A malformed `validation` configuration is an error rather than a silent
   skip; a missing configuration (or an empty list) skips validation and
   reports that clearly before review proceeds.
@@ -262,10 +266,16 @@ Validation and review refer to one exact commit:
 - The task worktree must be clean (no uncommitted tracked changes) and on its
   task branch.
 - If validation modifies tracked files or moves `HEAD`, the task fails
-  instead of being approved.
+  immediately instead of being approved.
 - Before any verdict is recorded, the task branch must still point at the
   validated commit; if it moved, the run stops and the task fails. actl never
   repairs or resets the branch.
+
+The commit a task branch was created from is recorded in `.actl/base/t1` when
+the branch is created, so the review diff always starts at the original base
+even if the project's base branch is reconfigured later. Branches created
+before this record existed (Stage 4 projects) fall back to the merge base
+with the configured base branch.
 
 After validation passes, the reviewer runs in a temporary detached worktree
 under `.actl/review/t1-<timestamp>` created at the validated commit, never in
@@ -279,9 +289,11 @@ opencode run --agent plan --model REVIEWER_MODEL --session ID --format json "<pr
 The reviewer receives the task title and description (requirements and
 acceptance criteria), the cumulative diff of the task branch against the
 commit it was created from, the validation results, and the review policy. It
-can inspect the whole checkout for context. Its temporary worktree is removed
-afterwards on every path, so nothing it does can reach the task worktree or
-the task branch.
+can inspect the whole checkout for context. Before its verdict is accepted,
+the reviewer's checkout must still point at the validated commit with
+unchanged tracked files (untracked scratch files are fine); otherwise the
+review fails. Its temporary worktree is removed afterwards on every path, so
+nothing it does can reach the task worktree or the task branch.
 
 The reviewer must answer with one JSON verdict:
 
@@ -304,13 +316,17 @@ The reviewer must answer with one JSON verdict:
 }
 ```
 
-The verdict is parsed strictly. Malformed output, unknown decisions or
-severities, an approval that carries a critical or major finding, and a
-`changes_requested` verdict without a blocking finding are all invalid: the
-task becomes `FAILED` and nothing is recorded as an approval. Every critical
-or major finding must include a scenario, impact, and location. Valid
-verdicts are stored in `.actl/tasks.db` (the `reviews` table) with the commit
-they refer to, so Stage 6 can use the findings.
+The verdict is parsed strictly. The reviewer's final message must be exactly
+one complete JSON object - a single surrounding Markdown code fence is
+tolerated, but prose, several objects, and truncated JSON are refused.
+Malformed output, unknown decisions or severities, an approval that carries a
+critical or major finding, and a `changes_requested` verdict without a
+blocking finding are all invalid: the task becomes `FAILED` and nothing is
+recorded as an approval. Every critical or major finding must include a
+scenario, impact, and location. Valid verdicts are stored in `.actl/tasks.db`
+(the `reviews` table) with the commit they refer to, so Stage 6 can use the
+findings. Reviewer execution and format failures are recorded in the review
+log with a reason.
 
 The review policy is the built-in risk-based policy plus, when present, the
 project's `REVIEW_POLICY.md`:
@@ -434,6 +450,7 @@ actl reports an error instead of resuming the wrong session.
 ├── planner.json    # active planner session id, created_at
 ├── tasks.db        # SQLite task database (tasks, dependencies, reviews)
 ├── execution.lock  # project-wide execution lock (fcntl.flock)
+├── base/           # branch-creation commit per task: t1, t2, ...
 ├── runs/           # tN-<timestamp>.log worker, -validation.log, -review.log
 ├── review/         # temporary reviewer worktrees (removed after review)
 └── worktrees/      # one Git worktree per task: t1/, t2/, ...
@@ -462,11 +479,13 @@ without a real model. Base-branch selection is covered too: `main`/`master`
 detection, feature branches, the ambiguity prompt, explicit `--base`, the
 remote default branch, repositories without commits, and legacy projects
 without a stored `base_branch`. The Stage 5 tests cover validation success,
-failure, worktree tampering and `HEAD` movement, skipped validation, every
-verdict shape (approval with and without findings, rejection, malformed
-output, unknown severities and decisions, contradictory verdicts), reviewer
-isolation and the temporary worktree, a task branch moving during review,
-the built-in and project review policies, the configured models, and
+failure, per-command worktree tampering and `HEAD` movement, modify-and-
+restore command sequences, skipped validation, every verdict shape
+(approval with and without findings, rejection, malformed, truncated and
+prose-wrapped output, unknown severities and decisions, contradictory
+verdicts), reviewer isolation, checkout mutation and the temporary
+worktree, a task branch moving during review, the built-in and project
+review policies, the configured models, the recorded branch base, and
 validating/reviewing an `IMPLEMENTED` task without rerunning the worker.
 
 ## Limitations
@@ -501,8 +520,9 @@ validating/reviewing an `IMPLEMENTED` task without rerunning the worker.
   `IMPLEMENTED` task is then validated and reviewed without rerunning the
   worker once the model is configured.
 - Validation commands run with actl's environment inside the task worktree
-  and may create untracked files (caches, reports). Only changes to tracked
-  files or to `HEAD` fail the task; actl does not clean anything up.
+  and may create untracked files (caches, reports). Changes to tracked files
+  or to `HEAD` fail the task as soon as a command finishes; actl does not
+  clean anything up.
 - actl never resets, cleans, rebases, or deletes a task worktree, and it never
   touches the base branch. A task that fails keeps its branch, worktree, and
   log for an explicit retry. A reviewer worktree is the one exception: it is
@@ -525,9 +545,11 @@ validating/reviewing an `IMPLEMENTED` task without rerunning the worker.
   failure rather than corrected automatically.
 - The reviewer runs with OpenCode's read-only `plan` agent in a disposable
   worktree at the validated commit; it can still run shell commands, so treat
-  its transcript as untrusted output. Its verdict is parsed strictly and a
-  malformed or contradictory answer always fails the task instead of being
-  approved.
+  its transcript as untrusted output. Its checkout must still be at the
+  validated commit with unchanged tracked files when it answers, and its
+  final message must be one complete JSON object (a single code fence is
+  tolerated). Malformed, truncated, or contradictory answers always fail the
+  task instead of being approved.
 - The review verdict is bound to the validated commit, but it is a model
   judgment: minor findings may be missed, and an approval is not a
   correctness proof. Human review before merging stays necessary.

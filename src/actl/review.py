@@ -5,10 +5,11 @@ out at the validated commit (never in the task worktree). It receives the
 task, the cumulative diff of the task branch against its base commit, the
 validation results, and the review policy.
 
-The reviewer must end its turn with one JSON verdict. Parsing is strict:
-malformed output, unknown decisions or severities, approvals that carry
-blocking findings, and change requests without a blocking finding are all
-rejected, so none of them can ever be mistaken for an approval. There is no
+The reviewer must end its turn with exactly one complete JSON object.
+Parsing is strict: prose around the verdict, several objects, truncated
+JSON, unknown decisions or severities, approvals that carry blocking
+findings, and change requests without a blocking finding are all rejected,
+so none of them can ever be mistaken for an approval. There is no
 output-repair loop.
 """
 
@@ -209,9 +210,7 @@ def parse_verdict(text: str) -> Verdict:
     critical or major finding and a changes_requested verdict without one are
     both refused, and the orchestration layer never records them.
     """
-    payload = _last_json_object(_strip_code_fence(text))
-    if payload is None:
-        raise ReviewError("the reviewer output contains no JSON verdict")
+    payload = _verdict_object(text)
     decision = payload.get("decision")
     if decision not in DECISIONS:
         raise ReviewError("unknown review decision " + repr(decision))
@@ -308,25 +307,19 @@ def _strip_code_fence(text: str) -> str:
     return stripped.strip()
 
 
-def _last_json_object(text: str):
-    """Return the last complete top-level JSON object in ``text``, or None.
+def _verdict_object(text: str):
+    """Return the single JSON object the reviewer finished with.
 
-    Models sometimes wrap the verdict in prose or an example; the last
-    complete object is the one they finished with. Parsing is still strict
-    afterwards, so an object that does not validate never becomes a verdict.
+    The final message must be one complete JSON object; a single surrounding
+    Markdown code fence is tolerated. Prose, several objects, truncated JSON
+    and non-objects are all refused, so a partial or ambiguous answer can
+    never pass as a verdict.
     """
-    decoder = json.JSONDecoder()
-    found = None
-    index = 0
-    while True:
-        start = text.find("{", index)
-        if start < 0:
-            return found
-        try:
-            value, end = decoder.raw_decode(text, start)
-        except ValueError:
-            index = start + 1
-            continue
-        if isinstance(value, dict):
-            found = value
-        index = end
+    stripped = _strip_code_fence(text.strip())
+    try:
+        payload = json.loads(stripped)
+    except ValueError:
+        raise ReviewError("the reviewer output is not one complete JSON verdict")
+    if not isinstance(payload, dict):
+        raise ReviewError("the reviewer verdict is not a JSON object")
+    return payload

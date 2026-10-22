@@ -59,8 +59,10 @@ Behaviour is controlled through environment variables:
 * ``ACTL_FAKE_REVIEW_MARKER`` - file receiving the reviewer PID when it starts
 * ``ACTL_FAKE_REVIEW_WAIT_FOR`` - the reviewer waits for this file (max 120s)
 * ``ACTL_FAKE_REVIEW_DONE`` - file written when the reviewer is about to exit
-* ``ACTL_FAKE_REVIEW_MUTATE`` - non-empty to write and commit a file in the
-                              reviewer's own checkout
+* ``ACTL_FAKE_REVIEW_MUTATE`` - reviewer-side change to its own checkout:
+                              ``commit`` (replace a tracked file and commit),
+                              ``dirty`` (modify a tracked file), or
+                              ``untracked`` (write a scratch file)
 """
 
 import json
@@ -88,16 +90,23 @@ def _run_reviewer():
     deadline = time.time() + 120
     while wait_for and not os.path.exists(wait_for) and time.time() < deadline:
         time.sleep(0.05)
-    if os.environ.get("ACTL_FAKE_REVIEW_MUTATE"):
-        with open("reviewer-checkout.txt", "w", encoding="utf-8") as handle:
-            handle.write("reviewer change\\n")
-        subprocess.run(["git", "add", "reviewer-checkout.txt"], check=True)
+    mutate = os.environ.get("ACTL_FAKE_REVIEW_MUTATE")
+    if mutate == "commit":
+        with open("worker-output.txt", "w", encoding="utf-8") as handle:
+            handle.write("reviewer replacement\\n")
+        subprocess.run(["git", "add", "worker-output.txt"], check=True)
         subprocess.run(
             ["git", "-c", "user.name=Fake Reviewer",
              "-c", "user.email=reviewer@example.invalid",
              "commit", "-m", "reviewer: touch the checkout"],
             check=True, capture_output=True,
         )
+    elif mutate == "dirty":
+        with open("worker-output.txt", "a", encoding="utf-8") as handle:
+            handle.write("reviewer edit\\n")
+    elif mutate == "untracked":
+        with open("reviewer-scratch.txt", "w", encoding="utf-8") as handle:
+            handle.write("reviewer scratch\\n")
     print(json.dumps({"type": "step_start",
                       "part": {"type": "step-start"}}))
     message = os.environ.get(

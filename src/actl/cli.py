@@ -1015,43 +1015,52 @@ def _verify_task(
                 log.write("branch: " + worktree.branch + "\n")
                 log.write("commit: " + commit + "\n")
                 log.write("started_at: " + _utc_now() + "\n---\n")
-                validation_result = validation.run(
-                    validation_commands, worktree.path, log,
-                )
+                try:
+                    validation_result = validation.run(
+                        validation_commands, worktree.path, log,
+                        verify=_validation_integrity(root, worktree, commit),
+                    )
+                except OSError as exc:
+                    log.write(
+                        "result: FAILED\nreason: validation could not run: "
+                        + str(exc) + "\n"
+                    )
+                    raise
                 log.write("---\nfinished_at: " + _utc_now() + "\n")
                 log.write(
                     "result: "
                     + ("PASSED" if validation_result.passed else "FAILED") + "\n"
                 )
-                if not validation_result.passed:
+                if validation_result.failed:
                     log.write("failed_command: " + validation_result.failed + "\n")
+                elif validation_result.reason:
+                    log.write("reason: " + validation_result.reason + "\n")
         except OSError as exc:
             return _verification_failed(
                 actl_dir, task.id, "validation could not run: " + str(exc),
                 log_hint=validation_log_path,
             )
         if not validation_result.passed:
-            exit_code = validation_result.results[-1][1]
-            _event(
-                "Validation failed (" + validation_result.failed
-                + ", exit code " + str(exit_code) + ")"
-            )
+            if validation_result.failed:
+                exit_code = validation_result.results[-1][1]
+                _event(
+                    "Validation failed (" + validation_result.failed
+                    + ", exit code " + str(exit_code) + ")"
+                )
+                detail = (
+                    validation_result.failed + " exited with status "
+                    + str(exit_code)
+                )
+            else:
+                _event("Validation failed (worktree or commit changed)")
+                detail = validation_result.reason
             return _verification_failed(
-                actl_dir, task.id,
-                "validation failed: " + validation_result.failed
-                + " exited with status " + str(exit_code),
+                actl_dir, task.id, "validation failed: " + detail,
                 log_hint=validation_log_path,
             )
         _event("Validation passed")
     else:
         _event("Validation skipped (no validation commands configured)")
-
-    try:
-        _require_commit_intact(root, worktree, commit, "validation")
-    except execution.ExecutionError as exc:
-        return _verification_failed(
-            actl_dir, task.id, str(exc), log_hint=validation_log_path,
-        )
 
     if reviewer_model is None:
         _event(
@@ -1130,9 +1139,11 @@ def _run_reviewer(
     The worktree is discarded on every path. The returned verdict has already
     been validated; malformed output raises :class:`review.ReviewError`.
     """
-    base_commit = execution.merge_base(
-        root, "refs/heads/" + base_branch, commit,
-    )
+    base_commit = execution.branch_base(actl_dir, task.id)
+    if base_commit is None:
+        base_commit = execution.merge_base(
+            root, "refs/heads/" + base_branch, commit,
+        )
     diff = execution.commit_diff(root, base_commit, commit)
     policy = review.policy_text(review.load_project_policy(root))
     prompt = review.build_prompt(
@@ -1162,20 +1173,38 @@ def _run_reviewer(
         # Flush before the reviewer starts writing to the same file through
         # its inherited stdout descriptor, so the header stays on top.
         log.flush()
-        exit_code = opencode.run_headless(
-            binary, review_path, session.id, reviewer_model, prompt, log,
-            pass_fds=(lock_fd,), agent=opencode.REVIEWER_AGENT,
-            output_format="json",
-        )
+        try:
+            exit_code = opencode.run_headless(
+                binary, review_path, session.id, reviewer_model, prompt, log,
+                pass_fds=(lock_fd,), agent=opencode.REVIEWER_AGENT,
+                output_format="json",
+            )
+        except (opencode.OpenCodeError, OSError) as exc:
+            _log_review_failure(log, str(exc))
+            raise
         log.write("---\nfinished_at: " + _utc_now() + "\n")
         log.write("exit_code: " + str(exit_code) + "\n")
         log.flush()
         if exit_code != 0:
+            _log_review_failure(
+                log, "the reviewer exited with status " + str(exit_code)
+            )
             raise review.ReviewError(
                 "the reviewer exited with status " + str(exit_code)
             )
+        try:
+            _require_reviewer_checkout(review_path, commit)
+        except (review.ReviewError, execution.ExecutionError) as exc:
+            _log_review_failure(log, str(exc))
+            raise
+        log.write("checkout: " + commit + " (unchanged)\n")
+        log.flush()
         output = Path(log.name).read_text(encoding="utf-8", errors="replace")
-        verdict = review.verdict_from_output(output)
+        try:
+            verdict = review.verdict_from_output(output)
+        except review.ReviewError as exc:
+            _log_review_failure(log, str(exc))
+            raise
         log.write("decision: " + verdict.decision + "\n")
         log.write(
             "findings: "
@@ -1240,6 +1269,50 @@ def _require_commit_intact(root: Path, worktree, commit: str, stage: str) -> Non
             stage + " modified tracked files in the task worktree; refusing"
             " approval"
         )
+
+
+def _validation_integrity(root: Path, worktree, commit: str):
+    """Return the validation check that runs after every command.
+
+    Validation commands run inside the task worktree, so a command that
+    modifies tracked files or moves HEAD must fail the task immediately; a
+    later command could otherwise validate the modified state and restore the
+    original before a final check.
+    """
+    def verify() -> str:
+        try:
+            _require_commit_intact(root, worktree, commit, "a validation command")
+        except execution.ExecutionError as exc:
+            return str(exc)
+        return ""
+
+    return verify
+
+
+def _require_reviewer_checkout(review_path: Path, commit: str) -> None:
+    """Refuse a verdict when the reviewer changed its own checkout.
+
+    The reviewer must evaluate the validated commit; a checkout that moved or
+    carries modified tracked files no longer represents it. Untracked scratch
+    files are harmless and allowed.
+    """
+    head = execution.head_commit(review_path)
+    if head != commit:
+        raise review.ReviewError(
+            "the reviewer changed its checkout: expected " + commit[:12]
+            + ", found " + head[:12] + "; refusing approval"
+        )
+    if execution.worktree_tracked_dirty(review_path):
+        raise review.ReviewError(
+            "the reviewer modified tracked files in its checkout; refusing"
+            " approval"
+        )
+
+
+def _log_review_failure(log, reason: str) -> None:
+    """Record a review failure in the review log; it is never an approval."""
+    log.write("result: FAILED\nreason: " + reason + "\n")
+    log.flush()
 
 
 def _verification_failed(actl_dir, task_id, reason, log_hint=None) -> int:

@@ -35,15 +35,18 @@ class ValidationResult:
 
     ``results`` holds one ``(command, exit_code)`` pair per executed command,
     in execution order. ``failed`` names the first command that exited
-    non-zero, or is empty when every command passed.
+    non-zero, or is empty when every command passed. ``reason`` describes a
+    failure that is not a command exit (the worktree or commit changed), or
+    is empty.
     """
 
     results: tuple
-    failed: str
+    failed: str = ""
+    reason: str = ""
 
     @property
     def passed(self) -> bool:
-        return not self.failed
+        return not self.failed and not self.reason
 
 
 def commands_from_metadata(metadata: dict) -> list:
@@ -76,12 +79,14 @@ def commands_from_metadata(metadata: dict) -> list:
     return result
 
 
-def run(commands, cwd, log) -> ValidationResult:
+def run(commands, cwd, log, verify=None) -> ValidationResult:
     """Run ``commands`` sequentially in ``cwd``, writing output to ``log``.
 
-    Stops at the first non-zero exit. Commands are shell command lines, so
-    pipelines and arguments work as written; they inherit actl's environment
-    and cannot read from stdin.
+    Stops at the first non-zero exit. After every successful command the
+    optional ``verify`` callback runs; it returns an error text when the
+    worktree or commit changed and the run must stop. Checking after each
+    command - not only at the end - stops a later command from validating
+    modified code and restoring the original before the check.
     """
     results = []
     for command in commands:
@@ -100,6 +105,12 @@ def run(commands, cwd, log) -> ValidationResult:
         results.append((command, proc.returncode))
         if proc.returncode != 0:
             return ValidationResult(tuple(results), command)
+        if verify is not None:
+            problem = verify()
+            if problem:
+                log.write("integrity: " + problem + "\n\n")
+                log.flush()
+                return ValidationResult(tuple(results), "", problem)
     return ValidationResult(tuple(results), "")
 
 
@@ -119,6 +130,8 @@ def summary(result) -> str:
     ]
     if result.passed:
         lines.append("All configured validation commands passed.")
-    else:
+    elif result.failed:
         lines.append("Validation failed at: " + result.failed)
+    else:
+        lines.append("Validation failed: " + result.reason)
     return "\n".join(lines)

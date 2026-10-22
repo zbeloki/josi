@@ -172,7 +172,9 @@ class ValidationTests(VerificationTestCase):
         self.assertEqual(self.task_status(), "FAILED")
         self.assertIn("modified tracked files", result.stderr)
         self.assertEqual(self.reviewer_calls(), [], "review must not start")
-        self.assertIn("result: PASSED", self.validation_log())
+        log = self.validation_log()
+        self.assertIn("result: FAILED", log)
+        self.assertIn("integrity:", log)
 
     def test_validation_moving_head_refuses_approval(self):
         self.set_validation(
@@ -185,6 +187,36 @@ class ValidationTests(VerificationTestCase):
         self.assertEqual(self.task_status(), "FAILED")
         self.assertIn("changed the task commit", result.stderr)
         self.assertEqual(self.reviewer_calls(), [], "review must not start")
+        log = self.validation_log()
+        self.assertIn("result: FAILED", log)
+        self.assertIn("changed the task commit", log)
+
+    def test_validation_modifying_then_restoring_tracked_files_is_refused(self):
+        # A real project may format or generate code, validate it, and
+        # restore the original: the modified state must never pass.
+        (self.repo / "app.py").write_text("VALUE = 0\n", encoding="utf-8")
+        (self.repo / "check.py").write_text(
+            "from app import VALUE\nassert VALUE == 1\n", encoding="utf-8"
+        )
+        self.commit("add the app and its acceptance check")
+        self.set_validation(
+            "printf 'VALUE = 1\\n' > app.py",
+            sys.executable + " -B check.py",
+            "git restore -- app.py",
+        )
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertIn("modified tracked files", result.stderr)
+        self.assertEqual(self.reviewer_calls(), [], "review must not start")
+
+        log = self.validation_log()
+        self.assertIn("result: FAILED", log)
+        self.assertIn("integrity:", log)
+        # The check against the modified file never ran, so it cannot hide
+        # the change from the integrity check.
+        self.assertNotIn("check.py", log)
 
     def test_no_validation_commands_skips_validation(self):
         self.make_task()
@@ -359,8 +391,45 @@ class ReviewTests(VerificationTestCase):
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.task_status(), "FAILED")
-        self.assertIn("no JSON verdict", result.stderr)
+        self.assertIn("not one complete JSON verdict", result.stderr)
         self.assertIsNone(self.latest_review())
+        log = self.review_log()
+        self.assertIn("result: FAILED", log)
+        self.assertIn("reason:", log)
+
+    def test_truncated_verdict_after_an_approval_is_refused(self):
+        # An echoed approval example followed by an unfinished real verdict
+        # must never approve the task.
+        self.env["ACTL_FAKE_REVIEW_JSON"] = (
+            '{"decision":"approved","findings":[]}\n'
+            '{"decision":"changes_requested","findings":['
+        )
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertIn("not one complete JSON verdict", result.stderr)
+        self.assertIsNone(self.latest_review())
+
+    def test_prose_around_the_verdict_is_refused(self):
+        self.env["ACTL_FAKE_REVIEW_JSON"] = (
+            'Here is my verdict: {"decision":"approved","findings":[]}'
+        )
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertIn("not one complete JSON verdict", result.stderr)
+        self.assertIsNone(self.latest_review())
+
+    def test_verdict_in_a_code_fence_is_accepted(self):
+        self.env["ACTL_FAKE_REVIEW_JSON"] = (
+            '```json\n{"decision":"approved","findings":[]}\n```'
+        )
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "APPROVED")
 
     def test_unknown_decision_is_refused(self):
         self.env["ACTL_FAKE_REVIEW_JSON"] = self.review_json("maybe", [])
@@ -419,6 +488,9 @@ class ReviewTests(VerificationTestCase):
         self.assertEqual(self.task_status(), "FAILED")
         self.assertIn("exited with status 2", result.stderr)
         self.assertIsNone(self.latest_review())
+        log = self.review_log()
+        self.assertIn("result: FAILED", log)
+        self.assertIn("exited with status 2", log)
 
     def test_reviewer_evaluates_the_cumulative_task_diff(self):
         # Without a reviewer model the first run stops at IMPLEMENTED.
@@ -459,19 +531,45 @@ class ReviewTests(VerificationTestCase):
         self.assertIn(call["cwd"], log)
         self.assertIn("commit: " + self.rev("actl/t1"), log)
 
-    def test_reviewer_checkout_cannot_modify_the_task_worktree(self):
-        self.env["ACTL_FAKE_REVIEW_MUTATE"] = "1"
+    def test_reviewer_checkout_commit_is_refused(self):
+        self.env["ACTL_FAKE_REVIEW_MUTATE"] = "commit"
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertIn("changed its checkout", result.stderr)
+        self.assertIsNone(self.latest_review())
+        self.assertIn("result: FAILED", self.review_log())
+
+        # The real task worktree is untouched and the temporary checkout is
+        # removed, so the reviewer commit is discarded with it.
+        worktree = self.worktree()
+        self.assertEqual(
+            (worktree / "worker-output.txt").read_text(encoding="utf-8"),
+            "worker change\n",
+        )
+        self.assertEqual(self.git("status", "--porcelain", cwd=worktree).stdout, "")
+        subjects = self.git("log", "--format=%s", "actl/t1").stdout
+        self.assertNotIn("reviewer: touch the checkout", subjects)
+        self.assertFalse(Path(self.reviewer_calls()[-1]["cwd"]).exists())
+
+    def test_reviewer_checkout_dirty_tracked_files_are_refused(self):
+        self.env["ACTL_FAKE_REVIEW_MUTATE"] = "dirty"
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertIn("modified tracked files in its checkout", result.stderr)
+        self.assertIsNone(self.latest_review())
+
+    def test_reviewer_untracked_scratch_files_are_allowed(self):
+        self.env["ACTL_FAKE_REVIEW_MUTATE"] = "untracked"
         self.make_task()
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "APPROVED")
-
-        worktree = self.worktree()
-        self.assertFalse((worktree / "reviewer-checkout.txt").exists())
-        self.assertEqual(self.git("status", "--porcelain", cwd=worktree).stdout, "")
-        subjects = self.git("log", "--format=%s", "actl/t1").stdout
-        self.assertNotIn("reviewer: touch the checkout", subjects)
-        self.assertEqual(self.rev("actl/t1"), self.latest_review()["commit_sha"])
+        self.assertFalse((self.worktree() / "reviewer-scratch.txt").exists())
+        self.assertFalse(Path(self.reviewer_calls()[-1]["cwd"]).exists())
 
     def test_task_branch_moving_during_review_is_not_approved(self):
         self.make_task()
@@ -761,6 +859,36 @@ class Stage5IntegrationTests(VerificationTestCase):
         self.assertEqual(self.task_status(), "FAILED")
         self.assertIn("no committed changes", result.stderr)
         self.assertEqual(self.reviewer_calls(), [], "review must not start")
+
+    def test_review_uses_the_recorded_branch_base(self):
+        self.remove_reviewer_model()
+        self.make_task("Add the feature")
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(self.task_status(), "IMPLEMENTED")
+        first_commit = self.rev("actl/t1")
+
+        # The project's base branch is reconfigured after the first task
+        # commit: the review diff must still start at the commit the branch
+        # was created from, not at the new base.
+        self.git("branch", "develop", first_commit)
+        (self.worktree() / "second.txt").write_text(
+            "second change\n", encoding="utf-8"
+        )
+        self.commit("second change", cwd=self.worktree())
+        self.assertEqual(self.run_actl("init", "--base", "develop").returncode, 0)
+
+        self.set_reviewer_model("reviewer/model")
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            (self.repo / ".actl" / "base" / "t1").read_text(encoding="utf-8").strip(),
+            self.base_sha,
+        )
+        prompt = self.reviewer_prompt()
+        self.assertIn("created from base commit " + self.base_sha, prompt)
+        diff = prompt.split("```diff\n", 1)[1].split("\n```", 1)[0]
+        self.assertIn("worker-output.txt", diff)
+        self.assertIn("second.txt", diff)
 
 
 if __name__ == "__main__":

@@ -55,11 +55,20 @@ approval - except safe Git inspection commands (`git status`, `git log`,
 `git diff`, `git show`, `git blame`, `git rev-parse`, `git ls-files`,
 `git grep`, and bare read-only `git branch` listings), which are pre-approved.
 The prompt also tells the planner to prefer the native `read`, `glob`, and
-`grep` tools over shell `cat`, `ls`, or `grep`, and to run inspections one per
+`grep` tools over shell `cat`, `head`, `tail`, `ls`, or `grep` (the `read`
+tool pages through files with offset/limit), and to run inspections one per
 shell call (each command in a compound `&&` call is checked separately, and
 helpers like `echo` always require confirmation). Because the instructions
 are system-level, launching the planner does not start a conversation by
 itself - the TUI just waits for input.
+
+File-reading shell commands (`cat`, `head`, `tail`, `ls`, `grep`) are
+deliberately **not** pre-approved: OpenCode matches output redirection as
+part of the tracked command, so an allow rule like `cat *` would also permit
+`cat file > file` and silently write files, defeating the no-modification
+rule. If you still want a specific command pre-approved, choose *Allow
+always* in the permission dialog - OpenCode saves a project-scoped rule that
+actl does not override.
 
 actl binds the planner session to this agent (for `--new` and first runs) and
 re-selects it before resuming, so older sessions created before the agent

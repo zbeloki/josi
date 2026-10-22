@@ -53,17 +53,23 @@ never modify code, never execute tasks), and its frontmatter makes the agent
 read-only: `edit` is denied and every shell command requires explicit user
 approval - except safe Git inspection commands (`git status`, `git log`,
 `git diff`, `git show`, `git blame`, `git rev-parse`, `git ls-files`,
-`git grep`), which are pre-approved. The prompt also tells the planner to
-prefer the native `read`, `glob`, and `grep` tools over shell `cat`, `ls`, or
-`grep`, so routine exploration does not trigger prompts. Because the
-instructions are system-level, launching the planner does not start a
-conversation by itself - the TUI just waits for input.
+`git grep`, and bare read-only `git branch` listings), which are pre-approved.
+The prompt also tells the planner to prefer the native `read`, `glob`, and
+`grep` tools over shell `cat`, `ls`, or `grep`, and to run inspections one per
+shell call (each command in a compound `&&` call is checked separately, and
+helpers like `echo` always require confirmation). Because the instructions
+are system-level, launching the planner does not start a conversation by
+itself - the TUI just waits for input.
 
 actl binds the planner session to this agent (for `--new` and first runs) and
 re-selects it before resuming, so older sessions created before the agent
-existed are upgraded on the next `actl plan`. An existing
-`.opencode/agents/actl-planner.md` is never overwritten, so you can customize
-your planner; delete the file to have actl restore the default.
+existed are upgraded on the next `actl plan`.
+
+The agent file is **managed by actl**: if its content differs from the
+definition shipped with the installed actl version (for example after an
+upgrade adds new pre-approved commands), the next `actl plan` rewrites it and
+prints an `Updated the planner agent definition` notice. Do not hand-edit
+that file; put project-specific guidance in your own `AGENTS.md` instead.
 
 ## How it works
 

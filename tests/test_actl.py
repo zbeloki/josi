@@ -313,19 +313,64 @@ class PlanTests(ActlTestCase):
                 self.assertIn(
                     'resource: "' + command + ' *"\n    effect: allow', content
                 )
+        # read-only branch listings; bare forms only, because e.g.
+        # `git branch -v <name>` (which `-v *` would match) creates a branch
+        for listing in (
+            "git branch",
+            "git branch -a",
+            "git branch -r",
+            "git branch -v",
+            "git branch -vv",
+            "git branch --all",
+            "git branch --remotes",
+            "git branch --show-current",
+        ):
+            with self.subTest(listing=listing):
+                self.assertIn(
+                    'resource: "' + listing + '"\n    effect: allow', content
+                )
+        self.assertIn('resource: "git branch --list *"\n    effect: allow', content)
+        self.assertNotIn('resource: "git branch -v *"', content)
         # The broad `shell *` ask rule comes first and the last matching rule
         # wins, so only the listed Git commands skip confirmation.
         shell_ask = content.index('  - action: shell\n    resource: "*"\n    effect: ask')
         first_git_allow = content.index('resource: "git status *"')
         self.assertLess(shell_ask, first_git_allow)
-        self.assertIn("Every other\nshell command will ask the user for confirmation.", content)
+        self.assertIn("Every other shell command will ask the user for", content)
+        self.assertIn("checked separately", content)
 
-    def test_plan_does_not_overwrite_existing_planner_agent(self):
-        custom = "---\ndescription: custom planner\nmode: primary\n---\ncustom body\n"
+    def test_plan_installs_planner_agent_once(self):
+        first = self.run_actl("plan")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assertNotIn("Updated the planner agent", first.stdout)
+        mtime = self.agent_path().stat().st_mtime_ns
+
+        second = self.run_actl("plan")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertNotIn("Updated the planner agent", second.stdout)
+        self.assertEqual(self.agent_path().stat().st_mtime_ns, mtime)
+
+    def test_plan_refreshes_stale_planner_agent(self):
+        legacy = (
+            "---\n"
+            "description: old planner\n"
+            "mode: primary\n"
+            "permissions:\n"
+            '  - action: edit\n    resource: "*"\n    effect: deny\n'
+            '  - action: shell\n    resource: "*"\n    effect: ask\n'
+            "---\n"
+            "old planner body\n"
+        )
         self.agent_path().parent.mkdir(parents=True)
-        self.agent_path().write_text(custom, encoding="utf-8")
-        self.assertEqual(self.run_actl("plan").returncode, 0)
-        self.assertEqual(self.agent_path().read_text(encoding="utf-8"), custom)
+        self.agent_path().write_text(legacy, encoding="utf-8")
+
+        result = self.run_actl("plan")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Updated the planner agent", result.stdout)
+        content = self.agent_path().read_text(encoding="utf-8")
+        self.assertNotIn("old planner body", content)
+        self.assertIn('resource: "git status *"', content)
+        self.assertIn('resource: "git branch -a"', content)
 
     def test_resumes_existing_session(self):
         self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000002"

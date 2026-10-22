@@ -32,7 +32,8 @@ PLANNER_AGENT_PATH = Path(".opencode") / "agents" / (PLANNER_AGENT_NAME + ".md")
 # Safe Git inspection commands are pre-approved; every other shell command
 # requires explicit user approval. The body becomes the agent's system
 # prompt. Deployed under .opencode/agents/ so OpenCode discovers it for this
-# project.
+# project. actl manages this file: ensure_planner_agent() rewrites it when
+# its content differs from this definition.
 PLANNER_AGENT_DOC = """\
 ---
 description: "Planning assistant that defines requirements and produces plans without modifying code"
@@ -68,6 +69,33 @@ permissions:
   - action: shell
     resource: "git grep *"
     effect: allow
+  - action: shell
+    resource: "git branch"
+    effect: allow
+  - action: shell
+    resource: "git branch -a"
+    effect: allow
+  - action: shell
+    resource: "git branch -r"
+    effect: allow
+  - action: shell
+    resource: "git branch -v"
+    effect: allow
+  - action: shell
+    resource: "git branch -vv"
+    effect: allow
+  - action: shell
+    resource: "git branch --all"
+    effect: allow
+  - action: shell
+    resource: "git branch --remotes"
+    effect: allow
+  - action: shell
+    resource: "git branch --list *"
+    effect: allow
+  - action: shell
+    resource: "git branch --show-current"
+    effect: allow
 ---
 
 You are the planning assistant for this repository.
@@ -84,8 +112,11 @@ actionable plan.
 - Do not execute implementation tasks.
 
 Safe Git inspection commands (git status, git log, git diff, git show,
-git blame, git rev-parse, git ls-files, git grep) are pre-approved. Every other
-shell command will ask the user for confirmation.
+git blame, git rev-parse, git ls-files, git grep, and read-only git branch
+listings) are pre-approved. Every other shell command will ask the user for
+confirmation, and each command in a compound call is checked separately, so
+run one pre-approved inspection per shell call instead of chaining commands
+with && or echo separators.
 
 Ask clarifying questions before proposing a plan, and never start implementing.
 """
@@ -181,22 +212,26 @@ def ensure_gitignore(root: Path) -> None:
         path.write_text(entry + "\n", encoding="utf-8")
 
 
-def ensure_planner_agent(root: Path) -> Path:
-    """Install the actl planner agent file if it does not exist yet.
+def ensure_planner_agent(root: Path) -> str:
+    """Make the planner agent file match actl's current definition.
 
-    An existing file is left untouched so users can customize their planner.
+    The file is managed by actl: it is written when missing and rewritten
+    when its content differs from :data:`PLANNER_AGENT_DOC`, so definition
+    updates (for example new pre-approved commands) apply on the next plan.
+    Returns ``"installed"``, ``"updated"`` or ``"unchanged"``.
     """
     path = root / PLANNER_AGENT_PATH
-    if path.is_file():
-        return path
+    existed = path.is_file()
     try:
+        if existed and path.read_text(encoding="utf-8") == PLANNER_AGENT_DOC:
+            return "unchanged"
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(PLANNER_AGENT_DOC, encoding="utf-8")
     except OSError as exc:
         raise ProjectError(
             "could not write the planner agent " + str(path) + " (" + str(exc) + ")"
         )
-    return path
+    return "updated" if existed else "installed"
 
 
 def cmd_init(_args) -> int:
@@ -248,9 +283,14 @@ def cmd_plan(args) -> int:
     except opencode.OpenCodeError as exc:
         return _fail(str(exc))
     try:
-        ensure_planner_agent(root)
+        agent_status = ensure_planner_agent(root)
     except ProjectError as exc:
         return _fail(str(exc))
+    if agent_status == "updated":
+        print(
+            "Updated the planner agent definition ("
+            + str(root / PLANNER_AGENT_PATH) + ")"
+        )
 
     session_id = None
     if not args.new:

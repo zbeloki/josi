@@ -137,16 +137,19 @@ class ValidationTests(VerificationTestCase):
         self.assertIn("echo first-check: exit code 0", prompt)
         self.assertIn("All configured validation commands passed.", prompt)
 
-    def test_failed_validation_command_fails_the_task(self):
+    def test_failed_validation_command_triggers_repairs_then_needs_human(self):
+        # A failed validation command is implementation feedback: all three
+        # attempts run and the still-failing command ends in NEEDS_HUMAN.
         self.set_validation("echo first-check", "exit 3", "echo never-runs")
         self.make_task()
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.task_status(), "FAILED")
+        self.assertEqual(self.task_status(), "NEEDS_HUMAN")
         self.assertIn("Validation failed", result.stdout)
         self.assertIn("exit 3", result.stdout)
-        self.assertIn("validation failed", result.stderr)
+        self.assertIn("needs human intervention", result.stderr)
         self.assertIn("log:", result.stderr)
+        self.assertEqual(len(self.worker_calls()), 3)
         self.assertEqual(self.reviewer_calls(), [], "review must not start")
 
         log = self.validation_log()
@@ -329,12 +332,13 @@ class ReviewTests(VerificationTestCase):
         self.make_task()
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.task_status(), "NEEDS_CHANGES")
+        self.assertEqual(self.task_status(), "NEEDS_HUMAN")
         self.assertIn("Review requested changes (1 major finding)", result.stdout)
         self.assertIn("Authentication accepts an expired token.", result.stdout)
         self.assertIn("src/auth.py", result.stdout)
-        self.assertIn("needs changes", result.stderr)
-        self.assertIn("review log: ", result.stderr)
+        self.assertIn("needs human intervention", result.stderr)
+        self.assertIn("log: ", result.stderr)
+        self.assertEqual(len(self.worker_calls()), 3, "repairs run to the limit")
 
         stored = self.latest_review()
         self.assertEqual(stored["decision"], "changes_requested")
@@ -355,7 +359,7 @@ class ReviewTests(VerificationTestCase):
         self.make_task()
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
-        self.assertEqual(self.task_status(), "NEEDS_CHANGES")
+        self.assertEqual(self.task_status(), "NEEDS_HUMAN")
         self.assertIn("Review requested changes (1 critical finding)", result.stdout)
 
     def test_approval_with_blocking_findings_is_refused(self):
@@ -664,12 +668,12 @@ class PolicyTests(VerificationTestCase):
                 )
                 result = self.run_task(task_id)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertEqual(self.task_status(task_id), "NEEDS_CHANGES")
+                self.assertEqual(self.task_status(task_id), "NEEDS_HUMAN")
                 self.assertIn("1 " + severity + " finding", result.stdout)
-                # Nothing is retried automatically: one worker and one
-                # reviewer invocation per task so far.
-                self.assertEqual(len(self.worker_calls()), index)
-                self.assertEqual(len(self.reviewer_calls()), index)
+                # Every rejection triggers a repair: three worker attempts
+                # and three review verdicts per task, then NEEDS_HUMAN.
+                self.assertEqual(len(self.worker_calls()), 3 * index)
+                self.assertEqual(len(self.reviewer_calls()), 3 * index)
 
 
 class Stage5IntegrationTests(VerificationTestCase):
@@ -797,7 +801,7 @@ class Stage5IntegrationTests(VerificationTestCase):
         self.assertEqual(len(self.worker_calls()), 1)
         self.assertEqual(len(self.reviewer_calls()), 1)
 
-    def test_needs_changes_task_is_not_run_again(self):
+    def test_needs_human_task_is_not_run_again_without_intervention(self):
         self.env["ACTL_FAKE_REVIEW_JSON"] = self.review_json(
             "changes_requested",
             [{
@@ -810,13 +814,16 @@ class Stage5IntegrationTests(VerificationTestCase):
         )
         self.make_task()
         self.assertNotEqual(self.run_task("t1").returncode, 0)
-        self.assertEqual(self.task_status(), "NEEDS_CHANGES")
+        self.assertEqual(self.task_status(), "NEEDS_HUMAN")
+        self.assertEqual(len(self.worker_calls()), 3)
 
+        # The exhausted budget is never restarted automatically.
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("NEEDS_CHANGES", result.stderr)
-        self.assertEqual(len(self.worker_calls()), 1, "no automatic repair")
-        self.assertEqual(len(self.reviewer_calls()), 1)
+        self.assertIn("NEEDS_HUMAN", result.stderr)
+        self.assertIn(".actl/attempts/t1", result.stderr)
+        self.assertEqual(len(self.worker_calls()), 3, "no automatic restart")
+        self.assertEqual(len(self.reviewer_calls()), 3)
 
     def test_approval_does_not_merge_or_move_the_base_branch(self):
         self.make_task()

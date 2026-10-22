@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "actl"
-version = "0.5.0"
+version = "0.6.0"
 description = "Lightweight CLI for orchestrating AI coding agents through OpenCode"
 readme = "README.md"
 requires-python = ">=3.9"

@@ -4,8 +4,8 @@ Stage 2 keeps the project's tasks in a small SQLite database at
 ``.actl/tasks.db``. The schema has three tables: ``tasks``, ``dependencies``,
 and ``reviews``. There is no BLOCKED status - whether a task is blocked is
 derived from its dependencies when needed. A task's status is PENDING,
-RUNNING, IMPLEMENTED, FAILED, APPROVED, or NEEDS_CHANGES (Stage 5); only
-``actl task run`` moves a task between them.
+RUNNING, IMPLEMENTED, FAILED, APPROVED, NEEDS_CHANGES, or NEEDS_HUMAN
+(Stage 6); only ``actl task run`` moves a task between them.
 
 Reviewer verdicts are stored in ``reviews`` (one row per completed review,
 newest last) so later stages can read the findings that belong to a task's
@@ -35,9 +35,10 @@ STATUS_IMPLEMENTED = "IMPLEMENTED"
 STATUS_FAILED = "FAILED"
 STATUS_APPROVED = "APPROVED"
 STATUS_NEEDS_CHANGES = "NEEDS_CHANGES"
+STATUS_NEEDS_HUMAN = "NEEDS_HUMAN"
 STATUSES = (
     STATUS_PENDING, STATUS_RUNNING, STATUS_IMPLEMENTED, STATUS_FAILED,
-    STATUS_APPROVED, STATUS_NEEDS_CHANGES,
+    STATUS_APPROVED, STATUS_NEEDS_CHANGES, STATUS_NEEDS_HUMAN,
 )
 REVIEW_APPROVED = "approved"
 REVIEW_CHANGES_REQUESTED = "changes_requested"

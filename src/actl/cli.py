@@ -28,11 +28,22 @@ Stage 5:
 
 * After the worker succeeds, the configured validation commands run inside the
   task worktree, and an independent reviewer - in a temporary worktree at the
-  validated commit - returns a structured verdict. The task ends APPROVED,
-  NEEDS_CHANGES, or FAILED. A reviewer model is required for every run, and
-  the worker model whenever the worker runs; without a reviewer model the run
-  refuses before launching anything instead of skipping review. Nothing is
-  retried or merged.
+  validated commit - returns a structured verdict. The task ends APPROVED or
+  FAILED. A reviewer model is required for every run, and the worker model
+  whenever the worker runs; without a reviewer model the run refuses before
+  launching anything instead of skipping review.
+
+Stage 6:
+
+* A validation failure or a reviewer rejection with critical or major findings
+  triggers automatic repairs: up to three worker attempts in all. The first
+  two use the project's worker model, the third the escalation worker model;
+  every attempt continues in the same branch and worktree and receives the
+  blocking findings or the failed validation command as feedback. If the
+  third attempt is still not approved, the task ends NEEDS_HUMAN. Only
+  implementation failures trigger repairs: worker and reviewer execution
+  errors end the run with FAILED. The attempt budget is persisted per task in
+  ``.actl/attempts/`` so restarting actl never resets it.
 """
 
 from __future__ import annotations
@@ -45,6 +56,7 @@ import sqlite3
 import subprocess
 import sys
 from contextlib import contextmanager
+from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -372,6 +384,24 @@ def _reviewer_model(metadata: dict) -> str:
     return _parse_reviewer_model(model)
 
 
+def _escalation_worker_model(metadata: dict):
+    """Return the project's escalation worker model, or None when unset.
+
+    The third (final) worker attempt of a repair cycle uses this model when
+    configured. Without it the regular worker model keeps running the third
+    attempt, so projects from earlier stages keep working unchanged.
+    """
+    model = metadata.get("escalation_worker_model")
+    if model is None:
+        return None
+    if not isinstance(model, str):
+        raise ProjectError(
+            "project metadata has an invalid 'escalation_worker_model' value "
+            + repr(model)
+        )
+    return _parse_model(model, "escalation worker")
+
+
 def _validate_explicit_base_branch(root: Path, value: str) -> str:
     """Validate ``--base`` and return the branch name.
 
@@ -538,6 +568,14 @@ def cmd_init(args) -> int:
             reviewer_model = _parse_reviewer_model(args.reviewer_model)
         except ProjectError as exc:
             return _fail(str(exc))
+    escalation_worker_model = None
+    if args.escalation_worker_model is not None:
+        try:
+            escalation_worker_model = _parse_model(
+                args.escalation_worker_model, "escalation worker"
+            )
+        except ProjectError as exc:
+            return _fail(str(exc))
 
     actl_dir = root / PROJECT_DIR
     metadata_path = actl_dir / PROJECT_METADATA
@@ -557,6 +595,11 @@ def cmd_init(args) -> int:
             and metadata.get("reviewer_model") != reviewer_model
         ):
             updates["reviewer_model"] = reviewer_model
+        if (
+            escalation_worker_model is not None
+            and metadata.get("escalation_worker_model") != escalation_worker_model
+        ):
+            updates["escalation_worker_model"] = escalation_worker_model
         stored_base = metadata.get("base_branch")
         if args.base is not None:
             # An explicit --base is the user's decision: it may replace an
@@ -586,6 +629,11 @@ def cmd_init(args) -> int:
                 print("Updated the worker model to " + updates["worker_model"])
             if "reviewer_model" in updates:
                 print("Updated the reviewer model to " + updates["reviewer_model"])
+            if "escalation_worker_model" in updates:
+                print(
+                    "Updated the escalation worker model to "
+                    + updates["escalation_worker_model"]
+                )
             if "base_branch" in updates:
                 print("Updated the base branch to " + updates["base_branch"])
         else:
@@ -605,6 +653,8 @@ def cmd_init(args) -> int:
             metadata["worker_model"] = worker_model
         if reviewer_model is not None:
             metadata["reviewer_model"] = reviewer_model
+        if escalation_worker_model is not None:
+            metadata["escalation_worker_model"] = escalation_worker_model
         try:
             actl_dir.mkdir(parents=True, exist_ok=True)
             _write_metadata(metadata_path, metadata)
@@ -866,40 +916,134 @@ def _execute_task(
 ) -> int:
     """Run one task while the execution lock is held.
 
-    The task is marked RUNNING before the worktree is prepared, so an
-    interrupted attempt keeps RUNNING and a later explicit run continues from
-    its worktree.
+    A task gets up to three worker attempts in the same branch and worktree:
+    the first two with the project's worker model and the third with the
+    escalation worker model when one is configured. A failed validation
+    command or a reviewer rejection with critical or major findings feeds the
+    next attempt; the attempt count and the feedback are persisted per task so
+    restarting actl never resets the budget. Exhausting the attempts marks
+    the task NEEDS_HUMAN.
 
-    After the worker succeeds - or when an IMPLEMENTED task is run again -
-    validation and review always run. The worker model is only needed when
-    the worker runs; the reviewer model is required for every run.
+    Only implementation failures are repaired. A worker, validation, or
+    reviewer execution error stops the run with FAILED: infrastructure
+    problems never launch another repair worker.
 
     The terminal shows only actl's own timestamped events; transcripts and
     validation output go straight into their log files while they run.
     """
     task = _load_task(actl_dir, task_id)
-    _require_runnable(task)
+    _require_runnable(task, actl_dir)
     print("task t" + str(task.id) + ": " + task.title)
-    if task.status == tasks.STATUS_IMPLEMENTED:
+    attempts, feedback = _attempt_baseline(actl_dir, task)
+    # An IMPLEMENTED task is validated and reviewed without a new worker. A
+    # pending feedback means the implementation was already rejected, so the
+    # next attempt repairs it instead of re-reviewing the same commit.
+    review_first = task.status == tasks.STATUS_IMPLEMENTED and not feedback
+    if review_first:
         print("reviewer model: " + reviewer_model)
-        return _verify_task(
+    else:
+        print("model: " + _worker_model(metadata))
+        print("reviewer model: " + reviewer_model)
+        escalation_model = _escalation_worker_model(metadata)
+        if escalation_model is not None:
+            print("escalation model: " + escalation_model)
+        if task.status == tasks.STATUS_RUNNING:
+            _event(
+                "Retrying task t" + str(task.id)
+                + ", left RUNNING by an interrupted execution"
+            )
+
+    if review_first:
+        verification = _validate_and_review(
             binary, root, actl_dir, task, base_branch, reviewer_model,
-            validation_commands, lock_fd, announce_worktree=True,
+            validation_commands, lock_fd, attempt=max(attempts, 1),
+            announce_worktree=True,
         )
-    model = _worker_model(metadata)
-    print("model: " + model)
-    print("reviewer model: " + reviewer_model)
+        if verification.outcome == "approved":
+            return _task_approved(actl_dir, task)
+        if verification.outcome == "failed":
+            return _verification_failed(
+                actl_dir, task.id, verification.reason,
+                log_hint=verification.log_hint,
+            )
+        # The existing implementation spends one worker attempt: it was
+        # produced by an earlier worker run, even if none was recorded.
+        attempts = max(attempts, 1)
+        feedback = verification.feedback
+        execution.record_attempt_state(actl_dir, task.id, attempts, feedback)
+        if attempts >= execution.MAX_WORKER_ATTEMPTS:
+            return _needs_human(actl_dir, task, verification, attempts)
+        _set_task_status(actl_dir, task.id, tasks.STATUS_RUNNING)
 
-    if task.status == tasks.STATUS_RUNNING:
+    while attempts < execution.MAX_WORKER_ATTEMPTS:
+        attempt = attempts + 1
+        model = _attempt_model(metadata, attempt)
         _event(
-            "Retrying task t" + str(task.id)
-            + ", left RUNNING by an interrupted execution"
+            "Worker attempt " + str(attempt) + "/"
+            + str(execution.MAX_WORKER_ATTEMPTS) + " (" + model + ")"
         )
+        status, reason, log_path = _run_worker_attempt(
+            binary, root, actl_dir, task, lock_fd, base_branch,
+            attempt=attempt, model=model, feedback=feedback,
+            retry=not (attempt == 1 and task.status == tasks.STATUS_PENDING),
+            announce_worktree=attempt == 1,
+        )
+        if status != tasks.STATUS_IMPLEMENTED:
+            _set_task_status(actl_dir, task.id, status)
+            _event("Task status: " + status)
+            return _fail(
+                "task t" + str(task.id) + " failed: " + reason
+                + " (log: " + str(log_path) + ")"
+            )
+        attempts = attempt
+        # The feedback was handed to the worker that just ran; clear it so an
+        # interruption during validation or review re-verifies this commit
+        # instead of launching another worker.
+        execution.record_attempt_state(actl_dir, task.id, attempts, "")
+        _set_task_status(actl_dir, task.id, tasks.STATUS_IMPLEMENTED)
+        _event("Task status: IMPLEMENTED")
 
+        verification = _validate_and_review(
+            binary, root, actl_dir, task, base_branch, reviewer_model,
+            validation_commands, lock_fd, attempt=attempt,
+        )
+        if verification.outcome == "approved":
+            return _task_approved(actl_dir, task)
+        if verification.outcome == "failed":
+            return _verification_failed(
+                actl_dir, task.id, verification.reason,
+                log_hint=verification.log_hint,
+            )
+        feedback = verification.feedback
+        execution.record_attempt_state(actl_dir, task.id, attempts, feedback)
+        if attempts >= execution.MAX_WORKER_ATTEMPTS:
+            return _needs_human(actl_dir, task, verification, attempts)
+        _set_task_status(actl_dir, task.id, tasks.STATUS_RUNNING)
+
+    # The budget was already exhausted by an earlier attempt (for example a
+    # reviewer execution error after the third worker attempt).
+    return _needs_human(actl_dir, task, None, attempts)
+
+
+def _run_worker_attempt(
+    binary, root, actl_dir, task, lock_fd, base_branch, attempt, model,
+    feedback, retry, announce_worktree,
+):
+    """Run one worker attempt in the task worktree.
+
+    Returns ``(status, reason, log_path)``: ``IMPLEMENTED`` with an empty
+    reason when the worker left a clean, committed implementation;
+    ``FAILED`` with a reason for a worker or OpenCode execution error. The
+    attempt continues on the existing branch and never resets it.
+    """
     log_path, log = execution.open_run_log(actl_dir, task.id)
     with log:
         log.write("actl task run\n")
         log.write("task: t" + str(task.id) + " - " + task.title + "\n")
+        log.write(
+            "attempt: " + str(attempt) + " of "
+            + str(execution.MAX_WORKER_ATTEMPTS) + "\n"
+        )
         log.write("model: " + model + "\n")
         log.write("started_at: " + _utc_now() + "\n")
 
@@ -908,23 +1052,24 @@ def _execute_task(
         reason = ""
         exit_code = None
         try:
-            _event("Preparing worktree")
+            if announce_worktree:
+                _event("Preparing worktree")
             worktree = execution.ensure_worktree(
-                root, actl_dir, task, retry=task.status != tasks.STATUS_PENDING,
-                base_branch=base_branch,
+                root, actl_dir, task, retry=retry, base_branch=base_branch,
             )
             log.write("branch: " + worktree.branch + "\n")
             log.write("worktree: " + str(worktree.path) + "\n")
-            if worktree.created:
-                _event(
-                    "Created worktree " + str(worktree.path)
-                    + " (branch " + worktree.branch + ")"
-                )
-            else:
-                _event(
-                    "Reusing worktree " + str(worktree.path)
-                    + " (branch " + worktree.branch + ")"
-                )
+            if announce_worktree:
+                if worktree.created:
+                    _event(
+                        "Created worktree " + str(worktree.path)
+                        + " (branch " + worktree.branch + ")"
+                    )
+                else:
+                    _event(
+                        "Reusing worktree " + str(worktree.path)
+                        + " (branch " + worktree.branch + ")"
+                    )
             session = opencode.create_session(
                 binary, worktree.path,
                 title="actl task t" + str(task.id) + ": " + task.title,
@@ -939,8 +1084,11 @@ def _execute_task(
             _event("log: " + str(log_path))
             exit_code = opencode.run_headless(
                 binary, worktree.path, session.id, model,
-                execution.worker_prompt(task, worktree, base_branch), log,
-                pass_fds=(lock_fd,),
+                execution.worker_prompt(
+                    task, worktree, base_branch, attempt=attempt,
+                    total=execution.MAX_WORKER_ATTEMPTS, feedback=feedback,
+                ),
+                log, pass_fds=(lock_fd,),
             )
             if exit_code == 0:
                 _event("Worker finished with exit code 0")
@@ -957,32 +1105,38 @@ def _execute_task(
         log.write("result: " + status + "\n")
         if reason:
             log.write("reason: " + reason + "\n")
-
-    _set_task_status(actl_dir, task.id, status)
-    _event("Task status: " + status)
-    if status != tasks.STATUS_IMPLEMENTED:
-        return _fail(
-            "task t" + str(task.id) + " failed: " + reason
-            + " (log: " + str(log_path) + ")"
-        )
-    return _verify_task(
-        binary, root, actl_dir, task, base_branch, reviewer_model,
-        validation_commands, lock_fd,
-    )
+    return status, reason, log_path
 
 
-def _verify_task(
+@dataclass(frozen=True)
+class _Verification:
+    """The outcome of validating and reviewing one implementation commit."""
+
+    outcome: str  # "approved", "rejected", "validation_failed", "failed"
+    reason: str = ""
+    feedback: str = ""
+    findings: tuple = ()
+    verdict: object = None
+    log_hint: object = None
+
+
+def _validate_and_review(
     binary, root, actl_dir, task, base_branch, reviewer_model,
-    validation_commands, lock_fd, announce_worktree=False,
-) -> int:
-    """Validate and review an implemented task.
+    validation_commands, lock_fd, attempt, announce_worktree=False,
+) -> _Verification:
+    """Validate and review one implemented commit.
 
     Validation and review must refer to one exact commit: it is recorded
     before validation, the task worktree must stay clean and on its branch,
     and the task branch must still point at that commit before any verdict is
-    recorded. Anything else stops the run without repairing it.
+    recorded.
 
-    The task stays IMPLEMENTED until the outcome is known.
+    A failed validation command and a reviewer rejection with critical or
+    major findings are implementation outcomes the caller repairs; the
+    returned feedback explains them to the next worker. A validation
+    integrity failure, a reviewer execution or format failure, and any other
+    orchestration error return ``"failed"`` and never trigger a repair
+    worker.
     """
     try:
         worktree = execution.ensure_worktree(
@@ -1001,7 +1155,7 @@ def _verify_task(
                 )
         commit = _verification_commit(root, worktree, base_branch)
     except (execution.ExecutionError, opencode.OpenCodeError, OSError) as exc:
-        return _verification_failed(actl_dir, task.id, str(exc))
+        return _Verification("failed", reason=str(exc))
 
     validation_result = None
     validation_log_path = None
@@ -1015,6 +1169,7 @@ def _verify_task(
             with log:
                 log.write("actl validation\n")
                 log.write("task: t" + str(task.id) + " - " + task.title + "\n")
+                log.write("attempt: " + str(attempt) + "\n")
                 log.write("branch: " + worktree.branch + "\n")
                 log.write("commit: " + commit + "\n")
                 log.write("started_at: " + _utc_now() + "\n---\n")
@@ -1039,8 +1194,9 @@ def _verify_task(
                 elif validation_result.reason:
                     log.write("reason: " + validation_result.reason + "\n")
         except OSError as exc:
-            return _verification_failed(
-                actl_dir, task.id, "validation could not run: " + str(exc),
+            return _Verification(
+                "failed",
+                reason="validation could not run: " + str(exc),
                 log_hint=validation_log_path,
             )
         if not validation_result.passed:
@@ -1050,15 +1206,22 @@ def _verify_task(
                     "Validation failed (" + validation_result.failed
                     + ", exit code " + str(exit_code) + ")"
                 )
-                detail = (
-                    validation_result.failed + " exited with status "
-                    + str(exit_code)
+                return _Verification(
+                    "validation_failed",
+                    reason="validation failed: " + validation_result.failed
+                    + " exited with status " + str(exit_code),
+                    feedback=_validation_feedback(
+                        attempt, validation_result, validation_log_path
+                    ),
+                    log_hint=validation_log_path,
                 )
-            else:
-                _event("Validation failed (worktree or commit changed)")
-                detail = validation_result.reason
-            return _verification_failed(
-                actl_dir, task.id, "validation failed: " + detail,
+            # A validation command that moved HEAD or changed tracked files is
+            # a project or validation-configuration problem, not something a
+            # worker repair could address: fail without a repair attempt.
+            _event("Validation failed (worktree or commit changed)")
+            return _Verification(
+                "failed",
+                reason="validation failed: " + validation_result.reason,
                 log_hint=validation_log_path,
             )
         _event("Validation passed")
@@ -1075,6 +1238,7 @@ def _verify_task(
             verdict = _run_reviewer(
                 binary, root, actl_dir, task, worktree, commit, base_branch,
                 reviewer_model, validation_result, lock_fd, review_log,
+                attempt,
             )
         finally:
             review_log.close()
@@ -1083,50 +1247,53 @@ def _verify_task(
         OSError,
     ) as exc:
         _event("Review failed")
-        return _verification_failed(
-            actl_dir, task.id, "review failed: " + str(exc),
+        return _Verification(
+            "failed",
+            reason="review failed: " + str(exc),
             log_hint=review_log_path,
         )
 
     try:
         _require_commit_intact(root, worktree, commit, "the review")
     except execution.ExecutionError as exc:
-        return _verification_failed(
-            actl_dir, task.id, str(exc), log_hint=review_log_path,
+        return _Verification(
+            "failed", reason=str(exc), log_hint=review_log_path,
         )
 
     _record_review(actl_dir, task.id, commit, verdict)
     if verdict.decision == review.DECISION_APPROVED:
-        _set_task_status(actl_dir, task.id, tasks.STATUS_APPROVED)
         _event(
             "Review approved ("
             + (_finding_summary(verdict.findings) or "no findings") + ")"
         )
         _print_findings(verdict.findings)
-        print("")
-        print("Task t" + str(task.id) + " \u2192 APPROVED")
-        return 0
+        return _Verification(
+            "approved", verdict=verdict, findings=verdict.findings,
+            log_hint=review_log_path,
+        )
 
-    _set_task_status(actl_dir, task.id, tasks.STATUS_NEEDS_CHANGES)
     _event("Review requested changes (" + _finding_summary(verdict.blocking) + ")")
     _print_findings(verdict.findings)
-    print("")
-    print("Task t" + str(task.id) + " \u2192 NEEDS_CHANGES")
-    return _fail(
-        "task t" + str(task.id) + " needs changes: "
-        + _finding_summary(verdict.blocking)
-        + " (review log: " + str(review_log_path) + ")"
+    return _Verification(
+        "rejected",
+        reason="review requested changes: " + _finding_summary(verdict.blocking),
+        feedback=_review_feedback(attempt, verdict.blocking),
+        verdict=verdict,
+        findings=verdict.findings,
+        log_hint=review_log_path,
     )
 
 
 def _run_reviewer(
     binary, root, actl_dir, task, worktree, commit, base_branch,
-    reviewer_model, validation_result, lock_fd, log,
+    reviewer_model, validation_result, lock_fd, log, attempt=None,
 ) -> review.Verdict:
     """Run the reviewer in a temporary worktree at ``commit``.
 
     The worktree is discarded on every path. The returned verdict has already
-    been validated; malformed output raises :class:`review.ReviewError`.
+    been validated; malformed output raises :class:`review.ReviewError`. The
+    reviewer always evaluates the complete cumulative task diff, never just
+    the latest repair commit.
     """
     base_commit = execution.branch_base(actl_dir, task.id)
     if base_commit is None:
@@ -1148,6 +1315,8 @@ def _run_reviewer(
     try:
         log.write("actl review\n")
         log.write("task: t" + str(task.id) + " - " + task.title + "\n")
+        if attempt is not None:
+            log.write("attempt: " + str(attempt) + "\n")
         log.write("model: " + reviewer_model + "\n")
         log.write("commit: " + commit + "\n")
         log.write("base_commit: " + base_commit + "\n")
@@ -1327,6 +1496,160 @@ def _record_review(actl_dir: Path, task_id: int, commit: str, verdict) -> None:
         conn.close()
 
 
+def _attempt_baseline(actl_dir: Path, task):
+    """Return the task's recorded ``(attempts, feedback)`` for this run.
+
+    A Stage 5 task that ended NEEDS_CHANGES continues from its remaining
+    attempts: its first worker attempt and the review rejection are already
+    history, so the next run starts at attempt 2 with the stored blocking
+    findings as feedback. When no review row exists the attempt is still
+    counted - the status itself proves that a rejection happened - but no
+    feedback can be reconstructed.
+    """
+    state = execution.attempt_state(actl_dir, task.id)
+    if state is not None:
+        return state
+    if task.status == tasks.STATUS_NEEDS_CHANGES:
+        feedback = _legacy_review_feedback(actl_dir, task.id)
+        # Persist the derived baseline immediately: a later worker execution
+        # error changes the status to FAILED, and the spent attempt must not
+        # be forgotten when the task is retried.
+        execution.record_attempt_state(actl_dir, task.id, 1, feedback)
+        return 1, feedback
+    return 0, ""
+
+
+def _attempt_model(metadata: dict, attempt: int) -> str:
+    """Return the model for worker ``attempt`` (1-based).
+
+    The first two attempts use the project's worker model; the third and
+    final attempt uses the escalation worker model when configured, and
+    otherwise keeps using the regular worker model.
+    """
+    if attempt >= execution.MAX_WORKER_ATTEMPTS:
+        escalation = _escalation_worker_model(metadata)
+        if escalation is not None:
+            return escalation
+    return _worker_model(metadata)
+
+
+def _legacy_review_feedback(actl_dir: Path, task_id: int) -> str:
+    """Rebuild repair feedback from the newest stored review, if any."""
+    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    try:
+        stored = tasks.latest_review(conn, task_id)
+    finally:
+        conn.close()
+    if not stored or stored.get("decision") != tasks.REVIEW_CHANGES_REQUESTED:
+        return ""
+    findings = tuple(
+        review.Finding(
+            severity=item.get("severity", ""),
+            description=item.get("description", ""),
+            scenario=item.get("scenario", ""),
+            impact=item.get("impact", ""),
+            location=item.get("location", ""),
+        )
+        for item in stored.get("findings", [])
+        if isinstance(item, dict)
+        and item.get("severity") in review.BLOCKING_SEVERITIES
+    )
+    if not findings:
+        return ""
+    return _review_feedback(1, findings)
+
+
+def _validation_feedback(attempt: int, result, log_path) -> str:
+    """Describe a failed validation command for the next worker attempt."""
+    lines = [
+        "The previous implementation (worker attempt " + str(attempt)
+        + ") failed the project's validation:",
+        "",
+        "Failed command: " + result.failed,
+    ]
+    if result.results:
+        lines.append("Exit code: " + str(result.results[-1][1]))
+    lines += [
+        "",
+        "Relevant validation output (tail of " + str(log_path) + "):",
+        _file_tail(log_path),
+    ]
+    return "\n".join(lines)
+
+
+def _review_feedback(attempt: int, findings) -> str:
+    """Describe blocking reviewer findings for the next worker attempt."""
+    lines = [
+        "The independent reviewer rejected the previous implementation"
+        " (worker attempt " + str(attempt) + ") with these blocking findings:",
+        "",
+    ]
+    for finding in findings:
+        lines.append("- [" + finding.severity + "] " + finding.description)
+        if finding.scenario:
+            lines.append("  scenario: " + finding.scenario)
+        if finding.impact:
+            lines.append("  impact: " + finding.impact)
+        if finding.location:
+            lines.append("  location: " + finding.location)
+    return "\n".join(lines)
+
+
+def _file_tail(path, limit: int = 4000) -> str:
+    """Return the end of a log file, for worker feedback."""
+    try:
+        text = Path(path).read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return "(the log could not be read)"
+    if len(text) > limit:
+        return "...\n" + text[-limit:]
+    return text.rstrip()
+
+
+def _task_approved(actl_dir, task) -> int:
+    """Mark the task APPROVED and print the final line of the run."""
+    _set_task_status(actl_dir, task.id, tasks.STATUS_APPROVED)
+    print("")
+    print("Task t" + str(task.id) + " \u2192 APPROVED")
+    return 0
+
+
+def _needs_human(actl_dir, task, verification, attempts) -> int:
+    """Mark the task NEEDS_HUMAN after its three attempts are exhausted."""
+    _set_task_status(actl_dir, task.id, tasks.STATUS_NEEDS_HUMAN)
+    print("")
+    print("Task t" + str(task.id) + " \u2192 NEEDS_HUMAN")
+    if verification is not None and verification.outcome == "rejected":
+        blocking = (
+            verification.verdict.blocking
+            if verification.verdict is not None else verification.findings
+        )
+        detail = (
+            "the reviewer still reports blocking findings after "
+            + str(attempts) + " worker attempts ("
+            + _finding_summary(blocking) + ")"
+        )
+    elif verification is not None and verification.reason:
+        detail = (
+            verification.reason + " after " + str(attempts)
+            + " worker attempts"
+        )
+    else:
+        detail = (
+            "all " + str(attempts) + " worker attempts were used and the"
+            " implementation is still not approved"
+        )
+    message = "task t" + str(task.id) + " needs human intervention: " + detail
+    if verification is not None and verification.log_hint is not None:
+        message += " (log: " + str(verification.log_hint) + ")"
+    message += (
+        "; inspect the task branch, worktree, and logs and intervene by hand"
+        " (removing .actl/attempts/t" + str(task.id) + " grants a deliberate"
+        " fresh three-attempt budget)"
+    )
+    return _fail(message)
+
+
 def _finding_summary(findings) -> str:
     """Describe findings, for example ``"2 minor findings"``."""
     if not findings:
@@ -1387,11 +1710,15 @@ def _evaluate_run(worktree, exit_code: int, base_branch: str):
     return tasks.STATUS_IMPLEMENTED, ""
 
 
-def _require_runnable(task) -> None:
-    """Refuse tasks that may not be executed in this stage.
+def _require_runnable(task, actl_dir: Path) -> None:
+    """Refuse tasks that may not be executed.
 
     An IMPLEMENTED task proceeds straight to validation and review without
-    rerunning the worker.
+    rerunning the worker. A NEEDS_CHANGES task from Stage 5 continues from
+    its remaining attempts. A NEEDS_HUMAN task refuses to run while its
+    exhausted attempt record exists: another automatic cycle would silently
+    restart the budget, so the human must intervene (removing
+    ``.actl/attempts/tN`` deliberately grants a fresh one).
     """
     if task.depends_on:
         dependencies = ", ".join("t" + str(dep) for dep in task.depends_on)
@@ -1400,19 +1727,23 @@ def _require_runnable(task) -> None:
             + "; dependency-aware execution arrives in a later stage (Stage 7"
             " introduces DONE after merging)"
         )
-    if task.status == tasks.STATUS_IMPLEMENTED:
-        return
-    if task.status == tasks.STATUS_NEEDS_CHANGES:
-        raise tasks.TaskError(
-            "cannot run task t" + str(task.id) + ": it is NEEDS_CHANGES after"
-            " review; automatic repair arrives in a later stage"
-        )
     if task.status == tasks.STATUS_APPROVED:
         raise tasks.TaskError(
             "cannot run task t" + str(task.id) + ": it is already APPROVED"
         )
+    if task.status == tasks.STATUS_NEEDS_HUMAN:
+        if execution.attempt_state(actl_dir, task.id) is None:
+            return
+        raise tasks.TaskError(
+            "cannot run task t" + str(task.id) + ": it is NEEDS_HUMAN after"
+            " its " + str(execution.MAX_WORKER_ATTEMPTS) + " worker attempts;"
+            " inspect the task branch, worktree, and logs and intervene by"
+            " hand (removing .actl/attempts/t" + str(task.id) + " grants a"
+            " deliberate fresh three-attempt budget)"
+        )
     if task.status not in (
-        tasks.STATUS_PENDING, tasks.STATUS_RUNNING, tasks.STATUS_FAILED
+        tasks.STATUS_PENDING, tasks.STATUS_RUNNING, tasks.STATUS_FAILED,
+        tasks.STATUS_IMPLEMENTED, tasks.STATUS_NEEDS_CHANGES,
     ):
         raise tasks.TaskError(
             "cannot run task t" + str(task.id)
@@ -1534,6 +1865,12 @@ def build_parser() -> argparse.ArgumentParser:
         "--reviewer-model", metavar="MODEL",
         help="set the project's reviewer model (provider/model[#variant]);"
              " required by 'actl task run'",
+    )
+    init.add_argument(
+        "--escalation-worker-model", metavar="MODEL",
+        help="set the model for the third and final worker attempt of a"
+             " repair cycle (provider/model[#variant]); defaults to the"
+             " worker model",
     )
     init.add_argument(
         "--base", metavar="BRANCH",

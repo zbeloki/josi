@@ -40,9 +40,21 @@ Behaviour is controlled through environment variables:
 * ``ACTL_FAKE_TUI_EXIT``    - exit code for the interactive TUI invocation
 * ``ACTL_FAKE_RUN``         - worker behaviour on ``run``: commit (default),
                               dirty (leave an uncommitted file), none, empty
-                              (make an empty commit), or detach (leave the
-                              worktree on a detached HEAD)
+                              (make an empty commit), detach (leave the
+                              worktree on a detached HEAD), or commit-index
+                              (commit a new ``worker-output-N.txt`` file,
+                              with N the one-based invocation number from
+                              ``ACTL_FAKE_RUN_COUNT_FILE``)
 * ``ACTL_FAKE_RUN_EXIT``    - exit code for the noninteractive run
+* ``ACTL_FAKE_RUN_SEQUENCE`` - JSON list of per-invocation behaviours (a
+                              string behaviour or an object with optional
+                              ``behavior``, ``exit``, and ``wait_for``
+                              members); the invocation number from
+                              ``ACTL_FAKE_RUN_COUNT_FILE`` selects the entry,
+                              and entries past the end fall back to the
+                              environment defaults
+* ``ACTL_FAKE_RUN_COUNT_FILE`` - file counting worker invocations; used with
+                              ``ACTL_FAKE_RUN_SEQUENCE`` and ``commit-index``
 * ``ACTL_FAKE_RUN_STREAM``  - text the worker prints to stdout and stderr
                               (flushed immediately) before it waits or does
                               any work, to test that the log is written
@@ -55,6 +67,12 @@ Behaviour is controlled through environment variables:
 * ``ACTL_FAKE_REVIEW_JSON`` - the final reviewer message (defaults to an
                               approval); ``opencode run --agent plan`` prints
                               it as the text event of ``--format json`` output
+* ``ACTL_FAKE_REVIEW_SEQUENCE`` - JSON list of per-invocation reviewer
+                              messages (objects) selected with
+                              ``ACTL_FAKE_REVIEW_COUNT_FILE``; entries past
+                              the end fall back to ``ACTL_FAKE_REVIEW_JSON``
+* ``ACTL_FAKE_REVIEW_COUNT_FILE`` - file counting reviewer invocations; used
+                              with ``ACTL_FAKE_REVIEW_SEQUENCE``
 * ``ACTL_FAKE_REVIEW_EXIT`` - exit code for the reviewer invocation
 * ``ACTL_FAKE_REVIEW_MARKER`` - file receiving the reviewer PID when it starts
 * ``ACTL_FAKE_REVIEW_WAIT_FOR`` - the reviewer waits for this file (max 120s)
@@ -78,6 +96,68 @@ def _log(argv):
         return
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps({"argv": argv, "cwd": os.getcwd()}) + "\\n")
+
+
+def _next_index(path):
+    """Return the current invocation index and bump the count file.
+
+    Without a count file every invocation is index 0, which keeps the
+    environment-default behaviour.
+    """
+    if not path:
+        return 0
+    try:
+        with open(path, encoding="utf-8") as handle:
+            index = int(handle.read().strip() or "0")
+    except (OSError, ValueError):
+        index = 0
+    try:
+        with open(path, "w", encoding="utf-8") as handle:
+            handle.write(str(index + 1))
+    except OSError:
+        pass
+    return index
+
+
+def _sequence_item(name, index):
+    """Return the ``index``-th entry of the JSON list in ``name``, or None."""
+    raw = os.environ.get(name)
+    if not raw:
+        return None
+    try:
+        items = json.loads(raw)
+    except ValueError:
+        return None
+    if not isinstance(items, list) or index >= len(items):
+        return None
+    return items[index]
+
+
+def _review_message():
+    """The reviewer's final message for this invocation."""
+    index = _next_index(os.environ.get("ACTL_FAKE_REVIEW_COUNT_FILE"))
+    item = _sequence_item("ACTL_FAKE_REVIEW_SEQUENCE", index)
+    if item is not None:
+        return item if isinstance(item, str) else json.dumps(item)
+    return os.environ.get(
+        "ACTL_FAKE_REVIEW_JSON", '{"decision":"approved","findings":[]}'
+    )
+
+
+def _worker_plan():
+    """Return ``(behavior, exit_code, wait_for, index)`` for this invocation."""
+    behavior = os.environ.get("ACTL_FAKE_RUN", "commit")
+    exit_code = int(os.environ.get("ACTL_FAKE_RUN_EXIT", "0"))
+    wait_for = os.environ.get("ACTL_FAKE_RUN_WAIT_FOR")
+    index = _next_index(os.environ.get("ACTL_FAKE_RUN_COUNT_FILE"))
+    item = _sequence_item("ACTL_FAKE_RUN_SEQUENCE", index)
+    if isinstance(item, dict):
+        behavior = item.get("behavior", behavior)
+        exit_code = int(item.get("exit", exit_code))
+        wait_for = item.get("wait_for", wait_for)
+    elif isinstance(item, str):
+        behavior = item
+    return behavior, exit_code, wait_for, index
 
 
 def _run_reviewer():
@@ -109,9 +189,7 @@ def _run_reviewer():
             handle.write("reviewer scratch\\n")
     print(json.dumps({"type": "step_start",
                       "part": {"type": "step-start"}}))
-    message = os.environ.get(
-        "ACTL_FAKE_REVIEW_JSON", '{"decision":"approved","findings":[]}'
-    )
+    message = _review_message()
     print(json.dumps({
         "type": "text",
         "part": {"type": "text", "messageID": "msg_fake_review",
@@ -126,6 +204,7 @@ def _run_reviewer():
 
 def _run_worker():
     """Emulate one noninteractive worker turn inside the current directory."""
+    behavior, exit_code, wait_for, index = _worker_plan()
     marker = os.environ.get("ACTL_FAKE_RUN_MARKER")
     if marker:
         with open(marker, "w", encoding="utf-8") as handle:
@@ -137,15 +216,24 @@ def _run_worker():
             "fake opencode: " + stream + " on stderr",
             file=sys.stderr, flush=True,
         )
-    wait_for = os.environ.get("ACTL_FAKE_RUN_WAIT_FOR")
     deadline = time.time() + 120
     while wait_for and not os.path.exists(wait_for) and time.time() < deadline:
         time.sleep(0.05)
-    behavior = os.environ.get("ACTL_FAKE_RUN", "commit")
     if behavior == "commit":
         with open("worker-output.txt", "a", encoding="utf-8") as handle:
             handle.write("worker change\\n")
         subprocess.run(["git", "add", "worker-output.txt"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Fake Worker",
+             "-c", "user.email=worker@example.invalid",
+             "commit", "-m", "worker: implement task"],
+            check=True, capture_output=True,
+        )
+    elif behavior == "commit-index":
+        name = "worker-output-" + str(index + 1) + ".txt"
+        with open(name, "a", encoding="utf-8") as handle:
+            handle.write("worker change " + str(index + 1) + "\\n")
+        subprocess.run(["git", "add", name], check=True)
         subprocess.run(
             ["git", "-c", "user.name=Fake Worker",
              "-c", "user.email=worker@example.invalid",
@@ -170,7 +258,7 @@ def _run_worker():
     if done:
         with open(done, "w", encoding="utf-8") as handle:
             handle.write("done")
-    return int(os.environ.get("ACTL_FAKE_RUN_EXIT", "0"))
+    return exit_code
 
 
 def main():

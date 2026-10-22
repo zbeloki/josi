@@ -6,7 +6,9 @@ Stage 2 adds a project-local task list; Stage 3 lets the planner manage that
 task list through the same `actl task` CLI; Stage 4 runs one task at a time
 with a noninteractive OpenCode worker in an isolated Git worktree; Stage 5
 validates the worker's commit with project-configured commands and has an
-independent reviewer approve or reject it.
+independent reviewer approve or reject it; Stage 6 repairs rejected
+implementations automatically with up to three worker attempts and escalates
+to a stronger model on the last one.
 
 ## Requirements
 
@@ -30,7 +32,7 @@ actl init          # register the Git repository as an actl project
 actl plan          # start (or resume) the planner; it can manage tasks
 actl plan --new    # start a fresh planner session
 actl task list     # list the project's tasks
-actl task run t1   # execute a task: worker, validation, and review
+actl task run t1   # execute a task: worker attempts, validation, and review
 ```
 
 - `actl init` requires a Git repository, creates `.actl/project.json`, and adds
@@ -40,6 +42,9 @@ actl task run t1   # execute a task: worker, validation, and review
   model, for example `actl init --worker-model openrouter/anthropic/claude-sonnet-latest`.
   `actl init --reviewer-model MODEL` sets the independent reviewer's model;
   `actl task run` requires it and refuses to start without one.
+  `actl init --escalation-worker-model MODEL` sets the stronger model used
+  for the third and final repair attempt (see below); without it the regular
+  worker model keeps running the third attempt.
   `actl init --base BRANCH` sets the base branch that task branches are
   created from; without it the branch is detected, and when the choice is
   ambiguous actl asks. It works in repositories without commits, where it
@@ -104,11 +109,13 @@ actl task delete t2
 `actl task run <id>` executes one task end to end: a noninteractive OpenCode
 worker implements it in an isolated Git worktree, the project's validation
 commands run on the worker's commit, and an independent reviewer approves or
-rejects that exact commit. Nothing is retried, repaired, or merged.
+rejects that exact commit. A failed validation command or a reviewer
+rejection with critical or major findings triggers an automatic repair: actl
+runs up to three worker attempts in all and escalates the last one to a
+stronger model. Nothing is merged.
 
 ```sh
-actl task run t1   # first execution, an explicit retry after a failure, or
-                   # validation + review of an IMPLEMENTED task
+actl task run t1   # up to three worker attempts, validation, and review
 ```
 
 A run goes through these steps:
@@ -125,14 +132,20 @@ A run goes through these steps:
    task runs - never at `actl task create`.
 4. OpenCode runs one noninteractive turn inside the worktree with the
    project's worker model and the built-in `build` agent
-   (`opencode run --agent build --model MODEL --session ID`).
+   (`opencode run --agent build --model MODEL --session ID`). A repair
+   attempt uses the escalation model on the third attempt and carries the
+   previous failure as feedback; the worker continues on the same branch and
+   actl never resets the branch or discards earlier commits.
 5. The worker's complete stdout and stderr are written straight into a log
    file under `.actl/runs/` while it runs; the log path is printed when the
    worker starts, so the run can be followed with `tail -f <logfile>`.
 6. After the worker succeeds, the configured validation commands run in the
    task worktree (see below) and an independent reviewer examines the
    validated commit in a temporary worktree.
-7. The task status is updated.
+7. An approval ends the run with `APPROVED`. A failed validation command or
+   a rejection with critical or major findings starts the next worker attempt
+   in the same branch and worktree, with the failure as feedback; when all
+   three attempts are used the task ends `NEEDS_HUMAN`.
 
 The terminal shows only actl's own timestamped events - task, models,
 worktree preparation, worker start, worker exit code, validation start and
@@ -147,33 +160,50 @@ The lifecycle is:
 
 ```text
 PENDING → RUNNING → IMPLEMENTED → APPROVED
-                  ↘ FAILED         ↘ NEEDS_CHANGES
+                  ↘ FAILED         ↘ NEEDS_HUMAN
 ```
 
 - `IMPLEMENTED` means the worker exited successfully, left a clean task
   worktree, and left committed changes on the task branch relative to the
   base branch. A run normally continues from there to validation and review;
-  a task stays `IMPLEMENTED` only when a run is interrupted or when it was
-  left behind by Stage 4.
+  a task stays `IMPLEMENTED` when an execution is interrupted between the
+  worker and the next stage, and a later run validates and reviews that same
+  commit - before starting another worker attempt - when it was never
+  rejected.
 - `APPROVED` means validation passed and the reviewer approved the exact
-  validated commit. It does **not** mean the code has been merged.
-- `NEEDS_CHANGES` means the reviewer reported at least one critical or major
-  finding; the findings are printed and stored for Stage 6. Stage 5 never
-  retries or repairs automatically.
+  validated commit, possibly after repairs. It does **not** mean the code has
+  been merged.
+- `NEEDS_HUMAN` means all three worker attempts were used without an
+  approval: the reviewer still reported critical or major findings, or a
+  validation command kept failing. The findings, logs, branch, and worktree
+  are preserved and no further attempt is started automatically; re-running
+  the task is refused until a human intervenes (removing
+  `.actl/attempts/t1` grants a deliberate fresh three-attempt budget).
+- `NEEDS_CHANGES` remains from Stage 5: a task left in that state by an older
+  actl continues from its remaining attempts - its first worker attempt and
+  the stored rejection count against the budget, so its next run starts at
+  attempt 2 with the stored findings as feedback.
+- `FAILED` covers infrastructure failures: a worker or OpenCode execution
+  error, a reviewer execution or verdict-format error, a corrupt attempt
+  record, or a validation command that changed tracked files or `HEAD`. None
+  of them launch a repair worker, because another implementation attempt
+  cannot fix an orchestration problem. A `FAILED` task can be retried
+  explicitly.
 - `actl task run` requires a reviewer model. Without one it refuses before
   taking the execution lock, creating a worktree, or changing the task.
 - A task that fails can be retried explicitly with `actl task run <id>`: the
   existing branch and worktree are reused as they are, so earlier commits are
   preserved and the worker continues from there. Nothing is reset, cleaned,
-  rebased, or merged.
+  rebased, or merged. An explicit retry continues the recorded attempt
+  accounting; it never silently restarts the budget.
 - Tasks with dependencies stay blocked. Dependency-aware execution arrives in
   a later stage (Stage 7, when successfully merged tasks become `DONE`); in
-  Stage 5 only tasks without dependencies can run.
-- An `APPROVED` or `NEEDS_CHANGES` task cannot be run again.
+  Stage 6 only tasks without dependencies can run.
+- An `APPROVED` task cannot be run again.
 - If an execution is interrupted (for example by Ctrl-C or a crash), the task
   keeps its status and its worktree and log are preserved; there is no
   automatic recovery, but an explicit `actl task run <id>` continues from the
-  preserved worktree.
+  preserved worktree and the recorded attempts.
 - The task is marked `IMPLEMENTED` only when OpenCode exits with status 0,
   the worktree is still on its task branch, the worktree is clean, and the
   branch has committed changes relative to the base branch. A worker that
@@ -194,6 +224,17 @@ runs: a task that is not `IMPLEMENTED` fails before the worktree is prepared
 or anything is launched without one, while an `IMPLEMENTED` task is validated
 and reviewed without it. OpenCode fails the run if the model is not available
 in the worktree.
+
+The escalation worker model is optional project configuration:
+
+```sh
+actl init --escalation-worker-model openrouter/anthropic/claude-opus-latest
+```
+
+It is stored as `escalation_worker_model` in `.actl/project.json`. It is used
+only for the third and final worker attempt of a repair cycle; without it the
+regular worker model runs the third attempt too. It is never used for the
+first two attempts, and the reviewer model never changes during repairs.
 
 The reviewer model is configured independently:
 
@@ -227,18 +268,71 @@ selection; a project initialized before `base_branch` existed gains one on
 the next `actl init`, and `actl task run` keeps working by detecting the
 branch without writing metadata.
 
-Every execution writes `.actl/runs/t1-<timestamp>.log` for the worker, plus
-`.actl/runs/t1-<timestamp>-validation.log` and
+Every worker attempt writes its own log: `.actl/runs/t1-<timestamp>.log` for
+the worker, plus `.actl/runs/t1-<timestamp>-validation.log` and
 `.actl/runs/t1-<timestamp>-review.log` when those stages run. Each log starts
-with a header (task, model, branch, commit) and ends with the result (exit
-codes, status, verdict, failure reason). The logs are written continuously
-while the stage runs, and each path is printed when the stage starts as well
-as in the final summary; use `tail -f` to watch a run.
+with a header (task, attempt, model, branch, commit) and ends with the result
+(exit codes, status, verdict, failure reason), and an earlier attempt's logs
+are never overwritten. The logs are written continuously while the stage
+runs, and each path is printed when the stage starts as well as in the final
+summary; use `tail -f` to watch a run.
 
 Only one execution may run per project. The lock is an exclusive, nonblocking
 `fcntl.flock` on `.actl/execution.lock`, and the locked file descriptor is
 passed to the OpenCode worker and reviewer (Python's `pass_fds`), so the lock
 stays held while those processes are alive even if actl itself is killed.
+
+## Repair and escalation
+
+A validation command that exits non-zero and a reviewer verdict of
+`changes_requested` (which always carries at least one critical or major
+finding) are implementation failures: actl feeds them back to the next
+worker attempt instead of stopping. A task gets at most three worker attempts:
+
+1. Attempt 1 uses `worker_model`.
+2. Attempt 2 uses `worker_model` with the failure feedback.
+3. Attempt 3 uses `escalation_worker_model` (or `worker_model` when the
+   project did not configure an escalation model) with the same feedback.
+
+The feedback carries the original task requirements plus either the failed
+validation command with the tail of its output or every critical and major
+finding with its description, failure scenario, impact, and location. The
+worker is told to continue from the existing worktree and commits; the branch
+is never reset, rebased, or recreated, and the reviewer always evaluates the
+complete cumulative task diff - never just the latest repair commit. Minor
+findings and suggestions never trigger a repair: an approval with minor
+findings is a successful result, and the reviewer is never asked to become
+stricter on later attempts.
+
+The console reports each attempt with its model and outcome:
+
+```text
+task t1: Add authentication
+
+[14:00] Worker attempt 1/3 (provider/model)
+[14:03] Validation passed
+[14:04] Reviewer started
+[14:05] Review requested changes (2 major findings)
+
+[14:05] Worker attempt 2/3 (provider/model)
+[14:08] Validation passed
+[14:08] Reviewer started
+[14:09] Review requested changes (1 major finding)
+
+[14:09] Worker attempt 3/3 (escalation/model)
+[14:12] Validation passed
+[14:12] Reviewer started
+[14:13] Review approved (no findings)
+
+Task t1 → APPROVED
+```
+
+Attempt accounting lives in `.actl/attempts/t1`, a small JSON record with the
+number of used attempts and the feedback for the next worker, so restarting
+`actl` never silently resets the budget. When all three attempts are used the
+task ends `NEEDS_HUMAN`; re-running it is refused until a human intervenes.
+Deleting `.actl/attempts/t1` is the explicit intervention that grants a fresh
+three-attempt budget, and the preserved branch and worktree are reused.
 
 ## Validation and review
 
@@ -255,11 +349,15 @@ Validation commands are project configuration in `.actl/project.json`:
 - Commands run sequentially in the task worktree, exactly as written (a
   shell), and stop at the first non-zero exit.
 - Output, exit codes, and the overall result are recorded in the validation
-  log; a failed command fails the task (`FAILED`) and no reviewer starts.
+  log. A failed command with attempts left triggers a repair attempt with the
+  command and its output as feedback; with no attempts left the task ends
+  `NEEDS_HUMAN`, and no reviewer starts for that attempt.
 - After every successful command, actl immediately re-checks the recorded
   commit and the tracked files. A command that modifies tracked files or
-  moves `HEAD` fails the task right there, so a later command cannot validate
-  the modified state and restore the original before a final check.
+  moves `HEAD` fails the task (`FAILED`) right there and is never repaired by
+  another worker, because the cause is the validation command rather than the
+  implementation; a later command cannot validate the modified state and
+  restore the original before a final check.
 - A malformed `validation` configuration is an error rather than a silent
   skip; a missing configuration (or an empty list) skips validation and
   reports that clearly before review proceeds.
@@ -270,7 +368,8 @@ Validation and review refer to one exact commit:
 - The task worktree must be clean (no uncommitted tracked changes) and on its
   task branch.
 - If validation modifies tracked files or moves `HEAD`, the task fails
-  immediately instead of being approved.
+  immediately instead of being approved; that failure is never repaired
+  automatically.
 - Before any verdict is recorded, the task branch must still point at the
   validated commit; if it moved, the run stops and the task fails. actl never
   repairs or resets the branch.
@@ -328,9 +427,10 @@ critical or major finding, and a `changes_requested` verdict without a
 blocking finding are all invalid: the task becomes `FAILED` and nothing is
 recorded as an approval. Every critical or major finding must include a
 scenario, impact, and location. Valid verdicts are stored in `.actl/tasks.db`
-(the `reviews` table) with the commit they refer to, so Stage 6 can use the
-findings. Reviewer execution and format failures are recorded in the review
-log with a reason.
+(the `reviews` table) with the commit they refer to, and Stage 6 feeds the
+critical and major findings back to the next worker attempt. Reviewer
+execution and format failures are recorded in the review log with a reason;
+they fail the task and never trigger a repair worker.
 
 The review policy is the built-in risk-based policy plus, when present, the
 project's `REVIEW_POLICY.md`:
@@ -347,8 +447,7 @@ project's `REVIEW_POLICY.md`:
   nonessential robustness work, features from future stages, and unrelated
   pre-existing problems never block approval.
 
-`APPROVED` records the validated commit. Nothing is merged, pushed, or
-retried in Stage 5.
+`APPROVED` records the validated commit. Nothing is merged or pushed.
 
 ## Planner agent
 
@@ -450,11 +549,13 @@ actl reports an error instead of resuming the wrong session.
 ```
 .actl/
 ├── project.json    # schema_version, name, worker_model, reviewer_model,
-│                   # validation.commands, base_branch, created_at
+│                   # escalation_worker_model, validation.commands,
+│                   # base_branch, created_at
 ├── planner.json    # active planner session id, created_at
 ├── tasks.db        # SQLite task database (tasks, dependencies, reviews)
 ├── execution.lock  # project-wide execution lock (fcntl.flock)
 ├── base/           # branch-creation commit per task: t1, t2, ...
+├── attempts/       # used worker attempts + next-attempt feedback: t1, t2, ...
 ├── runs/           # tN-<timestamp>.log worker, -validation.log, -review.log
 ├── review/         # temporary reviewer worktrees (removed after review)
 └── worktrees/      # one Git worktree per task: t1/, t2/, ...
@@ -492,7 +593,14 @@ worktree, a task branch moving during review, the built-in and project
 review policies, the configured models, the missing-reviewer-model preflight
 and its ordering before the execution lock, the recorded branch base, and
 validating/reviewing an `IMPLEMENTED` task without rerunning the worker or
-requiring a worker model.
+requiring a worker model. The Stage 6 tests cover the repair loop: approval on
+the first attempt, minor findings without a retry, a second attempt with
+reviewer feedback, escalation on the third attempt, `NEEDS_HUMAN` after three
+rejections or three validation failures, validation feedback, cumulative
+review diffs, preserved worktrees and commits, separate per-attempt logs,
+reviewer failures that never trigger a repair, the persisted attempt budget
+across invocations (including an interrupted run and legacy `NEEDS_CHANGES`
+tasks), the explicit reset path, and the escalation model configuration.
 
 ## Limitations
 
@@ -512,19 +620,28 @@ requiring a worker model.
   instructions are not a sandbox. The permission layer blocks file editing,
   task execution tools, and shell redirection, but review what the planner
   proposes before approving anything it asks for.
-- Stage 5 executes one task at a time and stops after approval. There is no
-  automatic retry, no repair iteration, no model escalation, and no automatic
-  merging; a task with dependencies cannot run until a later stage introduces
-  `DONE` after merging.
+- Stage 6 executes one task at a time and stops after approval. A task gets
+  at most three worker attempts, the third with the optional escalation
+  model; after that it is `NEEDS_HUMAN` and only explicit human intervention
+  continues. There is no automatic merging, no automatic rebasing, and no
+  automatic crash recovery; a task with dependencies cannot run until a later
+  stage introduces `DONE` after merging.
 - `IMPLEMENTED` only means that the worker exited successfully, left the
   worktree clean, and left committed changes on the task branch relative to
   the base branch. `APPROVED` additionally means the configured validation
-  commands passed on that exact commit and the reviewer approved it; it does
-  not mean the code is merged, and it is not a guarantee of correctness.
+  commands passed on that exact commit and the reviewer approved it, possibly
+  after repairs; it does not mean the code is merged, and it is not a
+  guarantee of correctness.
 - `actl task run` requires a reviewer model for every run, and a worker model
   whenever the worker runs. Without a reviewer model the run fails before
   launching anything; an `IMPLEMENTED` task is validated and reviewed with
   just the reviewer model, without rerunning the worker.
+- A validation command that changes tracked files or moves `HEAD` fails the
+  task immediately and is never repaired by another worker: the cause is the
+  validation command, not the implementation. actl reports it instead of
+  burning attempts on it.
+- A corrupt `.actl/attempts/tN` record fails the task instead of silently
+  resetting the repair budget; fix or remove the record deliberately.
 - Validation commands run with actl's environment inside the task worktree
   and may create untracked files (caches, reports). Changes to tracked files
   or to `HEAD` fail the task as soon as a command finishes; actl does not

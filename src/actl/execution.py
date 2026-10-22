@@ -16,6 +16,10 @@
 * The reviewer gets a temporary detached worktree under ``.actl/review/``
   (see ``add_review_worktree``), so its checkout can never touch the task
   worktree.
+* Each task records how many worker attempts it has used in
+  ``.actl/attempts/tN``, together with the feedback for the next attempt, so
+  the three-attempt repair budget survives CLI invocations and an interrupted
+  run never silently resets it.
 
 Task worktrees, branches, and logs are never deleted: failed or interrupted
 work is preserved for an explicit retry. The temporary reviewer worktree is
@@ -25,6 +29,7 @@ the one exception; it is removed after the review.
 from __future__ import annotations
 
 import fcntl
+import json
 import os
 import subprocess
 from contextlib import contextmanager
@@ -37,6 +42,9 @@ WORKTREES_DIR = "worktrees"
 REVIEW_DIR = "review"
 BASE_DIR = "base"
 RUNS_DIR = "runs"
+ATTEMPTS_DIR = "attempts"
+#: Total worker attempts a task gets before it needs a human (Stage 6).
+MAX_WORKER_ATTEMPTS = 3
 DEFAULT_BASE_CANDIDATES = ("main", "master")
 
 
@@ -365,6 +373,66 @@ def remove_review_worktree(root: Path, path: Path) -> str:
     return proc.stderr.strip() or proc.stdout.strip() or "git worktree remove failed"
 
 
+def attempt_state(actl_dir: Path, task_id: int):
+    """Return the task's recorded ``(attempts, feedback)``, or None.
+
+    ``attempts`` counts the worker attempts the task has used in its current
+    repair cycle; ``feedback`` is the text the next worker attempt must fix
+    (a failed validation or reviewer rejection), or "".
+
+    A missing record means no attempt was recorded yet. A corrupt record is
+    an error instead of an implicit reset: restarting actl must never hand a
+    task a fresh attempt budget by accident.
+    """
+    path = actl_dir / ATTEMPTS_DIR / ("t" + str(task_id))
+    try:
+        text = path.read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return None
+    except (OSError, UnicodeDecodeError) as exc:
+        raise ExecutionError(
+            "cannot read the attempt record " + str(path) + " (" + str(exc) + ")"
+        )
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise ExecutionError(
+            "the attempt record " + str(path) + " is not readable JSON ("
+            + str(exc) + "); fix or remove it before running the task again"
+            " (removing it grants a fresh attempt budget deliberately)"
+        )
+    attempts = data.get("attempts") if isinstance(data, dict) else None
+    feedback = data.get("feedback") if isinstance(data, dict) else None
+    if feedback is None:
+        feedback = ""
+    if not isinstance(attempts, int) or isinstance(attempts, bool) or attempts < 0:
+        raise ExecutionError(
+            "the attempt record " + str(path) + " has an invalid 'attempts'"
+            " value; fix or remove it before running the task again"
+        )
+    if not isinstance(feedback, str):
+        raise ExecutionError(
+            "the attempt record " + str(path) + " has an invalid 'feedback'"
+            " value; fix or remove it before running the task again"
+        )
+    return attempts, feedback
+
+
+def record_attempt_state(
+    actl_dir: Path, task_id: int, attempts: int, feedback: str,
+) -> None:
+    """Persist the task's ``attempts`` count and next-attempt ``feedback``."""
+    path = actl_dir / ATTEMPTS_DIR / ("t" + str(task_id))
+    payload = {"attempts": attempts, "feedback": feedback or ""}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise ExecutionError(
+            "cannot write the attempt record " + str(path) + " (" + str(exc) + ")"
+        )
+
+
 def timestamp() -> str:
     """Return a UTC timestamp usable in file and worktree names."""
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
@@ -397,27 +465,54 @@ def open_run_log(actl_dir: Path, task_id: int):
     return open_stage_log(actl_dir, task_id, None)
 
 
-def worker_prompt(task, worktree: Worktree, base_branch: str) -> str:
-    """The message that tells the worker what to implement."""
+def worker_prompt(
+    task, worktree: Worktree, base_branch: str, attempt=None, total=None, feedback="",
+) -> str:
+    """The message that tells the worker what to implement.
+
+    On a repair attempt (``attempt`` greater than 1) the worker is told to
+    continue from the existing worktree and commits and receives the
+    ``feedback`` that explains why the previous attempt was rejected: the
+    failed validation command and its output, or the blocking reviewer
+    findings. The branch is never reset or discarded.
+    """
     description = task.description.strip() or "(none)"
-    return (
+    lines = [
         "Implement this task in the current Git worktree"
-        " (branch " + worktree.branch + ").\n"
-        "\n"
-        "Task t" + str(task.id) + ": " + task.title + "\n"
-        "\n"
-        + description + "\n"
-        "\n"
-        "Instructions:\n"
-        "- Inspect the relevant project files and follow the existing style.\n"
-        "- Modify the code as needed to implement the task, without touching\n"
-        "  unrelated functionality.\n"
-        "- Run the relevant tests or checks to verify your work.\n"
-        "- Commit your changes on the current branch with Git. When you finish,\n"
-        "  the worktree must be clean: no uncommitted or untracked files\n"
-        "  outside .gitignore.\n"
-        "- Never merge into " + base_branch + ".\n"
-    )
+        " (branch " + worktree.branch + ").",
+        "",
+        "Task t" + str(task.id) + ": " + task.title,
+        "",
+        description,
+        "",
+    ]
+    if attempt is not None and attempt > 1:
+        lines += [
+            "This is worker attempt " + str(attempt) + " of " + str(total)
+            + " after a previous attempt was not accepted. The previous"
+            " implementation is already committed on the current branch:"
+            " continue from the existing worktree and commits, keep the"
+            " earlier commits, and fix the existing implementation. Do not"
+            " reset the branch or discard previous commits.",
+            "",
+            feedback.strip()
+            or "No validation or review feedback is available for this"
+            " attempt; inspect the previous implementation and fix whatever"
+            " still prevents it from being accepted.",
+            "",
+        ]
+    lines += [
+        "Instructions:",
+        "- Inspect the relevant project files and follow the existing style.",
+        "- Modify the code as needed to implement the task, without touching",
+        "  unrelated functionality.",
+        "- Run the relevant tests or checks to verify your work.",
+        "- Commit your changes on the current branch with Git. When you finish,",
+        "  the worktree must be clean: no uncommitted or untracked files",
+        "  outside .gitignore.",
+        "- Never merge into " + base_branch + ".",
+    ]
+    return "\n".join(lines)
 
 
 def _require_base(root: Path, base_branch: str) -> None:

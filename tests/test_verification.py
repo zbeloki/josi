@@ -57,6 +57,11 @@ class VerificationTestCase(TaskRunTestCase):
         metadata.pop("worker_model", None)
         self.write_metadata(metadata)
 
+    def remove_escalation_model(self):
+        metadata = self.metadata()
+        metadata.pop("escalation_worker_model", None)
+        self.write_metadata(metadata)
+
     def set_task_status(self, status, task_id=1):
         """Simulate a Stage 4 task left behind at the given status."""
         conn = tasks.connect(self.repo / ".actl" / "tasks.db")

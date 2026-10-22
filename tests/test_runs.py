@@ -47,6 +47,10 @@ class TaskRunTestCase(ActlTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         result = self.run_actl("init", "--reviewer-model", "reviewer/model")
         self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_actl(
+            "init", "--escalation-worker-model", "escalation/model"
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
 
     # -- helpers ---------------------------------------------------------
 
@@ -757,6 +761,10 @@ class EmptyRepositoryTests(ActlTestCase):
         result = self.run_actl("init", "--worker-model", "provider/model")
         self.assertEqual(result.returncode, 0, result.stderr)
         result = self.run_actl("init", "--reviewer-model", "reviewer/model")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        result = self.run_actl(
+            "init", "--escalation-worker-model", "escalation/model"
+        )
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def git(self, *args, cwd=None, check=True):

@@ -10,6 +10,7 @@ model call.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import shutil
 import subprocess
@@ -25,13 +26,6 @@ from actl import tasks
 @unittest.skipUnless(shutil.which("git"), "git is required")
 class RepairTestCase(VerificationTestCase):
     """A project with worker, reviewer, and escalation models configured."""
-
-    def setUp(self):
-        super().setUp()
-        result = self.run_actl(
-            "init", "--escalation-worker-model", "escalation/model"
-        )
-        self.assertEqual(result.returncode, 0, result.stderr)
 
     # -- helpers ----------------------------------------------------------
 
@@ -216,16 +210,42 @@ class BasicRepairTests(RepairTestCase):
         self.assertEqual(len(self.worker_calls()), 3)
         self.assertEqual(len(self.reviewer_calls()), 3)
 
-    def test_escalation_model_is_optional(self):
-        metadata = self.metadata()
-        del metadata["escalation_worker_model"]
-        self.write_metadata(metadata)
-        self.set_reviewer(self.major("One."), self.major("Two."), self.approved())
+    def test_missing_escalation_model_fails_before_any_work(self):
+        self.remove_escalation_model()
         self.make_task()
         result = self.run_task("t1")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
-        self.assertEqual(self.worker_models(), ["provider/model"] * 3)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no escalation worker model", result.stderr)
+        self.assertIn("actl init --escalation-worker-model", result.stderr)
+        self.assertEqual(self.task_status(), "PENDING")
+        self.assertEqual(self.worker_calls(), [], "no worker may start")
+        self.assertEqual(self.reviewer_calls(), [], "no reviewer may start")
+        self.assertFalse((self.repo / ".actl" / "worktrees").exists())
+        self.assertEqual(
+            list((self.repo / ".actl" / "runs").glob("t1-*.log")), [],
+            "no stage may start without an escalation model",
+        )
+        self.assertFalse(
+            (self.repo / ".actl" / "execution.lock").exists(),
+            "the lock must not be taken",
+        )
+
+    def test_missing_escalation_model_precedes_the_execution_lock(self):
+        self.remove_escalation_model()
+        self.make_task()
+        lock_path = self.repo / ".actl" / "execution.lock"
+        handle = open(lock_path, "a+b")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            result = self.run_task("t1")
+        finally:
+            handle.close()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no escalation worker model", result.stderr)
+        self.assertNotIn("already running", result.stderr)
+        self.assertEqual(self.task_status(), "PENDING")
+        self.assertEqual(self.calls(), [])
 
     def test_worker_error_stops_without_a_repair(self):
         self.env["ACTL_FAKE_RUN_EXIT"] = "1"
@@ -305,6 +325,74 @@ class ValidationRepairTests(RepairTestCase):
         self.assertIn("modified tracked files", result.stderr)
 
 
+class InfrastructureRetryTests(RepairTestCase):
+    """Reviewer infrastructure failures never spend an implementation attempt."""
+
+    def test_reviewer_error_retry_does_not_spend_a_worker_attempt(self):
+        self.env["ACTL_FAKE_REVIEW_JSON"] = "not a JSON verdict"
+        self.make_task()
+        first = self.run_task("t1")
+        self.assertNotEqual(first.returncode, 0)
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertEqual(len(self.worker_calls()), 1)
+        record = self.attempt_record()
+        self.assertEqual(record["attempts"], 1)
+        self.assertEqual(record["feedback"], "")
+
+        # Fixing the reviewer re-validates and re-reviews the same commit:
+        # no new worker attempt is spent.
+        self.set_reviewer(self.approved())
+        second = self.run_task("t1")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(len(self.worker_calls()), 1)
+        self.assertEqual(len(self.reviewer_calls()), 2)
+        self.assertIn("Re-verifying task t1", second.stdout)
+        self.assertNotIn("Worker attempt 2/3", second.stdout)
+
+    def test_reviewer_error_retry_repeats_validation(self):
+        self.set_validation("echo check")
+        self.env["ACTL_FAKE_REVIEW_EXIT"] = "2"
+        self.make_task()
+        self.assertNotEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(len(self.validation_logs()), 1)
+        self.assertEqual(self.task_status(), "FAILED")
+
+        self.env["ACTL_FAKE_REVIEW_EXIT"] = "0"
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(len(self.validation_logs()), 2, "validation must rerun")
+        self.assertEqual(len(self.worker_calls()), 1)
+        self.assertEqual(self.task_status(), "APPROVED")
+
+    def test_escalation_receives_the_newest_feedback_after_an_error(self):
+        self.set_worker("commit-index", "commit-index", "commit-index")
+        self.set_reviewer(
+            self.major("First finding."),
+            "not a JSON verdict",
+            self.major("Second finding."),
+            self.approved(),
+        )
+        self.make_task()
+        first = self.run_task("t1")
+        self.assertNotEqual(first.returncode, 0)
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertEqual(self.worker_models(), ["provider/model"] * 2)
+
+        # The retry re-verifies attempt 2's commit; its rejection feeds the
+        # escalation worker instead of leaving it without feedback.
+        second = self.run_task("t1")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(
+            self.worker_models(),
+            ["provider/model", "provider/model", "escalation/model"],
+        )
+        prompt = self.worker_calls()[2]["argv"][-1]
+        self.assertIn("Second finding.", prompt)
+        self.assertNotIn("No validation or review feedback is available", prompt)
+
+
 class PersistenceTests(RepairTestCase):
     def test_recorded_budget_continues_across_invocations(self):
         self.make_task()
@@ -373,12 +461,18 @@ class PersistenceTests(RepairTestCase):
         self.assertTrue(self.wait_for_lock_release(), "the worker kept the lock")
 
         # The next invocation continues at attempt 2 with the feedback; it
-        # never resets to attempt 1.
+        # never resets to attempt 1, and the interrupted attempt is retried
+        # under the same number instead of spending a new one.
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "APPROVED")
         self.assertIn("Worker attempt 2/3 (provider/model)", result.stdout)
         self.assertIn("Persisted finding.", self.worker_calls()[-1]["argv"][-1])
+        # The interrupted worker's commit was preserved and the retry
+        # continued on top of it.
+        subjects = self.git("log", "--format=%s", "actl/t1").stdout.splitlines()
+        self.assertEqual(subjects.count("worker: implement task"), 3)
+        self.assertEqual(self.attempt_record()["attempts"], 2)
 
     def test_needs_human_restarts_only_after_the_record_is_removed(self):
         self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
@@ -407,6 +501,7 @@ class PersistenceTests(RepairTestCase):
         self.assertIn("attempt record", result.stderr)
         self.assertIn("fix or remove", result.stderr)
         self.assertEqual(self.worker_calls(), [], "no worker may start")
+        self.assertEqual(self.task_status(), "FAILED")
 
     def test_stage5_needs_changes_continues_from_remaining_attempts(self):
         self.make_task("Add the feature")

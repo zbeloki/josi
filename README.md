@@ -43,8 +43,8 @@ actl task run t1   # execute a task: worker attempts, validation, and review
   `actl init --reviewer-model MODEL` sets the independent reviewer's model;
   `actl task run` requires it and refuses to start without one.
   `actl init --escalation-worker-model MODEL` sets the stronger model used
-  for the third and final repair attempt (see below); without it the regular
-  worker model keeps running the third attempt.
+  for the third and final repair attempt; `actl task run` requires it and
+  refuses to start without one.
   `actl init --base BRANCH` sets the base branch that task branches are
   created from; without it the branch is detected, and when the choice is
   ambiguous actl asks. It works in repositories without commits, where it
@@ -120,10 +120,11 @@ actl task run t1   # up to three worker attempts, validation, and review
 
 A run goes through these steps:
 
-1. The project must be initialized with a reviewer model, and the task must
-   exist, be runnable, and have no dependencies. A run that starts the worker
-   also needs the worker model; without a reviewer model the run refuses
-   before any lock, worktree, or task change.
+1. The project must be initialized with a reviewer model and an escalation
+   worker model, and the task must exist, be runnable, and have no
+   dependencies. A run that starts the worker also needs the worker model;
+   without a reviewer or escalation model the run refuses before any lock,
+   worktree, or task change.
 2. The project-wide execution lock is taken. A second `actl task run` in the
    same project refuses immediately while an execution is active.
 3. The task gets a dedicated branch (`actl/t1`) and worktree
@@ -188,14 +189,19 @@ PENDING → RUNNING → IMPLEMENTED → APPROVED
   record, or a validation command that changed tracked files or `HEAD`. None
   of them launch a repair worker, because another implementation attempt
   cannot fix an orchestration problem. A `FAILED` task can be retried
-  explicitly.
+  explicitly; when its last worker attempt had completed, the retry
+  validates and reviews that same committed implementation again instead of
+  launching another worker, so reviewer failures never spend an
+  implementation attempt.
 - `actl task run` requires a reviewer model. Without one it refuses before
   taking the execution lock, creating a worktree, or changing the task.
 - A task that fails can be retried explicitly with `actl task run <id>`: the
   existing branch and worktree are reused as they are, so earlier commits are
   preserved and the worker continues from there. Nothing is reset, cleaned,
   rebased, or merged. An explicit retry continues the recorded attempt
-  accounting; it never silently restarts the budget.
+  accounting; it never silently restarts the budget. A worker attempt counts
+  only once it completes, so an interrupted attempt is retried under the same
+  attempt number and does not consume the budget.
 - Tasks with dependencies stay blocked. Dependency-aware execution arrives in
   a later stage (Stage 7, when successfully merged tasks become `DONE`); in
   Stage 6 only tasks without dependencies can run.
@@ -203,7 +209,9 @@ PENDING → RUNNING → IMPLEMENTED → APPROVED
 - If an execution is interrupted (for example by Ctrl-C or a crash), the task
   keeps its status and its worktree and log are preserved; there is no
   automatic recovery, but an explicit `actl task run <id>` continues from the
-  preserved worktree and the recorded attempts.
+  preserved worktree and the recorded attempts. An interrupted worker attempt
+  is retried under the same attempt number and does not count against the
+  budget.
 - The task is marked `IMPLEMENTED` only when OpenCode exits with status 0,
   the worktree is still on its task branch, the worktree is clean, and the
   branch has committed changes relative to the base branch. A worker that
@@ -225,16 +233,19 @@ or anything is launched without one, while an `IMPLEMENTED` task is validated
 and reviewed without it. OpenCode fails the run if the model is not available
 in the worktree.
 
-The escalation worker model is optional project configuration:
+The escalation worker model is project configuration required for every run:
 
 ```sh
 actl init --escalation-worker-model openrouter/anthropic/claude-opus-latest
 ```
 
-It is stored as `escalation_worker_model` in `.actl/project.json`. It is used
-only for the third and final worker attempt of a repair cycle; without it the
-regular worker model runs the third attempt too. It is never used for the
-first two attempts, and the reviewer model never changes during repairs.
+It is stored as `escalation_worker_model` in `.actl/project.json` and is used
+for the third and final worker attempt of a repair cycle. `actl task run`
+requires it exactly like the reviewer model: without one the run fails before
+taking the execution lock, creating a worktree, or changing the task, instead
+of discovering at the last attempt that no stronger model is available. It is
+never used for the first two attempts, and the reviewer model never changes
+during repairs.
 
 The reviewer model is configured independently:
 
@@ -287,12 +298,12 @@ stays held while those processes are alive even if actl itself is killed.
 A validation command that exits non-zero and a reviewer verdict of
 `changes_requested` (which always carries at least one critical or major
 finding) are implementation failures: actl feeds them back to the next
-worker attempt instead of stopping. A task gets at most three worker attempts:
+worker attempt instead of stopping. A task gets at most three completed
+worker attempts:
 
 1. Attempt 1 uses `worker_model`.
 2. Attempt 2 uses `worker_model` with the failure feedback.
-3. Attempt 3 uses `escalation_worker_model` (or `worker_model` when the
-   project did not configure an escalation model) with the same feedback.
+3. Attempt 3 uses `escalation_worker_model` with the same feedback.
 
 The feedback carries the original task requirements plus either the failed
 validation command with the tail of its output or every critical and major
@@ -303,6 +314,13 @@ complete cumulative task diff - never just the latest repair commit. Minor
 findings and suggestions never trigger a repair: an approval with minor
 findings is a successful result, and the reviewer is never asked to become
 stricter on later attempts.
+
+Only completed attempts count. A worker or reviewer execution error, a
+malformed verdict, or an interrupted attempt does not consume the budget and
+never starts a repair: the run stops with `FAILED`, and an explicit retry
+re-validates and re-reviews the committed implementation without launching a
+worker. When all three attempts have been rejected or have failed validation,
+the task ends `NEEDS_HUMAN`.
 
 The console reports each attempt with its model and outcome:
 
@@ -598,9 +616,11 @@ the first attempt, minor findings without a retry, a second attempt with
 reviewer feedback, escalation on the third attempt, `NEEDS_HUMAN` after three
 rejections or three validation failures, validation feedback, cumulative
 review diffs, preserved worktrees and commits, separate per-attempt logs,
-reviewer failures that never trigger a repair, the persisted attempt budget
-across invocations (including an interrupted run and legacy `NEEDS_CHANGES`
-tasks), the explicit reset path, and the escalation model configuration.
+reviewer failures that never trigger a repair and never spend a worker
+attempt on an explicit retry, the persisted attempt budget across invocations
+(including an interrupted run and legacy `NEEDS_CHANGES` tasks), the explicit
+reset path, the required escalation model and its preflight ordering before
+the execution lock, and the escalation model configuration.
 
 ## Limitations
 
@@ -621,7 +641,7 @@ tasks), the explicit reset path, and the escalation model configuration.
   task execution tools, and shell redirection, but review what the planner
   proposes before approving anything it asks for.
 - Stage 6 executes one task at a time and stops after approval. A task gets
-  at most three worker attempts, the third with the optional escalation
+  at most three completed worker attempts, the third with the escalation
   model; after that it is `NEEDS_HUMAN` and only explicit human intervention
   continues. There is no automatic merging, no automatic rebasing, and no
   automatic crash recovery; a task with dependencies cannot run until a later
@@ -632,10 +652,11 @@ tasks), the explicit reset path, and the escalation model configuration.
   commands passed on that exact commit and the reviewer approved it, possibly
   after repairs; it does not mean the code is merged, and it is not a
   guarantee of correctness.
-- `actl task run` requires a reviewer model for every run, and a worker model
-  whenever the worker runs. Without a reviewer model the run fails before
-  launching anything; an `IMPLEMENTED` task is validated and reviewed with
-  just the reviewer model, without rerunning the worker.
+- `actl task run` requires a reviewer model and an escalation worker model
+  for every run, and a worker model whenever the worker runs. Without any of
+  them the run fails before launching anything; an `IMPLEMENTED` task is
+  validated and reviewed with just the reviewer and escalation models,
+  without rerunning the worker.
 - A validation command that changes tracked files or moves `HEAD` fails the
   task immediately and is never repaired by another worker: the cause is the
   validation command, not the implementation. actl reports it instead of

@@ -36,13 +36,17 @@ Stage 5:
 Stage 6:
 
 * A validation failure or a reviewer rejection with critical or major findings
-  triggers automatic repairs: up to three worker attempts in all. The first
-  two use the project's worker model, the third the escalation worker model;
-  every attempt continues in the same branch and worktree and receives the
-  blocking findings or the failed validation command as feedback. If the
-  third attempt is still not approved, the task ends NEEDS_HUMAN. Only
-  implementation failures trigger repairs: worker and reviewer execution
-  errors end the run with FAILED. The attempt budget is persisted per task in
+  triggers automatic repairs: up to three completed worker attempts. The first
+  two use the project's worker model, the third the project's escalation
+  worker model (required, like the reviewer model); every attempt continues in
+  the same branch and worktree and receives the blocking findings or the
+  failed validation command as feedback. If the third attempt is still not
+  approved, the task ends NEEDS_HUMAN. Only implementation failures trigger
+  repairs: worker and reviewer execution errors end the run with FAILED, and
+  an explicit retry after a reviewer infrastructure failure validates and
+  reviews the committed implementation again without spending another worker
+  attempt. An interrupted attempt is retried under the same number and does
+  not consume the budget. The attempt budget is persisted per task in
   ``.actl/attempts/`` so restarting actl never resets it.
 """
 
@@ -384,16 +388,22 @@ def _reviewer_model(metadata: dict) -> str:
     return _parse_reviewer_model(model)
 
 
-def _escalation_worker_model(metadata: dict):
-    """Return the project's escalation worker model, or None when unset.
+def _escalation_worker_model(metadata: dict) -> str:
+    """Return the project's escalation worker model or raise.
 
-    The third (final) worker attempt of a repair cycle uses this model when
-    configured. Without it the regular worker model keeps running the third
-    attempt, so projects from earlier stages keep working unchanged.
+    The third (final) worker attempt of every repair cycle uses this model.
+    It is required by ``actl task run`` from the start, exactly like the
+    reviewer model: escalation is part of the design, so a project defines it
+    before a task runs instead of discovering that it is missing when the
+    final attempt is due. Without it the run refuses before any lock,
+    worktree, or task change.
     """
     model = metadata.get("escalation_worker_model")
     if model is None:
-        return None
+        raise ProjectError(
+            "no escalation worker model is configured for this project; run"
+            " 'actl init --escalation-worker-model provider/model' first"
+        )
     if not isinstance(model, str):
         raise ProjectError(
             "project metadata has an invalid 'escalation_worker_model' value "
@@ -887,6 +897,7 @@ def cmd_task_run(args) -> int:
         root = _project_root()
         metadata = load_project_metadata(root)
         reviewer_model = _reviewer_model(metadata)
+        escalation_worker_model = _escalation_worker_model(metadata)
         validation_commands = validation.commands_from_metadata(metadata)
         base_branch = _run_base_branch(root, metadata)
         binary = opencode.find_binary()
@@ -900,7 +911,8 @@ def cmd_task_run(args) -> int:
         with execution.lock(actl_dir) as lock_fd:
             return _execute_task(
                 binary, root, actl_dir, task_id, metadata, lock_fd,
-                base_branch, reviewer_model, validation_commands,
+                base_branch, reviewer_model, escalation_worker_model,
+                validation_commands,
             )
     except (
         ProjectError, tasks.TaskError, sqlite3.Error,
@@ -912,41 +924,57 @@ def cmd_task_run(args) -> int:
 
 def _execute_task(
     binary, root, actl_dir, task_id, metadata, lock_fd, base_branch,
-    reviewer_model, validation_commands,
+    reviewer_model, escalation_worker_model, validation_commands,
 ) -> int:
     """Run one task while the execution lock is held.
 
-    A task gets up to three worker attempts in the same branch and worktree:
-    the first two with the project's worker model and the third with the
-    escalation worker model when one is configured. A failed validation
-    command or a reviewer rejection with critical or major findings feeds the
-    next attempt; the attempt count and the feedback are persisted per task so
-    restarting actl never resets the budget. Exhausting the attempts marks
-    the task NEEDS_HUMAN.
+    A task gets up to three completed worker attempts in the same branch and
+    worktree: the first two with the project's worker model and the third
+    with the project's escalation model. A failed validation command or a
+    reviewer rejection with critical or major findings feeds the next
+    attempt; the attempt count and the feedback are persisted per task so
+    restarting actl never resets the budget. An interrupted attempt does not
+    count: a retry resumes the same attempt number. Exhausting the attempts
+    marks the task NEEDS_HUMAN.
 
-    Only implementation failures are repaired. A worker, validation, or
-    reviewer execution error stops the run with FAILED: infrastructure
-    problems never launch another repair worker.
+    Only implementation failures are repaired. A worker or reviewer
+    execution error stops the run with FAILED: infrastructure problems never
+    launch another repair worker, and a retry after such a failure validates
+    and reviews the committed implementation again instead of spending
+    another worker attempt.
 
     The terminal shows only actl's own timestamped events; transcripts and
     validation output go straight into their log files while they run.
     """
     task = _load_task(actl_dir, task_id)
-    _require_runnable(task, actl_dir)
+    try:
+        _require_runnable(task, actl_dir)
+        attempts, feedback = _attempt_baseline(actl_dir, task)
+    except execution.ExecutionError as exc:
+        # A corrupt or unreadable attempt record is an infrastructure
+        # failure: fail the task instead of silently resetting its budget.
+        return _verification_failed(actl_dir, task.id, str(exc))
     print("task t" + str(task.id) + ": " + task.title)
-    attempts, feedback = _attempt_baseline(actl_dir, task)
-    # An IMPLEMENTED task is validated and reviewed without a new worker. A
-    # pending feedback means the implementation was already rejected, so the
-    # next attempt repairs it instead of re-reviewing the same commit.
-    review_first = task.status == tasks.STATUS_IMPLEMENTED and not feedback
+    # Validate and review the existing committed implementation first when
+    # one is pending: an IMPLEMENTED task was interrupted between the worker
+    # and validation/review, and a FAILED task whose last worker attempt
+    # completed without pending feedback failed in validation or review
+    # infrastructure. Neither case may spend another worker attempt.
+    review_first = not feedback and (
+        task.status == tasks.STATUS_IMPLEMENTED
+        or (task.status == tasks.STATUS_FAILED and attempts > 0)
+    )
     if review_first:
         print("reviewer model: " + reviewer_model)
+        if task.status == tasks.STATUS_FAILED:
+            _event(
+                "Re-verifying task t" + str(task.id)
+                + ", left FAILED by an infrastructure failure"
+            )
     else:
         print("model: " + _worker_model(metadata))
         print("reviewer model: " + reviewer_model)
-        escalation_model = _escalation_worker_model(metadata)
-        if escalation_model is not None:
-            print("escalation model: " + escalation_model)
+        print("escalation model: " + escalation_worker_model)
         if task.status == tasks.STATUS_RUNNING:
             _event(
                 "Retrying task t" + str(task.id)
@@ -977,7 +1005,7 @@ def _execute_task(
 
     while attempts < execution.MAX_WORKER_ATTEMPTS:
         attempt = attempts + 1
-        model = _attempt_model(metadata, attempt)
+        model = _attempt_model(metadata, attempt, escalation_worker_model)
         _event(
             "Worker attempt " + str(attempt) + "/"
             + str(execution.MAX_WORKER_ATTEMPTS) + " (" + model + ")"
@@ -996,9 +1024,11 @@ def _execute_task(
                 + " (log: " + str(log_path) + ")"
             )
         attempts = attempt
-        # The feedback was handed to the worker that just ran; clear it so an
-        # interruption during validation or review re-verifies this commit
-        # instead of launching another worker.
+        # The attempt counts as used only now that it completed; an
+        # interrupted attempt is retried under the same number and does not
+        # consume the budget. The feedback was handed to the worker that just
+        # ran, so clear it: an interruption during validation or review
+        # re-verifies this commit instead of launching another worker.
         execution.record_attempt_state(actl_dir, task.id, attempts, "")
         _set_task_status(actl_dir, task.id, tasks.STATUS_IMPLEMENTED)
         _event("Task status: IMPLEMENTED")
@@ -1474,7 +1504,7 @@ def _log_review_failure(log, reason: str) -> None:
 
 
 def _verification_failed(actl_dir, task_id, reason, log_hint=None) -> int:
-    """Mark a task FAILED after validation or review could not complete."""
+    """Mark a task FAILED after validation, review, or state loading failed."""
     _set_task_status(actl_dir, task_id, tasks.STATUS_FAILED)
     print("")
     print("Task t" + str(task_id) + " \u2192 FAILED")
@@ -1519,17 +1549,16 @@ def _attempt_baseline(actl_dir: Path, task):
     return 0, ""
 
 
-def _attempt_model(metadata: dict, attempt: int) -> str:
+def _attempt_model(
+    metadata: dict, attempt: int, escalation_worker_model: str,
+) -> str:
     """Return the model for worker ``attempt`` (1-based).
 
     The first two attempts use the project's worker model; the third and
-    final attempt uses the escalation worker model when configured, and
-    otherwise keeps using the regular worker model.
+    final attempt uses the configured escalation worker model.
     """
     if attempt >= execution.MAX_WORKER_ATTEMPTS:
-        escalation = _escalation_worker_model(metadata)
-        if escalation is not None:
-            return escalation
+        return escalation_worker_model
     return _worker_model(metadata)
 
 
@@ -1869,8 +1898,8 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--escalation-worker-model", metavar="MODEL",
         help="set the model for the third and final worker attempt of a"
-             " repair cycle (provider/model[#variant]); defaults to the"
-             " worker model",
+             " repair cycle (provider/model[#variant]); required by"
+             " 'actl task run'",
     )
     init.add_argument(
         "--base", metavar="BRANCH",

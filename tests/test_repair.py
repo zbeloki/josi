@@ -77,7 +77,7 @@ class BasicRepairTests(RepairTestCase):
         self.make_task("Add the feature")
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         self.assertEqual(len(self.worker_calls()), 1)
         self.assertEqual(len(self.reviewer_calls()), 1)
         self.assertIn("Worker attempt 1/3 (provider/model)", result.stdout)
@@ -92,7 +92,7 @@ class BasicRepairTests(RepairTestCase):
         self.make_task()
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         self.assertEqual(len(self.worker_calls()), 1)
         self.assertEqual(len(self.reviewer_calls()), 1)
         self.assertNotIn("Worker attempt 2/3", result.stdout)
@@ -111,7 +111,7 @@ class BasicRepairTests(RepairTestCase):
         self.make_task("Add authentication")
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         self.assertEqual(self.worker_models(), ["provider/model", "provider/model"])
         self.assertEqual(len(self.reviewer_calls()), 2)
         self.assertIn("Review requested changes (1 major finding)", result.stdout)
@@ -143,7 +143,7 @@ class BasicRepairTests(RepairTestCase):
         self.make_task("Add the feature")
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         self.assertEqual(
             self.worker_models(),
             ["provider/model", "provider/model", "escalation/model"],
@@ -276,7 +276,7 @@ class ValidationRepairTests(RepairTestCase):
         self.make_task()
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         self.assertEqual(len(self.worker_calls()), 2)
         self.assertEqual(len(self.validation_logs()), 2)
         self.assertIn(
@@ -344,7 +344,7 @@ class InfrastructureRetryTests(RepairTestCase):
         self.set_reviewer(self.approved())
         second = self.run_task("t1")
         self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         self.assertEqual(len(self.worker_calls()), 1)
         self.assertEqual(len(self.reviewer_calls()), 2)
         self.assertIn("Re-verifying task t1", second.stdout)
@@ -363,7 +363,7 @@ class InfrastructureRetryTests(RepairTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.validation_logs()), 2, "validation must rerun")
         self.assertEqual(len(self.worker_calls()), 1)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
 
     def test_escalation_receives_the_newest_feedback_after_an_error(self):
         self.set_worker("commit-index", "commit-index", "commit-index")
@@ -383,7 +383,7 @@ class InfrastructureRetryTests(RepairTestCase):
         # escalation worker instead of leaving it without feedback.
         second = self.run_task("t1")
         self.assertEqual(second.returncode, 0, second.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         self.assertEqual(
             self.worker_models(),
             ["provider/model", "provider/model", "escalation/model"],
@@ -412,7 +412,7 @@ class PersistenceTests(RepairTestCase):
         self.set_reviewer(self.approved())
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         self.assertIn("left RUNNING by an interrupted execution", result.stdout)
         self.assertIn("Worker attempt 2/3 (provider/model)", result.stdout)
         prompt = self.worker_calls()[0]["argv"][-1]
@@ -465,7 +465,7 @@ class PersistenceTests(RepairTestCase):
         # under the same number instead of spending a new one.
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         self.assertIn("Worker attempt 2/3 (provider/model)", result.stdout)
         self.assertIn("Persisted finding.", self.worker_calls()[-1]["argv"][-1])
         # The interrupted worker's commit was preserved and the retry
@@ -487,7 +487,7 @@ class PersistenceTests(RepairTestCase):
         self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.approved())
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         self.assertEqual(len(self.worker_calls()), workers + 1)
         self.assertIn("Worker attempt 1/3 (provider/model)", result.stdout)
 
@@ -523,7 +523,7 @@ class PersistenceTests(RepairTestCase):
         self.set_reviewer(self.approved())
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         self.assertIn("Worker attempt 2/3 (provider/model)", result.stdout)
         prompt = self.worker_calls()[0]["argv"][-1]
         self.assertIn("worker attempt 2 of 3", prompt)
@@ -559,7 +559,7 @@ class PersistenceTests(RepairTestCase):
         self.set_reviewer(self.approved())
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         self.assertIn("Worker attempt 2/3 (provider/model)", result.stdout)
 
 

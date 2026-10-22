@@ -4,8 +4,9 @@ Stage 2 keeps the project's tasks in a small SQLite database at
 ``.actl/tasks.db``. The schema has three tables: ``tasks``, ``dependencies``,
 and ``reviews``. There is no BLOCKED status - whether a task is blocked is
 derived from its dependencies when needed. A task's status is PENDING,
-RUNNING, IMPLEMENTED, FAILED, APPROVED, NEEDS_CHANGES, or NEEDS_HUMAN
-(Stage 6); only ``actl task run`` moves a task between them.
+RUNNING, IMPLEMENTED, FAILED, APPROVED, NEEDS_CHANGES, NEEDS_HUMAN, or DONE
+(Stage 7, recorded only after the approved commit was integrated into the
+base branch); only ``actl task run`` moves a task between them.
 
 Reviewer verdicts are stored in ``reviews`` (one row per completed review,
 newest last) so later stages can read the findings that belong to a task's
@@ -36,9 +37,10 @@ STATUS_FAILED = "FAILED"
 STATUS_APPROVED = "APPROVED"
 STATUS_NEEDS_CHANGES = "NEEDS_CHANGES"
 STATUS_NEEDS_HUMAN = "NEEDS_HUMAN"
+STATUS_DONE = "DONE"
 STATUSES = (
     STATUS_PENDING, STATUS_RUNNING, STATUS_IMPLEMENTED, STATUS_FAILED,
-    STATUS_APPROVED, STATUS_NEEDS_CHANGES, STATUS_NEEDS_HUMAN,
+    STATUS_APPROVED, STATUS_NEEDS_CHANGES, STATUS_NEEDS_HUMAN, STATUS_DONE,
 )
 REVIEW_APPROVED = "approved"
 REVIEW_CHANGES_REQUESTED = "changes_requested"
@@ -248,6 +250,27 @@ def latest_review(conn, task_id: int):
         "findings": json.loads(row["findings"]),
         "created_at": row["created_at"],
     }
+
+
+def unfinished_dependencies(conn, task_id: int) -> list:
+    """Return the ``(id, status)`` pairs of dependencies that are not DONE.
+
+    A dependency is satisfied only by ``DONE``: an ``APPROVED`` dependency is
+    not yet integrated, so it does not unlock its dependents.
+    """
+    return [
+        (row["depends_on_id"], row["status"])
+        for row in conn.execute(
+            "SELECT dependencies.depends_on_id AS depends_on_id,"
+            " COALESCE(tasks.status, 'missing') AS status"
+            " FROM dependencies LEFT JOIN tasks"
+            " ON tasks.id = dependencies.depends_on_id"
+            " WHERE dependencies.task_id = ?"
+            " AND COALESCE(tasks.status, '') <> ?"
+            " ORDER BY dependencies.depends_on_id",
+            (task_id, STATUS_DONE),
+        )
+    ]
 
 
 def delete_task(conn, task_id: int) -> None:

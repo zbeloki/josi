@@ -165,7 +165,7 @@ class RunExecutionTests(TaskRunTestCase):
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Task status: IMPLEMENTED", result.stdout)
-        self.assertIn("Task t1 \u2192 APPROVED", result.stdout)
+        self.assertIn("Task t1 \u2192 DONE", result.stdout)
         self.assertIn("log:", result.stdout)
 
         worktree = self.worktree()
@@ -181,7 +181,8 @@ class RunExecutionTests(TaskRunTestCase):
         self.assertEqual(subjects[0], "worker: implement task")
         self.assertIn("base commit", subjects)
 
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.rev("main"), self.rev("actl/t1"))
 
         log = self.log_text()
         self.assertTrue(log.startswith("actl task run\n"), log[:80])
@@ -203,9 +204,11 @@ class RunExecutionTests(TaskRunTestCase):
         self.make_task()
         (self.repo / "later.txt").write_text("later\n", encoding="utf-8")
         self.commit("later commit")
+        later = self.rev("main")
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.rev("actl/t1~1"), self.rev("main"))
+        self.assertEqual(self.rev("actl/t1~1"), later)
+        self.assertEqual(self.rev("main"), self.rev("actl/t1"))
 
     def test_task_branch_starts_from_the_configured_base_branch(self):
         # Configure ``develop`` as the base, then let ``main`` advance: the
@@ -220,18 +223,20 @@ class RunExecutionTests(TaskRunTestCase):
         self.make_task()
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.rev("actl/t1~1"), self.rev("develop"))
-        self.assertEqual(self.rev("develop"), self.base_sha)
+        self.assertEqual(self.rev("actl/t1~1"), self.base_sha)
+        self.assertEqual(self.rev("develop"), self.rev("actl/t1"))
         self.assertNotEqual(self.rev("main"), self.rev("develop"))
         self.assertIn("Never merge into develop.", self.worker_prompt())
 
-    def test_main_branch_and_checkout_are_untouched(self):
+    def test_main_branch_is_fast_forwarded_and_clean(self):
         self.make_task()
         main_before = self.rev("main")
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.rev("main"), main_before)
-        self.assertEqual(self.rev("main"), self.base_sha)
+        # Stage 7 fast-forwards the base branch to the approved commit; it
+        # never rewrites history and the base checkout stays clean.
+        self.assertEqual(self.rev("main"), self.rev("actl/t1"))
+        self.git("merge-base", "--is-ancestor", main_before, "main")
         self.assertEqual(
             self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip(), "main"
         )
@@ -556,7 +561,7 @@ class RunFailureTests(TaskRunTestCase):
         self.env["ACTL_FAKE_RUN"] = "none"
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         self.assertEqual(self.rev("actl/t1"), first_head)
         self.assertIn("result: IMPLEMENTED", self.log_text())
 
@@ -577,11 +582,12 @@ class RunFailureTests(TaskRunTestCase):
 
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("already APPROVED", result.stderr)
+        self.assertIn("already DONE", result.stderr)
         self.assertEqual(len(self.worker_calls()), workers)
         self.assertEqual(len(self.reviewer_calls()), reviewers)
         self.assertEqual(self.rev("actl/t1"), head)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.rev("main"), head)
 
     def test_retry_reuses_existing_worktree_and_work(self):
         self.make_task()
@@ -595,7 +601,7 @@ class RunFailureTests(TaskRunTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Reusing worktree", result.stdout)
 
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         second_head = self.rev("actl/t1")
         self.assertNotEqual(second_head, first_head)
         # The first attempt's commit is still an ancestor: nothing was reset.
@@ -675,7 +681,7 @@ class RunFailureTests(TaskRunTestCase):
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.worktree().is_dir())
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         # The earlier commit is still there: the branch was re-attached, not
         # recreated.
         self.git("merge-base", "--is-ancestor", first_head, "actl/t1")
@@ -721,7 +727,7 @@ class LegacyProjectTests(TaskRunTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Using detected base branch 'main'", result.stdout)
         self.assertEqual(self.rev("actl/t1~1"), self.base_sha)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         # Detection never rewrites the existing configuration by itself.
         self.assertEqual(self.metadata_path().read_bytes(), before)
 
@@ -839,10 +845,10 @@ class EmptyRepositoryTests(ActlTestCase):
         self.commit_initial()
         result = self.run_actl("task", "run", "t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         self.assertEqual(
             self.git("rev-parse", "actl/t1~1").stdout.strip(),
-            self.git("rev-parse", "HEAD").stdout.strip(),
+            self.git("rev-parse", "HEAD~1").stdout.strip(),
         )
 
     def test_configured_base_must_have_commits_before_running(self):
@@ -861,12 +867,16 @@ class EmptyRepositoryTests(ActlTestCase):
         self.assertFalse((self.repo / ".actl" / "worktrees").exists())
 
         self.git("checkout", "-q", "-b", "develop")
+        develop_before = self.git("rev-parse", "develop").stdout.strip()
         result = self.run_actl("task", "run", "t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         self.assertEqual(
-            self.git("rev-parse", "actl/t1~1").stdout.strip(),
+            self.git("rev-parse", "actl/t1~1").stdout.strip(), develop_before
+        )
+        self.assertEqual(
             self.git("rev-parse", "develop").stdout.strip(),
+            self.git("rev-parse", "actl/t1").stdout.strip(),
         )
 
 
@@ -881,13 +891,13 @@ class DependencyTests(TaskRunTestCase):
         )
         result = self.run_task("t2")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("depends on t1", result.stderr)
-        self.assertIn("Stage 7", result.stderr)
+        self.assertIn("depends on t1 (PENDING)", result.stderr)
+        self.assertIn("all its dependencies are DONE", result.stderr)
         self.assertEqual(self.task_status("t2"), "PENDING")
         self.assertFalse(self.worktree("t2").exists())
         self.assertEqual(self.worker_calls(), [])
 
-    def test_dependency_stays_blocked_after_the_dependency_is_implemented(self):
+    def test_dependency_unlocks_after_the_dependency_is_done(self):
         self.make_task()
         self.assertEqual(
             self.run_actl(
@@ -896,12 +906,12 @@ class DependencyTests(TaskRunTestCase):
             0,
         )
         self.assertEqual(self.run_task("t1").returncode, 0)
-        self.assertEqual(self.task_status("t1"), "APPROVED")
+        self.assertEqual(self.task_status("t1"), "DONE")
 
         result = self.run_task("t2")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("depends on t1", result.stderr)
-        self.assertFalse(self.worktree("t2").exists())
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status("t2"), "DONE")
+        self.assertEqual(self.rev("main"), self.rev("actl/t2"))
 
 
 class ExecutionLockTests(TaskRunTestCase):
@@ -976,7 +986,7 @@ class ExecutionLockTests(TaskRunTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("left RUNNING", result.stdout)
         self.assertIn("Reusing worktree", result.stdout)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.task_status(), "DONE")
         subjects = self.git("log", "--format=%s", "actl/t1").stdout.splitlines()
         self.assertEqual(subjects.count("worker: implement task"), 2)
 

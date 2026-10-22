@@ -16,6 +16,11 @@
 * The reviewer gets a temporary detached worktree under ``.actl/review/``
   (see ``add_review_worktree``), so its checkout can never touch the task
   worktree.
+* An approved task is integrated with ``git merge --ff-only``
+  (see ``integrate_commit``): the base branch is fast-forwarded to the exact
+  approved commit in the worktree that has the base branch checked out, or -
+  when no worktree has it checked out - in a temporary worktree under
+  ``.actl/integrate/``. The base branch is never reset, rebased, or forced.
 * Each task records how many worker attempts it has used in
   ``.actl/attempts/tN``, together with the feedback for the next attempt, so
   the three-attempt repair budget survives CLI invocations and an interrupted
@@ -40,6 +45,7 @@ from pathlib import Path
 LOCK_NAME = "execution.lock"
 WORKTREES_DIR = "worktrees"
 REVIEW_DIR = "review"
+INTEGRATE_DIR = "integrate"
 BASE_DIR = "base"
 RUNS_DIR = "runs"
 ATTEMPTS_DIR = "attempts"
@@ -360,17 +366,109 @@ def branch_base(actl_dir: Path, task_id: int):
     return commit or None
 
 
-def remove_review_worktree(root: Path, path: Path) -> str:
-    """Remove a temporary reviewer worktree; return an error text or "".
+def remove_temporary_worktree(root: Path, path: Path) -> str:
+    """Remove a temporary worktree; return an error text or "".
 
-    Removal is forced: the reviewer may have left untracked or modified files
-    in its disposable checkout, and those changes are never rolled back into
-    the task worktree. A failure is reported but never blocks a verdict.
+    Removal is forced: a reviewer or merge may have left untracked or
+    modified files in its disposable checkout, and those changes are never
+    rolled back into a task worktree or the base worktree. A failure is
+    reported but never blocks a verdict or a completed merge.
     """
     proc = _git(root, "worktree", "remove", "--force", str(path), check=False)
     if proc.returncode == 0:
         return ""
     return proc.stderr.strip() or proc.stdout.strip() or "git worktree remove failed"
+
+
+def worktree_for_branch(root: Path, branch: str):
+    """Return the path of the worktree that has ``branch`` checked out.
+
+    Git allows a branch to be checked out in at most one worktree, so the
+    match is unique. Returns None when no worktree has the branch checked out
+    (a bare or detached checkout) - the caller decides where to merge.
+    """
+    wanted = "refs/heads/" + branch
+    for path, ref in _registered_worktrees(root).items():
+        if ref == wanted:
+            return Path(path)
+    return None
+
+
+def integrate_commit(
+    root: Path, actl_dir: Path, base_branch: str, branch: str, commit: str
+) -> Path:
+    """Fast-forward ``base_branch`` to ``commit``; return the merge worktree.
+
+    The approved commit is merged exactly as it was validated and approved:
+    the task branch must still point at it, the base branch must exist, and
+    the worktree holding the base branch (or a temporary one, when no
+    worktree has it checked out) must be clean before ``git merge --ff-only``
+    runs. A non-fast-forward merge, a moved task branch, a missing base
+    branch, and a dirty base worktree all raise :class:`ExecutionError`
+    without changing anything: actl never resets, rebases, force-pushes, or
+    resolves conflicts, so the caller can keep the task APPROVED for a
+    deliberate retry.
+
+    A temporary merge worktree is removed on every path; the branch ref keeps
+    the merge either way.
+    """
+    current = ref_commit(root, "refs/heads/" + branch)
+    if current != commit:
+        raise ExecutionError(
+            "task branch " + branch + " moved after approval: expected "
+            + commit[:12] + ", found " + current[:12]
+            + "; refusing to merge"
+        )
+    if not branch_exists(root, base_branch):
+        raise ExecutionError(
+            "base branch '" + base_branch + "' does not exist in " + str(root)
+            + "; refusing to merge"
+        )
+    worktree = worktree_for_branch(root, base_branch)
+    temporary = None
+    if worktree is None:
+        temporary = (
+            actl_dir / INTEGRATE_DIR
+            / (branch.replace("/", "-") + "-" + timestamp())
+        )
+        try:
+            # The short branch name (not the full ref) makes git check the
+            # branch out instead of detaching HEAD. Verifying the checkout
+            # below still refuses safely when another ref shadows the name.
+            _git(root, "worktree", "add", str(temporary), base_branch)
+        except ExecutionError:
+            if temporary.exists():
+                remove_temporary_worktree(root, temporary)
+            raise
+        worktree = temporary
+    try:
+        checked_out = worktree_branch(worktree)
+        if checked_out != base_branch:
+            raise ExecutionError(
+                "worktree " + str(worktree) + " has '" + checked_out
+                + "' checked out instead of '" + base_branch
+                + "'; refusing to merge"
+            )
+        dirty = worktree_dirty(worktree)
+        if dirty:
+            raise ExecutionError(
+                "the base worktree " + str(worktree)
+                + " has uncommitted or untracked changes; commit or remove"
+                " them before merging (the task keeps its APPROVED state)"
+            )
+        _git(worktree, "merge", "--ff-only", commit)
+    except BaseException:
+        if temporary is not None:
+            remove_temporary_worktree(root, temporary)
+        raise
+    if temporary is not None:
+        problem = remove_temporary_worktree(root, temporary)
+        if problem:
+            raise ExecutionError(
+                "the merge finished but the temporary worktree "
+                + str(temporary) + " could not be removed (" + problem + ")"
+            )
+    return worktree
 
 
 def attempt_state(actl_dir: Path, task_id: int):

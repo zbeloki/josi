@@ -10,6 +10,8 @@ from __future__ import annotations
 import shutil
 import sqlite3
 import subprocess
+import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -335,6 +337,54 @@ class TaskDependencyTests(TaskTestCase):
         finally:
             conn.close()
         self.assertEqual(rows, [])
+
+    def test_overlapping_updates_cannot_create_a_cycle(self):
+        self.make_tasks("One", "Two")
+
+        def update(task_id, dependency):
+            return subprocess.Popen(
+                [
+                    sys.executable, "-m", "actl", "task", "update", task_id,
+                    "--depends-on", dependency,
+                ],
+                cwd=str(self.repo),
+                env=self.env,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                text=True,
+            )
+
+        # While this connection holds the write lock both updates are
+        # waiting on it, so neither writes before the other has read the
+        # dependency graph. Without an immediate transaction both read the
+        # same empty graph and the second writer commits a cycle.
+        lock = sqlite3.connect(str(self.task_db()))
+        lock.execute("BEGIN IMMEDIATE")
+        processes = [update("t1", "t2"), update("t2", "t1")]
+        try:
+            time.sleep(1.0)
+            self.assertEqual(
+                [process.poll() for process in processes],
+                [None, None],
+                "both updates must be waiting on the database lock",
+            )
+        finally:
+            lock.commit()
+            lock.close()
+            results = [process.communicate(timeout=30) for process in processes]
+
+        codes = [process.returncode for process in processes]
+        self.assertEqual(sorted(codes), [0, 1], results)
+        self.assertIn("cycle", results[codes.index(1)][1])
+
+        conn = sqlite3.connect(str(self.task_db()))
+        try:
+            edges = conn.execute(
+                "SELECT task_id, depends_on_id FROM dependencies"
+            ).fetchall()
+        finally:
+            conn.close()
+        self.assertEqual(len(edges), 1, edges)
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")

@@ -8,7 +8,10 @@ derived from its dependencies when needed.
 The module is deliberately small: repository functions over a connection
 opened by the caller. Every write runs inside a ``with conn:`` transaction,
 so a failed command never leaves a half-written task behind, and foreign
-keys are enabled on every connection.
+keys are enabled on every connection. Operations that validate state before
+writing (update and delete) open their transaction with ``BEGIN IMMEDIATE``:
+the write lock is taken before the dependency graph is read, so two
+overlapping commands cannot both validate against the same unchanged graph.
 """
 
 from __future__ import annotations
@@ -123,27 +126,33 @@ def update_task(conn, task_id: int, title=None, description=None, depends_on=Non
 
     ``title`` and ``description`` are changed when not None. ``depends_on``
     replaces the dependency set when not None (an empty sequence clears it).
+
+    Reading and validating the dependency graph happens inside the write
+    transaction: ``BEGIN IMMEDIATE`` takes the lock before the graph is read,
+    so two overlapping updates cannot both validate against the same
+    unchanged graph and then commit a dependency cycle.
     """
-    if not _task_exists(conn, task_id):
-        raise TaskError("task t" + str(task_id) + " does not exist")
-    changes = {}
-    if title is not None:
-        title = title.strip()
-        if not title:
-            raise TaskError("task title must not be empty")
-        changes["title"] = title
-    if description is not None:
-        changes["description"] = description
-    resolved = None
-    if depends_on is not None:
-        resolved = _resolve_dependencies(conn, task_id, depends_on)
-    if not changes and resolved is None:
-        raise TaskError(
-            "no changes requested for task t" + str(task_id)
-            + " (use --title, --description, --description-file, --depends-on,"
-            " or --clear-dependencies)"
-        )
     with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if not _task_exists(conn, task_id):
+            raise TaskError("task t" + str(task_id) + " does not exist")
+        changes = {}
+        if title is not None:
+            title = title.strip()
+            if not title:
+                raise TaskError("task title must not be empty")
+            changes["title"] = title
+        if description is not None:
+            changes["description"] = description
+        resolved = None
+        if depends_on is not None:
+            resolved = _resolve_dependencies(conn, task_id, depends_on)
+        if not changes and resolved is None:
+            raise TaskError(
+                "no changes requested for task t" + str(task_id)
+                + " (use --title, --description, --description-file, --depends-on,"
+                " or --clear-dependencies)"
+            )
         if resolved is not None:
             _set_dependencies(conn, task_id, resolved)
         changes["updated_at"] = _utc_now()
@@ -157,23 +166,29 @@ def update_task(conn, task_id: int, title=None, description=None, depends_on=Non
 
 
 def delete_task(conn, task_id: int) -> None:
-    """Delete ``task_id`` unless other tasks depend on it."""
-    if not _task_exists(conn, task_id):
-        raise TaskError("task t" + str(task_id) + " does not exist")
-    dependents = [
-        row["task_id"]
-        for row in conn.execute(
-            "SELECT task_id FROM dependencies WHERE depends_on_id = ? ORDER BY task_id",
-            (task_id,),
-        )
-    ]
-    if dependents:
-        names = ", ".join("t" + str(dependent) for dependent in dependents)
-        raise TaskError(
-            "cannot delete task t" + str(task_id) + ": " + names
-            + (" depend on it" if len(dependents) > 1 else " depends on it")
-        )
+    """Delete ``task_id`` unless other tasks depend on it.
+
+    The dependent check runs inside the same immediate transaction as the
+    deletion, so a concurrent dependency update cannot slip in between the
+    check and the write.
+    """
     with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if not _task_exists(conn, task_id):
+            raise TaskError("task t" + str(task_id) + " does not exist")
+        dependents = [
+            row["task_id"]
+            for row in conn.execute(
+                "SELECT task_id FROM dependencies WHERE depends_on_id = ? ORDER BY task_id",
+                (task_id,),
+            )
+        ]
+        if dependents:
+            names = ", ".join("t" + str(dependent) for dependent in dependents)
+            raise TaskError(
+                "cannot delete task t" + str(task_id) + ": " + names
+                + (" depend on it" if len(dependents) > 1 else " depends on it")
+            )
         conn.execute("DELETE FROM dependencies WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
 

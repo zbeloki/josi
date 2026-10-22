@@ -187,11 +187,15 @@ exact commit the reviewer approved:
   checked out must be clean (no uncommitted or untracked changes). When no
   worktree has the base branch checked out, actl uses a temporary worktree
   under `.actl/integrate/` for the merge and removes it afterwards.
-- The merge is `git merge --ff-only`: actl never force-pushes, resets,
-  rebases, or overwrites the base branch, and it never resolves conflicts.
-  When a fast-forward is impossible - the base branch advanced with its own
-  commits, or the branch moved after approval - actl stops and reports the
-  problem instead of changing anything.
+- The merge is `git merge --ff-only --no-squash --no-overwrite-ignore`:
+  actl never force-pushes, resets, rebases, squashes, or overwrites the
+  base branch, and it never resolves conflicts. When a fast-forward is
+  impossible - the base branch advanced with its own commits, or the branch
+  moved after approval - actl stops and reports the problem instead of
+  changing anything; the merge is likewise refused when it would replace an
+  ignored local file in the base worktree. After the merge, the base branch
+  must really contain the approved commit before the task is reported as
+  integrated.
 - An integration failure keeps the task `APPROVED`, so its branch, worktree,
   and approval are preserved. Resolving the problem (checking out the base
   branch, committing or removing local changes) and rerunning
@@ -744,8 +748,9 @@ already `DONE` task refusing to run, a completed merge whose `DONE` record
 was lost, dependencies unlocking only after `DONE`, explicit task lists,
 `--all` in dependency order, deterministic id order for independent tasks,
 stopping at the first failure or at a task that needs a human, never
-executing a task with unfinished dependencies, and one execution lock per
-batch.
+executing a task with unfinished dependencies, an ignored local file the
+merge must never overwrite, branch squash options that cannot fake a
+successful integration, and one execution lock per batch.
 
 ## Limitations
 
@@ -797,14 +802,17 @@ batch.
   fails keeps its branch, worktree, and log for an explicit retry. Two kinds
   of worktree are temporary and removed again: the reviewer's checkout and
   the merge worktree used when no worktree has the base branch checked out.
-- Integration is a plain `git merge --ff-only` of the exact approved commit.
-  actl never rewrites the base branch: when the base branch advanced with its
-  own commits, the merge is refused and a human must reconcile it by hand.
+- Integration is a plain `git merge --ff-only` of the exact approved commit;
+  `--no-squash` and `--no-overwrite-ignore` keep branch configuration from
+  staging a squash and from replacing an ignored local file. actl never
+  rewrites the base branch: when the base branch advanced with its own
+  commits, the merge is refused and a human must reconcile it by hand.
   Merging also refuses while an uncommitted or untracked file sits in the
   worktree that has the base branch checked out, instead of touching the
-  user's work; both refusals keep the task `APPROVED` for a later retry. When
-  no worktree has the base branch checked out, a temporary worktree performs
-  the merge, so that checkout does not see the new files until it is updated.
+  user's work; every refusal keeps the task `APPROVED` for a later retry.
+  When no worktree has the base branch checked out, a temporary worktree
+  performs the merge, so that checkout does not see the new files until it
+  is updated.
 - `actl task run --all` does not select `DONE` or `NEEDS_HUMAN` tasks. It
   reports the tasks that still need a human and stops when no selected task
   can progress, so a project with an abandoned `NEEDS_HUMAN` task can still

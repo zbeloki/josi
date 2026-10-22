@@ -5,7 +5,9 @@ Every test runs the CLI against a disposable Git repository and the fake
 APPROVED without a real model; the tests then exercise the fast-forward
 integration into the configured base branch, the DONE state, dependency-aware
 scheduling, and the batch execution modes (``actl task run t1 t2`` and
-``actl task run --all``), including every refusal path.
+``actl task run --all``), including every refusal path: a dirty base
+worktree, a non-fast-forward merge, a moved task branch, squash branch
+options, and an ignored local file the merge would overwrite.
 """
 
 from __future__ import annotations
@@ -196,6 +198,71 @@ class MergeTests(IntegrationTestCase):
         self.assertIn("moved after approval", result.stderr)
         self.assertEqual(self.task_status(), "APPROVED")
         self.assertEqual(self.rev("main"), self.base_sha)
+
+    def test_ignored_local_file_is_never_overwritten_by_merging(self):
+        # The base worktree ignores a local file that the task's approved
+        # commit starts tracking. Ignored files do not make the worktree
+        # dirty, so only the merge itself can refuse instead of silently
+        # replacing the human's local data.
+        (self.repo / ".gitignore").write_text(
+            ".actl/\nlocal-notes.txt\n", encoding="utf-8"
+        )
+        self.commit("ignore the local notes")
+        human = "local settings\n"
+        (self.repo / "local-notes.txt").write_text(human, encoding="utf-8")
+        base = self.rev("main")
+        self.create("Track the local notes")
+        self.env["ACTL_FAKE_RUN"] = "ignore-collision"
+
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("integration failed", result.stderr)
+        self.assertIn("local-notes.txt", result.stderr)
+        self.assertIn("Task t1 \u2192 APPROVED (not merged)", result.stdout)
+        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.rev("main"), base, "main must not move")
+        self.assertEqual(
+            (self.repo / "local-notes.txt").read_text(encoding="utf-8"),
+            human,
+            "the ignored local file must never be silently overwritten",
+        )
+
+        # The human resolves the collision and the same approved commit
+        # integrates without rerunning the worker, validation, or review.
+        workers = len(self.worker_calls())
+        reviewers = len(self.reviewer_calls())
+        (self.repo / "local-notes.txt").unlink()
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.rev("main"), self.rev("actl/t1"))
+        self.assertEqual(
+            (self.repo / "local-notes.txt").read_text(encoding="utf-8"),
+            "tracked default\n",
+        )
+        self.assertEqual(len(self.worker_calls()), workers)
+        self.assertEqual(len(self.reviewer_calls()), reviewers)
+
+    def test_branch_squash_options_cannot_fake_a_done_integration(self):
+        self.create("Add the feature")
+        self.approve_without_integrating()
+        self.clean_base()
+        workers = len(self.worker_calls())
+        reviewers = len(self.reviewer_calls())
+        # A branch-level option turns a plain merge into a squash that only
+        # stages the changes; actl must still fast-forward and may report
+        # DONE only once the approved commit is really in the base branch.
+        self.git("config", "branch.main.mergeOptions", "--squash")
+
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "DONE")
+        approved = self.rev("actl/t1")
+        self.assertEqual(self.rev("main"), approved)
+        self.git("merge-base", "--is-ancestor", approved, "main")
+        self.assertEqual(self.git("status", "--porcelain").stdout, "")
+        self.assertEqual(len(self.worker_calls()), workers)
+        self.assertEqual(len(self.reviewer_calls()), reviewers)
 
     def test_already_approved_task_integrates_without_rerunning_agents(self):
         self.create("Add the feature")

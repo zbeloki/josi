@@ -20,7 +20,10 @@
   (see ``integrate_commit``): the base branch is fast-forwarded to the exact
   approved commit in the worktree that has the base branch checked out, or -
   when no worktree has it checked out - in a temporary worktree under
-  ``.actl/integrate/``. The base branch is never reset, rebased, or forced.
+  ``.actl/integrate/``. The base branch is never reset, rebased, or forced;
+  the merge runs with ``--no-squash`` and ``--no-overwrite-ignore``, so
+  inherited branch configuration cannot stage a squash instead, and an
+  ignored local file is never silently overwritten.
 * Each task records how many worker attempts it has used in
   ``.actl/attempts/tN``, together with the feedback for the next attempt, so
   the three-attempt repair budget survives CLI invocations and an interrupted
@@ -319,6 +322,20 @@ def merge_base(root: Path, ref_a: str, ref_b: str) -> str:
     return _git(root, "merge-base", ref_a, ref_b).stdout.strip()
 
 
+def is_ancestor(root: Path, commit: str, ref: str) -> bool:
+    """Return whether ``commit`` is an ancestor of (or equal to) ``ref``."""
+    proc = _git(root, "merge-base", "--is-ancestor", commit, ref, check=False)
+    if proc.returncode == 0:
+        return True
+    if proc.returncode == 1:
+        return False
+    detail = proc.stderr.strip() or proc.stdout.strip() or "no output"
+    raise ExecutionError(
+        "git merge-base --is-ancestor " + commit + " " + ref + " failed: "
+        + detail
+    )
+
+
 def worktree_tracked_dirty(path: Path) -> str:
     """Return ``git status --porcelain`` output for tracked files only.
 
@@ -409,6 +426,13 @@ def integrate_commit(
     resolves conflicts, so the caller can keep the task APPROVED for a
     deliberate retry.
 
+    The merge always runs with ``--no-squash`` and ``--no-overwrite-ignore``,
+    so branch configuration cannot turn it into a squash that only stages
+    the changes, and an ignored local file in the base worktree (which does
+    not make it dirty) is refused instead of silently overwritten. After the
+    merge, the base branch must really contain the approved commit;
+    otherwise the integration fails and the task stays APPROVED.
+
     A temporary merge worktree is removed on every path; the branch ref keeps
     the merge either way.
     """
@@ -456,7 +480,20 @@ def integrate_commit(
                 + " has uncommitted or untracked changes; commit or remove"
                 " them before merging (the task keeps its APPROVED state)"
             )
-        _git(worktree, "merge", "--ff-only", commit)
+        _git(
+            worktree, "merge", "--ff-only", "--no-squash",
+            "--no-overwrite-ignore", commit,
+        )
+        # Command-line options override branch configuration, but never
+        # report a completed integration unless the base branch really
+        # contains the approved commit (a squash, for example, stages the
+        # changes and exits successfully without moving the branch).
+        if not is_ancestor(root, commit, "refs/heads/" + base_branch):
+            raise ExecutionError(
+                "the merge reported success but the approved commit "
+                + commit[:12] + " is not an ancestor of " + base_branch
+                + "; refusing to report the integration as complete"
+            )
     except BaseException:
         if temporary is not None:
             remove_temporary_worktree(root, temporary)

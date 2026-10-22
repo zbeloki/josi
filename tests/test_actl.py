@@ -41,10 +41,13 @@ Behaviour is controlled through environment variables:
 * ``ACTL_FAKE_RUN``         - worker behaviour on ``run``: commit (default),
                               dirty (leave an uncommitted file), none, empty
                               (make an empty commit), detach (leave the
-                              worktree on a detached HEAD), or commit-index
+                              worktree on a detached HEAD), commit-index
                               (commit a new ``worker-output-N.txt`` file,
                               with N the one-based invocation number from
-                              ``ACTL_FAKE_RUN_COUNT_FILE``)
+                              ``ACTL_FAKE_RUN_COUNT_FILE``), or
+                              ignore-collision (drop the ``local-notes.txt``
+                              ignore rule and commit a tracked
+                              ``local-notes.txt``)
 * ``ACTL_FAKE_RUN_EXIT``    - exit code for the noninteractive run
 * ``ACTL_FAKE_RUN_SEQUENCE`` - JSON list of per-invocation behaviours (a
                               string behaviour or an object with optional
@@ -234,6 +237,25 @@ def _run_worker():
         with open(name, "a", encoding="utf-8") as handle:
             handle.write("worker change " + str(index + 1) + "\\n")
         subprocess.run(["git", "add", name], check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Fake Worker",
+             "-c", "user.email=worker@example.invalid",
+             "commit", "-m", "worker: implement task"],
+            check=True, capture_output=True,
+        )
+    elif behavior == "ignore-collision":
+        with open(".gitignore", encoding="utf-8") as handle:
+            lines = [
+                line for line in handle
+                if line.strip() != "local-notes.txt"
+            ]
+        with open(".gitignore", "w", encoding="utf-8") as handle:
+            handle.writelines(lines)
+        with open("local-notes.txt", "w", encoding="utf-8") as handle:
+            handle.write("tracked default\\n")
+        subprocess.run(
+            ["git", "add", ".gitignore", "local-notes.txt"], check=True
+        )
         subprocess.run(
             ["git", "-c", "user.name=Fake Worker",
              "-c", "user.email=worker@example.invalid",

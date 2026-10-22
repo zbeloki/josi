@@ -43,6 +43,10 @@ Behaviour is controlled through environment variables:
                               (make an empty commit), or detach (leave the
                               worktree on a detached HEAD)
 * ``ACTL_FAKE_RUN_EXIT``    - exit code for the noninteractive run
+* ``ACTL_FAKE_RUN_STREAM``  - text the worker prints to stdout and stderr
+                              (flushed immediately) before it waits or does
+                              any work, to test that the log is written
+                              while the worker is still running
 * ``ACTL_FAKE_RUN_MARKER``  - file receiving the worker PID when it starts
 * ``ACTL_FAKE_RUN_WAIT_FOR`` - the worker waits for this file (max 120s)
                               after writing the marker and before doing its
@@ -71,6 +75,13 @@ def _run_worker():
     if marker:
         with open(marker, "w", encoding="utf-8") as handle:
             handle.write(str(os.getpid()))
+    stream = os.environ.get("ACTL_FAKE_RUN_STREAM")
+    if stream:
+        print("fake opencode: " + stream + " on stdout", flush=True)
+        print(
+            "fake opencode: " + stream + " on stderr",
+            file=sys.stderr, flush=True,
+        )
     wait_for = os.environ.get("ACTL_FAKE_RUN_WAIT_FOR")
     deadline = time.time() + 120
     while wait_for and not os.path.exists(wait_for) and time.time() < deadline:

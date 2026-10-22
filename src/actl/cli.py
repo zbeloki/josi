@@ -810,14 +810,19 @@ def _execute_task(binary, root, actl_dir, task_id, model, lock_fd, base_branch) 
     The task is marked RUNNING before the worktree is prepared, so an
     interrupted attempt keeps RUNNING and a later explicit run continues from
     its worktree. A completed attempt always ends as IMPLEMENTED or FAILED.
+
+    The terminal shows only actl's own timestamped events; the worker's
+    transcript goes straight into the run log while it executes.
     """
     task = _load_task(actl_dir, task_id)
     _require_runnable(task)
     if task.status == tasks.STATUS_RUNNING:
-        print(
+        _event(
             "Retrying task t" + str(task.id)
             + ", left RUNNING by an interrupted execution"
         )
+    print("task t" + str(task.id) + ": " + task.title)
+    print("model: " + model)
 
     log_path, log = execution.open_run_log(actl_dir, task.id)
     with log:
@@ -831,6 +836,7 @@ def _execute_task(binary, root, actl_dir, task_id, model, lock_fd, base_branch) 
         reason = ""
         exit_code = None
         try:
+            _event("Preparing worktree")
             worktree = execution.ensure_worktree(
                 root, actl_dir, task, retry=task.status != tasks.STATUS_PENDING,
                 base_branch=base_branch,
@@ -838,12 +844,12 @@ def _execute_task(binary, root, actl_dir, task_id, model, lock_fd, base_branch) 
             log.write("branch: " + worktree.branch + "\n")
             log.write("worktree: " + str(worktree.path) + "\n")
             if worktree.created:
-                print(
+                _event(
                     "Created worktree " + str(worktree.path)
                     + " (branch " + worktree.branch + ")"
                 )
             else:
-                print(
+                _event(
                     "Reusing worktree " + str(worktree.path)
                     + " (branch " + worktree.branch + ")"
                 )
@@ -857,12 +863,17 @@ def _execute_task(binary, root, actl_dir, task_id, model, lock_fd, base_branch) 
             # Flush before the worker starts writing to the same file through
             # its inherited stdout descriptor, so the header stays on top.
             log.flush()
-            print("Running task t" + str(task.id) + " with model " + model)
+            _event("Starting worker (session " + session.id + ")")
+            _event("log: " + str(log_path))
             exit_code = opencode.run_headless(
                 binary, worktree.path, session.id, model,
                 execution.worker_prompt(task, worktree, base_branch), log,
                 pass_fds=(lock_fd,),
             )
+            if exit_code == 0:
+                _event("Worker finished with exit code 0")
+            else:
+                _event("Worker failed with exit code " + str(exit_code))
             status, reason = _evaluate_run(worktree, exit_code, base_branch)
         except (execution.ExecutionError, opencode.OpenCodeError, OSError) as exc:
             reason = str(exc)
@@ -876,6 +887,7 @@ def _execute_task(binary, root, actl_dir, task_id, model, lock_fd, base_branch) 
             log.write("reason: " + reason + "\n")
 
     _set_task_status(actl_dir, task.id, status)
+    _event("Task status: " + status)
     if status == tasks.STATUS_IMPLEMENTED:
         print("Task t" + str(task.id) + " implemented (log: " + str(log_path) + ")")
         return 0
@@ -1011,6 +1023,15 @@ def _print_task(task) -> None:
     )
     print("description:")
     print(task.description if task.description else "(none)")
+
+
+def _event(message: str) -> None:
+    """Print one timestamped orchestration event of ``actl task run``.
+
+    Events are flushed immediately so they appear as they happen even when
+    actl's own output is redirected to a pipe or a file.
+    """
+    print("[" + _utc_now() + "] " + message, flush=True)
 
 
 def _fail(message: str) -> int:

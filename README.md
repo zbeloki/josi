@@ -117,8 +117,15 @@ A run goes through these steps:
 4. OpenCode runs one noninteractive turn inside the worktree with the
    project's worker model and the built-in `build` agent
    (`opencode run --agent build --model MODEL --session ID`).
-5. The run's transcript is streamed into a log file under `.actl/runs/`.
+5. The worker's complete stdout and stderr are written straight into a log
+   file under `.actl/runs/` while it runs; the log path is printed when the
+   worker starts, so the run can be followed with `tail -f <logfile>`.
 6. The task status is updated.
+
+The terminal shows only actl's own timestamped events - task and model,
+worktree preparation, worker start, worker exit code, and the final task
+status - plus the run log path. The worker's transcript is never printed to
+the terminal.
 
 The worker prompt contains the task title, its description, and the worker
 instructions: implement the task, run the relevant checks, commit the changes
@@ -187,9 +194,10 @@ the next `actl init`, and `actl task run` keeps working by detecting the
 branch without writing metadata.
 
 Every execution writes `.actl/runs/t1-<timestamp>.log`: a short header
-(task, model, branch, worktree, session), the worker transcript, and the
-result (exit code, final status, failure reason). The path is printed when
-the run ends.
+(task, model, branch, worktree, session), the complete worker stdout and
+stderr, and the result (exit code, final status, failure reason). The log is
+written continuously while the worker runs, and its path is printed when the
+worker starts as well as in the final summary; use `tail -f` to watch a run.
 
 Only one execution may run per project. The lock is an exclusive, nonblocking
 `fcntl.flock` on `.actl/execution.lock`, and the locked file descriptor is

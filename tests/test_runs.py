@@ -267,6 +267,119 @@ class RunExecutionTests(TaskRunTestCase):
         self.assertEqual(self.worker_calls(), [])
 
 
+class TerminalOutputTests(TaskRunTestCase):
+    """The terminal shows actl events; the worker transcript stays in the log."""
+
+    def test_terminal_reports_events_but_not_worker_output(self):
+        self.make_task("Add the login form")
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        stdout = result.stdout
+        self.assertIn("task t1: Add the login form", stdout)
+        self.assertIn("model: provider/model", stdout)
+        self.assertIn("Preparing worktree", stdout)
+        self.assertIn("Starting worker", stdout)
+        self.assertIn("Worker finished with exit code 0", stdout)
+        self.assertIn("Task status: IMPLEMENTED", stdout)
+        # Events carry timestamps, and the log path is printed when the
+        # worker starts, before the worker-finished event.
+        self.assertRegex(
+            stdout,
+            r"\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}\]"
+            r" Preparing worktree",
+        )
+        self.assertLess(stdout.index("Starting worker"), stdout.index("log:"))
+        self.assertLess(stdout.index("log:"), stdout.index("Worker finished"))
+
+        # The worker transcript never reaches the terminal.
+        self.assertNotIn("fake opencode:", stdout)
+        self.assertNotIn("fake opencode:", result.stderr)
+
+    def test_failed_run_reports_events_and_status(self):
+        self.make_task()
+        self.env["ACTL_FAKE_RUN_EXIT"] = "1"
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+
+        self.assertIn("Worker failed with exit code 1", result.stdout)
+        self.assertIn("Task status: FAILED", result.stdout)
+        self.assertNotIn("fake opencode:", result.stdout)
+        self.assertNotIn("fake opencode:", result.stderr)
+        self.assertIn("failed", result.stderr)
+        self.assertIn("log:", result.stderr)
+
+    def test_preparation_failure_reports_status_without_starting_the_worker(self):
+        self.make_task()
+        self.git("branch", "-m", "main", "trunk")
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+
+        self.assertIn("Preparing worktree", result.stdout)
+        self.assertIn("Task status: FAILED", result.stdout)
+        self.assertNotIn("Starting worker", result.stdout)
+        self.assertIn("'main' does not exist", result.stderr)
+
+    def test_log_keeps_the_complete_worker_output(self):
+        self.make_task()
+        self.env["ACTL_FAKE_RUN_EXIT"] = "1"
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+
+        log = self.log_text()
+        self.assertIn("fake opencode: worker turn finished", log)
+        self.assertIn("fake opencode: worker detail", log)
+        self.assertIn("exit_code: 1", log)
+        self.assertIn("result: FAILED", log)
+
+    def test_log_is_written_while_the_worker_runs(self):
+        self.make_task()
+        release = self.base / "worker.release"
+        self.env["ACTL_FAKE_RUN_STREAM"] = "live"
+        self.env["ACTL_FAKE_RUN_WAIT_FOR"] = str(release)
+
+        parent = subprocess.Popen(
+            [sys.executable, "-m", "actl", "task", "run", "t1"],
+            cwd=str(self.repo), env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE,
+        )
+        try:
+            content = ""
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                paths = self.log_paths()
+                if paths:
+                    content = paths[-1].read_text(
+                        encoding="utf-8", errors="replace"
+                    )
+                    if "live on stderr" in content:
+                        break
+                time.sleep(0.05)
+            # Both worker streams reached the log before it finished.
+            self.assertIn("live on stdout", content)
+            self.assertIn("live on stderr", content)
+            self.assertIsNone(parent.poll(), "actl finished unexpectedly early")
+            self.assertFalse(
+                release.exists(), "the worker must still be running"
+            )
+        finally:
+            release.write_text("go", encoding="utf-8")
+            try:
+                out, err = parent.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                parent.kill()
+                out, err = parent.communicate()
+
+        self.assertEqual(parent.returncode, 0, err.decode("utf-8", "replace"))
+        self.assertNotIn(b"fake opencode:", out)
+        self.assertNotIn(b"fake opencode:", err)
+        log = self.log_text()
+        self.assertIn("live on stdout", log)
+        self.assertIn("live on stderr", log)
+        self.assertIn("fake opencode: worker turn finished", log)
+        self.assertIn("result: IMPLEMENTED", log)
+
+
 class WorkerModelTests(TaskRunTestCase):
     def test_worker_model_is_required(self):
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))

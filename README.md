@@ -50,9 +50,14 @@ On the first `actl plan` (or whenever the file is missing), actl installs
 an OpenCode custom primary agent. Its body is the planner's **system prompt**
 (define requirements, decompose goals into tasks with acceptance criteria,
 never modify code, never execute tasks), and its frontmatter makes the agent
-read-only: `edit` is denied and shell commands require explicit user approval.
-Because the instructions are system-level, launching the planner does not
-start a conversation by itself - the TUI just waits for input.
+read-only: `edit` is denied and every shell command requires explicit user
+approval - except safe Git inspection commands (`git status`, `git log`,
+`git diff`, `git show`, `git blame`, `git rev-parse`, `git ls-files`,
+`git grep`), which are pre-approved. The prompt also tells the planner to
+prefer the native `read`, `glob`, and `grep` tools over shell `cat`, `ls`, or
+`grep`, so routine exploration does not trigger prompts. Because the
+instructions are system-level, launching the planner does not start a
+conversation by itself - the TUI just waits for input.
 
 actl binds the planner session to this agent (for `--new` and first runs) and
 re-selects it before resuming, so older sessions created before the agent

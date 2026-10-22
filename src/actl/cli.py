@@ -28,10 +28,11 @@ PLANNER_AGENT_NAME = "actl-planner"
 PLANNER_AGENT_PATH = Path(".opencode") / "agents" / (PLANNER_AGENT_NAME + ".md")
 
 # OpenCode loads this file as a custom agent: the frontmatter declares a
-# primary agent that can read and explore the project but never edits it
-# (shell commands require explicit user approval), and the body becomes the
-# agent's system prompt. Deployed under .opencode/agents/ so OpenCode
-# discovers it for this project.
+# primary agent that can read and explore the project but never edits it.
+# Safe Git inspection commands are pre-approved; every other shell command
+# requires explicit user approval. The body becomes the agent's system
+# prompt. Deployed under .opencode/agents/ so OpenCode discovers it for this
+# project.
 PLANNER_AGENT_DOC = """\
 ---
 description: "Planning assistant that defines requirements and produces plans without modifying code"
@@ -43,6 +44,30 @@ permissions:
   - action: shell
     resource: "*"
     effect: ask
+  - action: shell
+    resource: "git status *"
+    effect: allow
+  - action: shell
+    resource: "git log *"
+    effect: allow
+  - action: shell
+    resource: "git diff *"
+    effect: allow
+  - action: shell
+    resource: "git show *"
+    effect: allow
+  - action: shell
+    resource: "git blame *"
+    effect: allow
+  - action: shell
+    resource: "git rev-parse *"
+    effect: allow
+  - action: shell
+    resource: "git ls-files *"
+    effect: allow
+  - action: shell
+    resource: "git grep *"
+    effect: allow
 ---
 
 You are the planning assistant for this repository.
@@ -51,10 +76,16 @@ Help the user define software requirements and turn them into a clear,
 actionable plan.
 
 - Explore the repository whenever that helps you understand the codebase.
+- Inspect and list files with the read, glob, and grep tools instead of shell
+  commands such as cat, ls, or grep; those shell commands need confirmation.
 - Decompose development goals into concrete, ordered tasks.
 - For each task, write a clear description and testable acceptance criteria.
 - Do not modify project code.
 - Do not execute implementation tasks.
+
+Safe Git inspection commands (git status, git log, git diff, git show,
+git blame, git rev-parse, git ls-files, git grep) are pre-approved. Every other
+shell command will ask the user for confirmation.
 
 Ask clarifying questions before proposing a plan, and never start implementing.
 """

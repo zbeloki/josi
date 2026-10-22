@@ -292,9 +292,33 @@ class PlanTests(ActlTestCase):
         self.assertIn("mode: primary", content)
         self.assertIn("action: edit", content)
         self.assertIn("effect: deny", content)
-        self.assertIn("action: shell", content)
-        self.assertIn("effect: ask", content)
+        self.assertIn('  - action: shell\n    resource: "*"\n    effect: ask', content)
         self.assertIn("planning assistant for this repository", content)
+        self.assertIn("read, glob, and grep", content)
+
+    def test_plan_agent_preapproves_only_safe_git_inspection(self):
+        self.assertEqual(self.run_actl("plan").returncode, 0)
+        content = self.agent_path().read_text(encoding="utf-8")
+        for command in (
+            "git status",
+            "git log",
+            "git diff",
+            "git show",
+            "git blame",
+            "git rev-parse",
+            "git ls-files",
+            "git grep",
+        ):
+            with self.subTest(command=command):
+                self.assertIn(
+                    'resource: "' + command + ' *"\n    effect: allow', content
+                )
+        # The broad `shell *` ask rule comes first and the last matching rule
+        # wins, so only the listed Git commands skip confirmation.
+        shell_ask = content.index('  - action: shell\n    resource: "*"\n    effect: ask')
+        first_git_allow = content.index('resource: "git status *"')
+        self.assertLess(shell_ask, first_git_allow)
+        self.assertIn("Every other\nshell command will ask the user for confirmation.", content)
 
     def test_plan_does_not_overwrite_existing_planner_agent(self):
         custom = "---\ndescription: custom planner\nmode: primary\n---\ncustom body\n"

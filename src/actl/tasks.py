@@ -3,7 +3,9 @@
 Stage 2 keeps the project's tasks in a small SQLite database at
 ``.actl/tasks.db``. The schema has two tables: ``tasks`` and
 ``dependencies``. There is no BLOCKED status - whether a task is blocked is
-derived from its dependencies when needed.
+derived from its dependencies when needed. A task's status is PENDING,
+RUNNING, IMPLEMENTED, or FAILED (Stage 4); only ``actl task run`` moves a task
+between them.
 
 The module is deliberately small: repository functions over a connection
 opened by the caller. Every write runs inside a ``with conn:`` transaction,
@@ -23,6 +25,10 @@ from pathlib import Path
 
 DATABASE_NAME = "tasks.db"
 STATUS_PENDING = "PENDING"
+STATUS_RUNNING = "RUNNING"
+STATUS_IMPLEMENTED = "IMPLEMENTED"
+STATUS_FAILED = "FAILED"
+STATUSES = (STATUS_PENDING, STATUS_RUNNING, STATUS_IMPLEMENTED, STATUS_FAILED)
 
 # CREATE TABLE IF NOT EXISTS keeps opening the database idempotent: existing
 # tasks are preserved while a missing or older database gains the current
@@ -162,6 +168,24 @@ def update_task(conn, task_id: int, title=None, description=None, depends_on=Non
             "UPDATE tasks SET " + assignments + " WHERE id = ?",
             (*changes.values(), task_id),
         )
+    return get_task(conn, task_id)
+
+
+def set_task_status(conn, task_id: int, status: str) -> Task:
+    """Set the task's status and return the task.
+
+    Only the statuses actl defines are accepted; the caller decides which
+    transitions are legal (``actl task run`` moves tasks between them).
+    """
+    if status not in STATUSES:
+        raise TaskError("invalid task status " + repr(status))
+    with conn:
+        cursor = conn.execute(
+            "UPDATE tasks SET status = ?, updated_at = ? WHERE id = ?",
+            (status, _utc_now(), task_id),
+        )
+        if cursor.rowcount == 0:
+            raise TaskError("task t" + str(task_id) + " does not exist")
     return get_task(conn, task_id)
 
 

@@ -17,6 +17,11 @@ Stage 3:
 * The planner agent manages the same task list through the ``actl task``
   commands. Its agent definition documents the CLI and pre-approves exactly
   those commands, so planning and task management happen in one session.
+
+Stage 4:
+
+* ``actl task run <id>`` executes one task with a noninteractive OpenCode
+  worker inside a dedicated Git worktree, under a project-wide execution lock.
 """
 
 from __future__ import annotations
@@ -32,7 +37,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import __version__, opencode, tasks
+from . import __version__, execution, opencode, tasks
 
 PROJECT_DIR = ".actl"
 PROJECT_METADATA = "project.json"
@@ -58,12 +63,14 @@ PLANNER_AGENT_PATH = Path(".opencode") / "agents" / (PLANNER_AGENT_NAME + ".md")
 # Everything else - editing, subagents, web access, MCP tools - stays denied,
 # including tools that write files under an action name other than "edit".
 # "actl task" commands are the only pre-approved shell commands because they
-# only read and write .actl/tasks.db. The "*>*" deny must come after the
-# pre-approval rule (last match wins): OpenCode reports a redirected
-# statement as a single resource string, so without the deny
-# "actl task ... > src/file" would silently count as an allowed task command
-# and could overwrite source files. The .env "ask" rules must follow the
-# broad read allow to keep their effect.
+# only read and write .actl/tasks.db. Running tasks ("actl task run") is
+# denied outright and comes after the broad allow (last match wins): the
+# planner must never launch a worker, only the user runs tasks. The "*>*"
+# deny must come after the pre-approval rule (last match wins): OpenCode
+# reports a redirected statement as a single resource string, so without the
+# deny "actl task ... > src/file" would silently count as an allowed task
+# command and could overwrite source files. The .env "ask" rules must follow
+# the broad read allow to keep their effect.
 # The body becomes the agent's system prompt. Deployed under
 # .opencode/agents/ so OpenCode discovers it for this project. actl manages
 # this file: ensure_planner_agent() rewrites it when its content differs
@@ -107,6 +114,9 @@ permissions:
     resource: "actl task *"
     effect: allow
   - action: shell
+    resource: "actl task run*"
+    effect: deny
+  - action: shell
     resource: "*>*"
     effect: deny
 ---
@@ -125,7 +135,8 @@ actionable plan.
 - Ask clarifying questions before proposing a plan, and never start
   implementing.
 - Do not modify project code.
-- Do not execute implementation tasks.
+- Do not execute implementation tasks. `actl task run` is denied: task
+  execution is the user's decision, not yours.
 
 ## Managing tasks with actl
 
@@ -150,8 +161,9 @@ print plain text:
 Ids are printed as `t1`, `t2`, ... and commands also accept the bare number
 (`1`). `--depends-on` may be repeated or comma-separated; a dependency must
 reference an existing task, must not be the task itself, and must not create
-a dependency cycle. Task status is not configurable yet: new tasks are
-PENDING and stay PENDING.
+a dependency cycle. These commands never change a task's status: new tasks
+are PENDING, and only the user executes tasks (`actl task run`, which is
+denied to you).
 
 Plan with the user before writing tasks:
 
@@ -169,8 +181,9 @@ Read-only repository inspection (read, glob, grep) and user questions are
 allowed. `actl task` shell commands are the only pre-approved shell commands;
 every other shell command asks for confirmation, and each command in a
 compound call is checked separately - run one command per shell call instead
-of chaining them with && or echo separators. Shell redirection is denied
-outright: never redirect command output to a file, and avoid the `>`
+of chaining them with && or echo separators. `actl task run` is denied
+outright: never execute tasks or launch coding workers. Shell redirection is
+denied outright: never redirect command output to a file, and avoid the `>`
 character in inline task text (for example, write "to" instead of an arrow).
 Everything else - editing files, subagents, web access, and MCP tools - is
 denied. If a tool is denied, do not look for a workaround; explain the
@@ -260,6 +273,42 @@ def save_planner_session_id(root: Path, session_id: str) -> None:
         )
 
 
+def _write_metadata(path: Path, metadata: dict) -> None:
+    path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+
+
+def _parse_worker_model(value: str) -> str:
+    """Validate a ``provider/model`` (optionally ``#variant``) worker model."""
+    model = value.strip()
+    provider, _, rest = model.partition("/")
+    if (
+        not provider
+        or not rest
+        or model.startswith("-")
+        or any(char.isspace() for char in model)
+    ):
+        raise ProjectError(
+            "invalid worker model " + repr(value)
+            + " (expected provider/model, optionally provider/model#variant)"
+        )
+    return model
+
+
+def _worker_model(metadata: dict) -> str:
+    """Return the project's worker model or raise :class:`ProjectError`."""
+    model = metadata.get("worker_model")
+    if model is None:
+        raise ProjectError(
+            "no worker model is configured for this project; run"
+            " 'actl init --worker-model provider/model' first"
+        )
+    if not isinstance(model, str):
+        raise ProjectError(
+            "project metadata has an invalid 'worker_model' value " + repr(model)
+        )
+    return _parse_worker_model(model)
+
+
 def ensure_gitignore(root: Path) -> None:
     """Make sure ``.actl/`` is ignored, preserving existing bytes exactly."""
     path = root / ".gitignore"
@@ -300,7 +349,7 @@ def ensure_planner_agent(root: Path) -> str:
     return "updated" if existed else "installed"
 
 
-def cmd_init(_args) -> int:
+def cmd_init(args) -> int:
     try:
         root = git_toplevel(Path.cwd())
     except ProjectError as exc:
@@ -309,29 +358,45 @@ def cmd_init(_args) -> int:
         opencode.find_binary()
     except opencode.OpenCodeError as exc:
         return _fail(str(exc))
+    worker_model = None
+    if args.worker_model is not None:
+        try:
+            worker_model = _parse_worker_model(args.worker_model)
+        except ProjectError as exc:
+            return _fail(str(exc))
 
     actl_dir = root / PROJECT_DIR
     metadata_path = actl_dir / PROJECT_METADATA
     if metadata_path.exists():
         try:
-            load_project_metadata(root)
+            metadata = load_project_metadata(root)
         except MetadataError as exc:
             return _fail(
                 "existing actl metadata is invalid (" + str(exc) + "); "
                 "remove '" + str(actl_dir) + "' and re-run 'actl init'"
             )
-        print("actl is already initialized in " + str(root))
+        if worker_model is not None and metadata.get("worker_model") != worker_model:
+            metadata["worker_model"] = worker_model
+            try:
+                _write_metadata(metadata_path, metadata)
+            except OSError as exc:
+                return _fail(
+                    "could not write " + str(metadata_path) + " (" + str(exc) + ")"
+                )
+            print("Updated the worker model to " + worker_model)
+        else:
+            print("actl is already initialized in " + str(root))
     else:
         metadata = {
             "schema_version": SCHEMA_VERSION,
             "name": root.name,
             "created_at": _utc_now(),
         }
+        if worker_model is not None:
+            metadata["worker_model"] = worker_model
         try:
             actl_dir.mkdir(parents=True, exist_ok=True)
-            metadata_path.write_text(
-                json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
-            )
+            _write_metadata(metadata_path, metadata)
         except OSError as exc:
             return _fail(
                 "could not write " + str(metadata_path) + " (" + str(exc) + ")"
@@ -371,20 +436,31 @@ def _select_planner_agent(binary: str, root: Path, session: opencode.Session) ->
         )
 
 
-def cmd_plan(args) -> int:
-    try:
-        root = git_toplevel(Path.cwd())
-    except ProjectError as exc:
-        return _fail(str(exc))
+def _project_root() -> Path:
+    """Return the project root, requiring a valid initialized actl project.
+
+    The Git repository root is resolved first and must contain a valid
+    ``.actl/project.json``, so no command can read or write another project's
+    state - not even from a nested repository.
+    """
+    root = git_toplevel(Path.cwd())
     if not (root / PROJECT_DIR).is_dir():
-        return _fail(
+        raise ProjectError(
             "no actl project found at the Git repository root " + str(root)
             + "; run 'actl init' first"
         )
     try:
         load_project_metadata(root)
     except MetadataError as exc:
-        return _fail("invalid actl project metadata: " + str(exc))
+        raise ProjectError("invalid actl project metadata: " + str(exc))
+    return root
+
+
+def cmd_plan(args) -> int:
+    try:
+        root = _project_root()
+    except ProjectError as exc:
+        return _fail(str(exc))
     try:
         binary = opencode.find_binary()
     except opencode.OpenCodeError as exc:
@@ -461,21 +537,11 @@ def _launch_tui(binary: str, root: Path, session_id: str) -> int:
 def _task_database():
     """Yield a connection to the current project's task database.
 
-    The Git repository root is resolved first and must contain a valid
-    ``.actl/project.json``, so a task command can never read or write another
-    project's database. The database file is created (with the current
-    schema) when it does not exist yet.
+    The project root is validated first (see :func:`_project_root`), so a task
+    command can never read or write another project's database. The database
+    file is created (with the current schema) when it does not exist yet.
     """
-    root = git_toplevel(Path.cwd())
-    if not (root / PROJECT_DIR).is_dir():
-        raise ProjectError(
-            "no actl project found at the Git repository root " + str(root)
-            + "; run 'actl init' first"
-        )
-    try:
-        load_project_metadata(root)
-    except MetadataError as exc:
-        raise ProjectError("invalid actl project metadata: " + str(exc))
+    root = _project_root()
     conn = tasks.connect(root / PROJECT_DIR / tasks.DATABASE_NAME)
     try:
         yield conn
@@ -550,6 +616,168 @@ def cmd_task_delete(args) -> int:
         return _fail(str(exc))
     print("Deleted task t" + str(task_id))
     return 0
+
+
+def cmd_task_run(args) -> int:
+    """Execute one task with the OpenCode worker."""
+    try:
+        task_id = _parse_task_id(args.id)
+        root = _project_root()
+        metadata = load_project_metadata(root)
+        model = _worker_model(metadata)
+        binary = opencode.find_binary()
+    except (ProjectError, tasks.TaskError, opencode.OpenCodeError) as exc:
+        return _fail(str(exc))
+    actl_dir = root / PROJECT_DIR
+    try:
+        with execution.lock(actl_dir) as lock_fd:
+            return _execute_task(binary, root, actl_dir, task_id, model, lock_fd)
+    except (
+        ProjectError, tasks.TaskError, sqlite3.Error,
+        execution.ExecutionError, opencode.OpenCodeError,
+    ) as exc:
+        return _fail(str(exc))
+
+
+def _execute_task(binary, root, actl_dir, task_id, model, lock_fd) -> int:
+    """Run one task while the execution lock is held.
+
+    The task is marked RUNNING before the worktree is prepared, so an
+    interrupted attempt keeps RUNNING and a later explicit run continues from
+    its worktree. A completed attempt always ends as IMPLEMENTED or FAILED.
+    """
+    task = _load_task(actl_dir, task_id)
+    _require_runnable(task)
+    if task.status == tasks.STATUS_RUNNING:
+        print(
+            "Retrying task t" + str(task.id)
+            + ", left RUNNING by an interrupted execution"
+        )
+
+    log_path, log = execution.open_run_log(actl_dir, task.id)
+    with log:
+        log.write("actl task run\n")
+        log.write("task: t" + str(task.id) + " - " + task.title + "\n")
+        log.write("model: " + model + "\n")
+        log.write("started_at: " + _utc_now() + "\n")
+
+        _set_task_status(actl_dir, task.id, tasks.STATUS_RUNNING)
+        status = tasks.STATUS_FAILED
+        reason = ""
+        exit_code = None
+        try:
+            worktree = execution.ensure_worktree(
+                root, actl_dir, task, retry=task.status != tasks.STATUS_PENDING
+            )
+            log.write("branch: " + worktree.branch + "\n")
+            log.write("worktree: " + str(worktree.path) + "\n")
+            if worktree.created:
+                print(
+                    "Created worktree " + str(worktree.path)
+                    + " (branch " + worktree.branch + ")"
+                )
+            else:
+                print(
+                    "Reusing worktree " + str(worktree.path)
+                    + " (branch " + worktree.branch + ")"
+                )
+            session = opencode.create_session(
+                binary, worktree.path,
+                title="actl task t" + str(task.id) + ": " + task.title,
+                agent=opencode.WORKER_AGENT,
+            )
+            log.write("session: " + session.id + "\n")
+            log.write("---\n")
+            # Flush before the worker starts writing to the same file through
+            # its inherited stdout descriptor, so the header stays on top.
+            log.flush()
+            print("Running task t" + str(task.id) + " with model " + model)
+            exit_code = opencode.run_headless(
+                binary, worktree.path, session.id, model,
+                execution.worker_prompt(task, worktree), log, pass_fds=(lock_fd,),
+            )
+            status, reason = _evaluate_run(worktree, exit_code)
+        except (execution.ExecutionError, opencode.OpenCodeError, OSError) as exc:
+            reason = str(exc)
+
+        log.write("---\n")
+        log.write("finished_at: " + _utc_now() + "\n")
+        if exit_code is not None:
+            log.write("exit_code: " + str(exit_code) + "\n")
+        log.write("result: " + status + "\n")
+        if reason:
+            log.write("reason: " + reason + "\n")
+
+    _set_task_status(actl_dir, task.id, status)
+    if status == tasks.STATUS_IMPLEMENTED:
+        print("Task t" + str(task.id) + " implemented (log: " + str(log_path) + ")")
+        return 0
+    return _fail(
+        "task t" + str(task.id) + " failed: " + reason
+        + " (log: " + str(log_path) + ")"
+    )
+
+
+def _evaluate_run(worktree, exit_code: int):
+    """Turn a finished worker run into ``(status, reason)``."""
+    if exit_code != 0:
+        return (
+            tasks.STATUS_FAILED,
+            "the OpenCode worker exited with status " + str(exit_code),
+        )
+    branch = execution.worktree_branch(worktree.path)
+    if branch != worktree.branch:
+        return (
+            tasks.STATUS_FAILED,
+            "the worker left the worktree on '" + branch
+            + "' instead of '" + worktree.branch + "'",
+        )
+    dirty = execution.worktree_dirty(worktree.path)
+    if dirty:
+        return (
+            tasks.STATUS_FAILED,
+            "the worker left the worktree dirty (commit or remove the changes"
+            " and run the task again)",
+        )
+    return tasks.STATUS_IMPLEMENTED, ""
+
+
+def _require_runnable(task) -> None:
+    """Refuse tasks that may not be executed in this stage."""
+    if task.depends_on:
+        dependencies = ", ".join("t" + str(dep) for dep in task.depends_on)
+        raise tasks.TaskError(
+            "cannot run task t" + str(task.id) + ": it depends on " + dependencies
+            + "; dependency-aware execution arrives in a later stage (Stage 7"
+            " introduces DONE after merging)"
+        )
+    if task.status == tasks.STATUS_IMPLEMENTED:
+        raise tasks.TaskError(
+            "cannot run task t" + str(task.id) + ": it is already IMPLEMENTED"
+        )
+    if task.status not in (
+        tasks.STATUS_PENDING, tasks.STATUS_RUNNING, tasks.STATUS_FAILED
+    ):
+        raise tasks.TaskError(
+            "cannot run task t" + str(task.id)
+            + ": unexpected status " + repr(task.status)
+        )
+
+
+def _load_task(actl_dir: Path, task_id: int):
+    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    try:
+        return tasks.get_task(conn, task_id)
+    finally:
+        conn.close()
+
+
+def _set_task_status(actl_dir: Path, task_id: int, status: str) -> None:
+    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    try:
+        tasks.set_task_status(conn, task_id, status)
+    finally:
+        conn.close()
 
 
 def _resolve_description(args):
@@ -629,8 +857,12 @@ def build_parser() -> argparse.ArgumentParser:
     parser.add_argument("--version", action="version", version="actl " + __version__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
-    subparsers.add_parser(
+    init = subparsers.add_parser(
         "init", help="register the current Git repository as an actl project"
+    )
+    init.add_argument(
+        "--worker-model", metavar="MODEL",
+        help="set the project's worker model (provider/model[#variant])",
     )
     plan = subparsers.add_parser(
         "plan", help="start or resume the project's planner session"
@@ -671,6 +903,11 @@ def build_parser() -> argparse.ArgumentParser:
 
     delete = task_sub.add_parser("delete", help="delete a task")
     delete.add_argument("id", help="task id (tN or N)")
+
+    run = task_sub.add_parser(
+        "run", help="execute a task in an isolated Git worktree"
+    )
+    run.add_argument("id", help="task id (tN or N)")
     return parser
 
 
@@ -695,5 +932,6 @@ def main(argv=None) -> int:
         "show": cmd_task_show,
         "update": cmd_task_update,
         "delete": cmd_task_delete,
+        "run": cmd_task_run,
     }
     return handlers[args.task_command](args)

@@ -38,11 +38,22 @@ Behaviour is controlled through environment variables:
 * ``ACTL_FAKE_GET_AGENT``   - agent reported by session lookup
 * ``ACTL_FAKE_SWITCH_EXIT`` - non-zero to make agent switching fail
 * ``ACTL_FAKE_TUI_EXIT``    - exit code for the interactive TUI invocation
+* ``ACTL_FAKE_RUN``         - worker behaviour on ``run``: commit (default),
+                              dirty (leave an uncommitted file), none, or
+                              detach (leave the worktree on a detached HEAD)
+* ``ACTL_FAKE_RUN_EXIT``    - exit code for the noninteractive run
+* ``ACTL_FAKE_RUN_MARKER``  - file receiving the worker PID when it starts
+* ``ACTL_FAKE_RUN_WAIT_FOR`` - the worker waits for this file (max 120s)
+                              after writing the marker and before doing its
+                              work
+* ``ACTL_FAKE_RUN_DONE``    - file written when the worker is about to exit
 """
 
 import json
 import os
+import subprocess
 import sys
+import time
 
 
 def _log(argv):
@@ -51,6 +62,41 @@ def _log(argv):
         return
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps({"argv": argv, "cwd": os.getcwd()}) + "\\n")
+
+
+def _run_worker():
+    """Emulate one noninteractive worker turn inside the current directory."""
+    marker = os.environ.get("ACTL_FAKE_RUN_MARKER")
+    if marker:
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
+    wait_for = os.environ.get("ACTL_FAKE_RUN_WAIT_FOR")
+    deadline = time.time() + 120
+    while wait_for and not os.path.exists(wait_for) and time.time() < deadline:
+        time.sleep(0.05)
+    behavior = os.environ.get("ACTL_FAKE_RUN", "commit")
+    if behavior == "commit":
+        with open("worker-output.txt", "a", encoding="utf-8") as handle:
+            handle.write("worker change\\n")
+        subprocess.run(["git", "add", "worker-output.txt"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Fake Worker",
+             "-c", "user.email=worker@example.invalid",
+             "commit", "-m", "worker: implement task"],
+            check=True, capture_output=True,
+        )
+    elif behavior == "dirty":
+        with open("worker-output.txt", "a", encoding="utf-8") as handle:
+            handle.write("uncommitted work\\n")
+    elif behavior == "detach":
+        subprocess.run(["git", "checkout", "-q", "--detach"], check=True)
+    print("fake opencode: worker turn finished")
+    print("fake opencode: worker detail", file=sys.stderr)
+    done = os.environ.get("ACTL_FAKE_RUN_DONE")
+    if done:
+        with open(done, "w", encoding="utf-8") as handle:
+            handle.write("done")
+    return int(os.environ.get("ACTL_FAKE_RUN_EXIT", "0"))
 
 
 def main():
@@ -106,7 +152,11 @@ def main():
                                        "location": {"directory": directory}}}))
             return 0
 
-    # Anything else is treated as the interactive TUI invocation.
+    if argv and argv[0] == "run":
+        return _run_worker()
+
+    # Anything after the api and run handling is treated as the interactive
+    # TUI invocation.
     return int(os.environ.get("ACTL_FAKE_TUI_EXIT", "0"))
 
 
@@ -394,14 +444,13 @@ class PlanTests(ActlTestCase):
                 },
                 "unexpected permission rule " + repr(rule),
             )
-        # Only task management may be pre-approved, and only redirection is
-        # denied: everything else either stays allowed (read-only inspection)
-        # or asks the user.
+        # Only task management may be pre-approved. Shell denies are the
+        # "actl task run" block and the redirection guard.
         for rule in rules:
             if rule["action"] == "shell" and rule["effect"] == "allow":
                 self.assertEqual(rule["resource"], "actl task *")
             if rule["action"] == "shell" and rule["effect"] == "deny":
-                self.assertEqual(rule["resource"], "*>*")
+                self.assertIn(rule["resource"], ("actl task run*", "*>*"))
         # The .env asks must follow the broad read allow, otherwise the
         # last-match-wins rule would silently turn them into plain allows.
         broad_read = rules.index({"action": "read", "resource": "*", "effect": "allow"})
@@ -419,6 +468,11 @@ class PlanTests(ActlTestCase):
         self.assertIn(ask, rules)
         redirect_deny = {"action": "shell", "resource": "*>*", "effect": "deny"}
         self.assertIn(redirect_deny, rules)
+        # ...while executing tasks is denied to the planner, so the broad
+        # allow cannot launch a worker (last match wins).
+        run_deny = {"action": "shell", "resource": "actl task run*", "effect": "deny"}
+        self.assertIn(run_deny, rules)
+        self.assertLess(rules.index(shell_allow), rules.index(run_deny))
         # ...while the rules stay effective: last match wins, so the broad ask
         # must come before the task allow, and the redirect deny (which blocks
         # "actl task ... > file" silently overwriting files) must come after

@@ -20,6 +20,13 @@ The integration targets the OpenCode v2 CLI (tested with 2.1.2):
   the agent used by subsequent turns of an existing session.
 * ``opencode <directory> --session <id>`` opens the interactive TUI, resuming
   the given session and waiting for user input.
+* ``opencode run --agent <agent> --model <provider/model> --session <id>
+  "<message>"`` runs one noninteractive turn: OpenCode executes the message
+  with the given agent and model, prints the transcript to stdout/stderr, and
+  exits with status 0 when the turn succeeded. Actl uses this to run the
+  worker (the built-in ``build`` agent) inside a task worktree; a permission
+  that would ask the user in a TUI is auto-rejected in a noninteractive run,
+  so the worker never blocks on a prompt.
 """
 
 from __future__ import annotations
@@ -32,6 +39,12 @@ from dataclasses import dataclass
 from pathlib import Path
 
 BINARY = "opencode"
+
+# The built-in agent used for noninteractive task execution: it may read,
+# write, and run shell commands without asking (except for explicit denials
+# such as reading .env files or reaching outside the project directory, which
+# a noninteractive run rejects instead of prompting).
+WORKER_AGENT = "build"
 
 
 class OpenCodeError(RuntimeError):
@@ -111,6 +124,43 @@ def launch_tui(binary: str, project_root: Path, session_id: str) -> int:
         return subprocess.run(command, cwd=str(project_root)).returncode
     except OSError as exc:
         raise OpenCodeError("could not launch OpenCode: " + str(exc)) from exc
+
+
+def run_headless(
+    binary: str,
+    directory: Path,
+    session_id: str,
+    model: str,
+    prompt: str,
+    output,
+    pass_fds=(),
+) -> int:
+    """Run one noninteractive OpenCode turn in ``directory``.
+
+    The transcript is streamed into ``output`` (a writable file object); the
+    turn's stdout and stderr are merged so the log keeps the original order.
+    ``pass_fds`` are kept open in the OpenCode process - actl passes the
+    execution lock file descriptor so the lock outlives an actl crash.
+    Returns OpenCode's exit status.
+    """
+    command = [
+        binary, "run",
+        "--agent", WORKER_AGENT,
+        "--model", model,
+        "--session", session_id,
+        prompt,
+    ]
+    try:
+        proc = subprocess.run(
+            command,
+            cwd=str(directory),
+            stdout=output,
+            stderr=subprocess.STDOUT,
+            pass_fds=tuple(pass_fds),
+        )
+    except OSError as exc:
+        raise OpenCodeError("could not run OpenCode: " + str(exc)) from exc
+    return proc.returncode
 
 
 def _realpath(path: Path) -> str:

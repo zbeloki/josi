@@ -108,6 +108,32 @@ class PlannerRulesTests(ActlTestCase):
             with self.subTest(command=command):
                 self.assertEqual(self.ruleset.effect("shell", command), "ask")
 
+    def test_actl_task_run_is_denied(self):
+        commands = [
+            "actl task run",
+            "actl task run t1",
+            "actl task run 3",
+            "actl task run t2 --worker-model provider/model",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(self.ruleset.effect("shell", command), "deny")
+
+    def test_task_management_survives_the_run_deny(self):
+        commands = [
+            "actl task list",
+            "actl task show t1",
+            "actl task create --title 'Add login'",
+            "actl task update t1 --title 'New title'",
+            "actl task delete t1",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(self.ruleset.effect("shell", command), "allow")
+        # Only the real subcommand is blocked.
+        self.assertEqual(self.ruleset.effect("shell", "actl taskrun"), "ask")
+        self.assertEqual(self.ruleset.effect("shell", "actl tasks run t1"), "ask")
+
     def test_task_commands_cannot_redirect_output_to_files(self):
         # OpenCode reports a redirected statement as a single resource string,
         # so "actl task ... > file" would match the broad "actl task *" allow.

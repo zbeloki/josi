@@ -3,7 +3,8 @@
 A lightweight Python CLI for orchestrating AI coding agents through
 [OpenCode](https://opencode.ai). Stage 1 covers project setup and planning;
 Stage 2 adds a project-local task list; Stage 3 lets the planner manage that
-task list through the same `actl task` CLI.
+task list through the same `actl task` CLI; Stage 4 runs one task at a time
+with a noninteractive OpenCode worker in an isolated Git worktree.
 
 ## Requirements
 
@@ -27,18 +28,21 @@ actl init          # register the Git repository as an actl project
 actl plan          # start (or resume) the planner; it can manage tasks
 actl plan --new    # start a fresh planner session
 actl task list     # list the project's tasks
+actl task run t1   # execute a task with the worker
 ```
 
 - `actl init` requires a Git repository, creates `.actl/project.json`, and adds
   `.actl/` to `.gitignore` (existing `.gitignore` content is preserved).
   Running it again is harmless. It also checks that OpenCode is installed.
+  `actl init --worker-model MODEL` sets (or updates) the project's worker
+  model, for example `actl init --worker-model openrouter/anthropic/claude-sonnet-latest`.
 - `actl plan` opens the interactive OpenCode TUI from the project root and
   waits for your input - it never sends an initial message. The planner
   instructions live in a dedicated OpenCode custom agent: editing, subagents,
   web access, and MCP tools are denied, and shell commands ask for approval
-  except the `actl task` commands, which are pre-approved for task management.
-  Model selection stays interactive inside OpenCode: actl never passes
-  `--model`.
+  except the `actl task` management commands, which are pre-approved
+  (`actl task run` stays denied). Model selection stays interactive inside
+  OpenCode: actl never passes `--model`.
 - Each project keeps **one active planner session**. The session ID (generated
   by OpenCode) is stored in `.actl/planner.json`. Subsequent `actl plan` runs
   resume that session; `actl plan --new` creates a new one and makes it active,
@@ -51,9 +55,10 @@ Task commands are noninteractive: everything comes from arguments and files,
 output is plain text, and problems are reported on stderr with a non-zero
 exit code.
 
-The planner manages the same task list with the same commands: `actl task`
-is the only shell command it may run without a permission prompt, so task
-planning and task management happen in one OpenCode session.
+The planner manages the same task list with the same commands: the
+`actl task` management commands are the only shell commands it may run
+without a permission prompt, so task planning and task management happen in
+one OpenCode session. (`actl task run` is denied to the planner.)
 
 ```sh
 actl task create --title "Add the login form" --depends-on t1
@@ -65,7 +70,8 @@ actl task delete t2
 ```
 
 - Tasks have an integer id, printed as `t1`, `t2`, ...; commands accept both
-  `t1` and `1`. New tasks are `PENDING` - Stage 2 tracks no other status.
+  `t1` and `1`. New tasks are `PENDING`; `actl task run` is the only command
+  that changes a task's status.
 - `--description-file PATH` reads the description from a file (trailing
   newlines are stripped) and cannot be combined with `--description`.
 - `--depends-on ID` may be repeated or comma-separated. On `create` it adds
@@ -74,15 +80,93 @@ actl task delete t2
 - A dependency must reference an existing task and must not create a cycle
   (directly or indirectly); self-dependencies are rejected. Deleting a task
   that other tasks depend on is refused until those dependents are deleted.
-- A task is blocked when a dependency is unfinished; because Stage 2 never
-  completes tasks, blockedness is derived from dependencies instead of being
-  stored as a separate status.
+- A task is blocked when a dependency is unfinished; blockedness is derived
+  from dependencies instead of being stored as a separate status, and
+  `actl task run` refuses blocked tasks.
 - The database is created automatically when needed, including for projects
   initialized by Stage 1. Repeated `actl init` runs and task commands never
   reset existing tasks.
-- Task commands never invoke OpenCode and never touch another project's
-  database: they resolve the Git repository root first and require `.actl/`
-  there, so a nested repository is never served from its parent's database.
+- Task commands never touch another project's database: they resolve the Git
+  repository root first and require `.actl/` there, so a nested repository is
+  never served from its parent's database. Only `actl task run` invokes
+  OpenCode.
+
+## Running tasks
+
+`actl task run <id>` executes one task with a noninteractive OpenCode worker
+in an isolated Git worktree. No validation, review, or merging happens yet.
+
+```sh
+actl task run t1   # first execution, or an explicit retry after a failure
+```
+
+A run goes through these steps:
+
+1. The project must be initialized and the task must exist, be runnable, and
+   have no dependencies.
+2. The project-wide execution lock is taken. A second `actl task run` in the
+   same project refuses immediately while an execution is active.
+3. The task gets a dedicated branch (`actl/t1`) and worktree
+   (`.actl/worktrees/t1`) created from the latest local `main`. They are
+   created the first time the task runs - never at `actl task create`.
+4. OpenCode runs one noninteractive turn inside the worktree with the
+   project's worker model and the built-in `build` agent
+   (`opencode run --agent build --model MODEL --session ID`).
+5. The run's transcript is streamed into a log file under `.actl/runs/`.
+6. The task status is updated.
+
+The worker prompt contains the task title, its description, and the worker
+instructions: implement the task, run the relevant checks, commit the changes
+on the branch, keep the worktree clean, and never merge into `main`.
+
+The lifecycle is:
+
+```text
+PENDING → RUNNING → IMPLEMENTED
+                  ↘ FAILED
+```
+
+- `IMPLEMENTED` means the worker exited successfully and left a clean task
+  worktree with its changes committed. It does not imply validation or
+  approval.
+- A task that fails can be retried explicitly with `actl task run <id>`: the
+  existing branch and worktree are reused as they are, so earlier commits are
+  preserved and the worker continues from there. Nothing is reset, cleaned,
+  rebased, or merged.
+- Tasks with dependencies stay blocked. Dependency-aware execution arrives in
+  a later stage (Stage 7, when successfully merged tasks become `DONE`); in
+  Stage 4 only tasks without dependencies can run.
+- An `IMPLEMENTED` task cannot be run again. The task keeps its branch and
+  worktree after success or failure; actl never removes either.
+- If an execution is interrupted (for example by Ctrl-C or a crash), the task
+  keeps `RUNNING` and its worktree and log are preserved; there is no
+  automatic recovery, but an explicit `actl task run <id>` continues from the
+  preserved worktree.
+- The task is marked `IMPLEMENTED` only when OpenCode exits with status 0,
+  the worktree is still on its task branch, and the worktree is clean. A
+  worker that leaves uncommitted or untracked files behind is a failure.
+
+The worker model is project-level configuration:
+
+```sh
+actl init --worker-model openrouter/anthropic/claude-sonnet-latest
+actl init --worker-model provider/model#variant   # with a model variant
+```
+
+It is stored as `worker_model` in `.actl/project.json` (the file may be
+edited directly as well). `actl task run` refuses to start until a model is
+configured, and OpenCode fails the run if the model is not available in the
+worktree.
+
+Every execution writes `.actl/runs/t1-<timestamp>.log`: a short header
+(task, model, branch, worktree, session), the worker transcript, and the
+result (exit code, final status, failure reason). The path is printed when
+the run ends.
+
+Only one execution may run per project. The lock is an exclusive, nonblocking
+`fcntl.flock` on `.actl/execution.lock`, and the locked file descriptor is
+passed to the OpenCode process (Python's `pass_fds`), so the lock stays held
+while that process is alive even if actl itself is killed.
 
 ## Planner agent
 
@@ -100,12 +184,17 @@ deny-by-default: a catch-all rule blocks every tool, and only the native
 read-only inspection tools (`read`, `glob`, `grep`), questions, and the
 `actl task` shell commands are re-allowed. Editing, subagents, web access,
 and MCP tools stay denied - including tools that write files under an action
-name other than `edit` - and reading a `.env` file still asks.
+name other than `edit` - and reading a `.env` file still asks. `actl task run`
+is denied outright, so the planner can manage the task list but can never
+launch a worker.
 
 `actl task ...` is the only pre-approved shell command: the planner can
 create, list, show, update, and delete tasks without a permission prompt,
 while every other shell command still requires explicit user approval. The
-prompt tells the planner to prefer the native `read`, `glob`, and `grep`
+`actl task run` deny comes after that pre-approval (OpenCode evaluates
+permission rules last-match-wins), so the broad allow cannot launch a task;
+the deny was verified against the installed OpenCode 2.1.2 permission engine.
+The prompt tells the planner to prefer the native `read`, `glob`, and `grep`
 tools over shell `cat`, `head`, `tail`, `ls`, or `grep` (the `read` tool
 pages through files with offset/limit), and to run inspections one per shell
 call (each command in a compound `&&` call is checked separately, and helpers
@@ -159,6 +248,8 @@ conversations itself. It uses these OpenCode surfaces:
 | Verify a stored session belongs to the project | `opencode api GET /api/session/<id>` |
 | Re-select the planner agent on an old session | `opencode api POST /api/session/<id>/agent` |
 | Open the planner TUI | `opencode <project-root> --session <id>` |
+| Create a worker session in a task worktree | `opencode api POST /api/session` (location and agent `build`) |
+| Run the worker noninteractively | `opencode run --agent build --model <model> --session <id> "<prompt>"` |
 
 Sessions are created explicitly (instead of letting the TUI create them
 lazily) so actl captures the real session ID. Before resuming, actl asks
@@ -170,9 +261,12 @@ actl reports an error instead of resuming the wrong session.
 
 ```
 .actl/
-├── project.json   # schema_version, project name, created_at
-├── planner.json   # active planner session id, created_at
-└── tasks.db       # SQLite task database
+├── project.json    # schema_version, project name, worker_model, created_at
+├── planner.json    # active planner session id, created_at
+├── tasks.db        # SQLite task database
+├── execution.lock  # project-wide execution lock (fcntl.flock)
+├── runs/           # one log per execution: tN-<timestamp>.log
+└── worktrees/      # one Git worktree per task: t1/, t2/, ...
 
 .opencode/
 └── agents/
@@ -190,6 +284,11 @@ access, no real OpenCode process, and no model calls. The planner tests
 evaluate the installed agent's permission rules with a matcher that mirrors
 OpenCode 2.1.2 (last matching rule wins, `*`/`?` globs, `ask` by default) and
 run the pre-approved `actl task` commands against a real project database.
+The Stage 4 tests drive `actl task run` against disposable Git repositories;
+the fake worker can commit, leave a dirty worktree, fail, or keep running
+while the test kills actl, so branch and worktree handling, retries, and the
+execution lock (including the inherited lock descriptor) are all exercised
+without a real model.
 
 ## Limitations
 
@@ -209,6 +308,28 @@ run the pre-approved `actl task` commands against a real project database.
   instructions are not a sandbox. The permission layer blocks file editing,
   task execution tools, and shell redirection, but review what the planner
   proposes before approving anything it asks for.
-- No task execution, validation, review, scheduling, or automatic merging
-  yet - Stage 3 connects the planner to the task list, but actl itself still
-  only stores tasks.
+- Stage 4 executes one task at a time and stops there. There is no validation,
+  no independent review, no automatic retry or scheduling, and no automatic
+  merging; a task with dependencies cannot run until a later stage introduces
+  `DONE` after merging.
+- `IMPLEMENTED` only means that the worker exited successfully and left the
+  worktree clean with its changes committed. It says nothing about whether the
+  implementation is correct.
+- actl never resets, cleans, rebases, or deletes a task worktree, and it never
+  touches `main`. A task that fails keeps its branch, worktree, and log for an
+  explicit retry.
+- The execution lock covers actl and the OpenCode process it spawns. A
+  detached descendant that does not keep the inherited descriptor (for example
+  a daemonized helper the worker starts) can outlive the lock; actl keeps no
+  PID tracking, heartbeats, or automatic recovery.
+- The worker runs with OpenCode's standard `build` agent, so it may modify
+  anything inside its worktree. A noninteractive run cannot ask for
+  permissions: a request that would prompt in the TUI (for example reading a
+  `.env` file or touching a path outside the worktree) is auto-rejected and
+  the worker continues without it. actl does not pass `--auto`, so those
+  guards stay active. Like the planner, this is not a sandbox - review the
+  commits on the task branch before merging anything.
+- The worker prompt asks the worker to commit everything and never merge into
+  `main`, and actl checks afterwards that the worktree is still on its task
+  branch and clean; a worker that ignores the instructions is reported as a
+  failure rather than corrected automatically.

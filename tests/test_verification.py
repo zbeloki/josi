@@ -9,6 +9,7 @@ needs no real OpenCode process and no model call.
 
 from __future__ import annotations
 
+import fcntl
 import json
 import os
 import shutil
@@ -49,6 +50,11 @@ class VerificationTestCase(TaskRunTestCase):
     def remove_reviewer_model(self):
         metadata = self.metadata()
         metadata.pop("reviewer_model", None)
+        self.write_metadata(metadata)
+
+    def remove_worker_model(self):
+        metadata = self.metadata()
+        metadata.pop("worker_model", None)
         self.write_metadata(metadata)
 
     def set_task_status(self, status, task_id=1):
@@ -706,6 +712,25 @@ class Stage5IntegrationTests(VerificationTestCase):
         self.assertIn("Reusing worktree", result.stdout)
         self.assertIn("Validation passed", result.stdout)
 
+    def test_implemented_task_is_validated_and_reviewed_without_a_worker_model(self):
+        self.make_task("Add the feature")
+        self.set_validation("echo check")
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(len(self.worker_calls()), 1)
+
+        # Simulate a Stage 4 task left at IMPLEMENTED in a project that never
+        # configured a worker model: the reviewer model alone is enough to
+        # validate and review it.
+        self.set_task_status("IMPLEMENTED")
+        self.remove_worker_model()
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(len(self.worker_calls()), 1, "the worker must not rerun")
+        self.assertEqual(len(self.reviewer_calls()), 2)
+        self.assertIn("Validation passed", result.stdout)
+
     def test_validation_and_review_logs_are_preserved(self):
         self.set_validation("echo checked")
         self.make_task()
@@ -729,6 +754,7 @@ class Stage5IntegrationTests(VerificationTestCase):
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("no reviewer model", result.stderr)
+        self.assertIn("actl init --reviewer-model", result.stderr)
         self.assertEqual(self.task_status(), "PENDING")
         self.assertEqual(self.worker_calls(), [], "no worker may be launched")
         self.assertEqual(self.reviewer_calls(), [])
@@ -737,6 +763,30 @@ class Stage5IntegrationTests(VerificationTestCase):
             list((self.repo / ".actl" / "runs").glob("t1-*.log")), [],
             "no stage may start without a reviewer model",
         )
+        self.assertFalse(
+            (self.repo / ".actl" / "execution.lock").exists(),
+            "the lock must not be taken",
+        )
+
+    def test_missing_reviewer_model_precedes_the_execution_lock(self):
+        # With the lock held elsewhere, the run still reports the missing
+        # reviewer model instead of the lock conflict: the refusal happens
+        # before the lock is attempted.
+        self.remove_reviewer_model()
+        self.make_task()
+        lock_path = self.repo / ".actl" / "execution.lock"
+        handle = open(lock_path, "a+b")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            result = self.run_task("t1")
+        finally:
+            handle.close()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no reviewer model", result.stderr)
+        self.assertNotIn("already running", result.stderr)
+        self.assertEqual(self.task_status(), "PENDING")
+        self.assertEqual(self.calls(), [])
 
     def test_approved_task_is_not_run_again(self):
         self.make_task()

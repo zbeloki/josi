@@ -113,9 +113,10 @@ actl task run t1   # first execution, an explicit retry after a failure, or
 
 A run goes through these steps:
 
-1. The project must be initialized with a worker model and a reviewer model,
-   and the task must exist, be runnable, and have no dependencies. Without a
-   reviewer model the run refuses before any lock, worktree, or task change.
+1. The project must be initialized with a reviewer model, and the task must
+   exist, be runnable, and have no dependencies. A run that starts the worker
+   also needs the worker model; without a reviewer model the run refuses
+   before any lock, worktree, or task change.
 2. The project-wide execution lock is taken. A second `actl task run` in the
    same project refuses immediately while an execution is active.
 3. The task gets a dedicated branch (`actl/t1`) and worktree
@@ -188,9 +189,11 @@ actl init --worker-model provider/model#variant   # with a model variant
 ```
 
 It is stored as `worker_model` in `.actl/project.json` (the file may be
-edited directly as well). `actl task run` refuses to start until a model is
-configured, and OpenCode fails the run if the model is not available in the
-worktree.
+edited directly as well). `actl task run` requires it whenever the worker
+runs: a task that is not `IMPLEMENTED` fails before the worktree is prepared
+or anything is launched without one, while an `IMPLEMENTED` task is validated
+and reviewed without it. OpenCode fails the run if the model is not available
+in the worktree.
 
 The reviewer model is configured independently:
 
@@ -486,9 +489,10 @@ restore command sequences, skipped validation, every verdict shape
 prose-wrapped output, unknown severities and decisions, contradictory
 verdicts), reviewer isolation, checkout mutation and the temporary
 worktree, a task branch moving during review, the built-in and project
-review policies, the configured models, the missing-reviewer-model preflight,
-the recorded branch base, and validating/reviewing an `IMPLEMENTED` task
-without rerunning the worker.
+review policies, the configured models, the missing-reviewer-model preflight
+and its ordering before the execution lock, the recorded branch base, and
+validating/reviewing an `IMPLEMENTED` task without rerunning the worker or
+requiring a worker model.
 
 ## Limitations
 
@@ -517,10 +521,10 @@ without rerunning the worker.
   the base branch. `APPROVED` additionally means the configured validation
   commands passed on that exact commit and the reviewer approved it; it does
   not mean the code is merged, and it is not a guarantee of correctness.
-- `actl task run` requires both a worker model and a reviewer model. Without
-  a reviewer model it fails before launching anything; an `IMPLEMENTED` task
-  is then validated and reviewed without rerunning the worker once the model
-  is configured.
+- `actl task run` requires a reviewer model for every run, and a worker model
+  whenever the worker runs. Without a reviewer model the run fails before
+  launching anything; an `IMPLEMENTED` task is validated and reviewed with
+  just the reviewer model, without rerunning the worker.
 - Validation commands run with actl's environment inside the task worktree
   and may create untracked files (caches, reports). Changes to tracked files
   or to `HEAD` fail the task as soon as a command finishes; actl does not

@@ -29,9 +29,10 @@ Stage 5:
 * After the worker succeeds, the configured validation commands run inside the
   task worktree, and an independent reviewer - in a temporary worktree at the
   validated commit - returns a structured verdict. The task ends APPROVED,
-  NEEDS_CHANGES, or FAILED. Both the worker and reviewer models are required:
-  without a reviewer model the run refuses before launching anything instead
-  of skipping review. Nothing is retried or merged.
+  NEEDS_CHANGES, or FAILED. A reviewer model is required for every run, and
+  the worker model whenever the worker runs; without a reviewer model the run
+  refuses before launching anything instead of skipping review. Nothing is
+  retried or merged.
 """
 
 from __future__ import annotations
@@ -1526,7 +1527,8 @@ def build_parser() -> argparse.ArgumentParser:
     )
     init.add_argument(
         "--worker-model", metavar="MODEL",
-        help="set the project's worker model (provider/model[#variant])",
+        help="set the project's worker model (provider/model[#variant]);"
+             " required by 'actl task run' whenever the worker runs",
     )
     init.add_argument(
         "--reviewer-model", metavar="MODEL",

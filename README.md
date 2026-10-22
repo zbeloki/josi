@@ -126,9 +126,9 @@ PENDING → RUNNING → IMPLEMENTED
                   ↘ FAILED
 ```
 
-- `IMPLEMENTED` means the worker exited successfully and left a clean task
-  worktree with its changes committed. It does not imply validation or
-  approval.
+- `IMPLEMENTED` means the worker exited successfully, left a clean task
+  worktree, and left committed changes on the task branch relative to `main`.
+  It does not imply validation or approval.
 - A task that fails can be retried explicitly with `actl task run <id>`: the
   existing branch and worktree are reused as they are, so earlier commits are
   preserved and the worker continues from there. Nothing is reset, cleaned,
@@ -143,8 +143,10 @@ PENDING → RUNNING → IMPLEMENTED
   automatic recovery, but an explicit `actl task run <id>` continues from the
   preserved worktree.
 - The task is marked `IMPLEMENTED` only when OpenCode exits with status 0,
-  the worktree is still on its task branch, and the worktree is clean. A
-  worker that leaves uncommitted or untracked files behind is a failure.
+  the worktree is still on its task branch, the worktree is clean, and the
+  branch has committed changes relative to `main`. A worker that leaves
+  uncommitted or untracked files behind, or commits nothing, is a failure.
+  A retry may finish with previously committed work and no new commit.
 
 The worker model is project-level configuration:
 
@@ -182,18 +184,21 @@ descriptions and acceptance criteria, manage the task list only through
 `actl task`, never modify code, and never execute tasks. Its permissions are
 deny-by-default: a catch-all rule blocks every tool, and only the native
 read-only inspection tools (`read`, `glob`, `grep`), questions, and the
-`actl task` shell commands are re-allowed. Editing, subagents, web access,
-and MCP tools stay denied - including tools that write files under an action
-name other than `edit` - and reading a `.env` file still asks. `actl task run`
-is denied outright, so the planner can manage the task list but can never
-launch a worker.
+`actl task` management subcommands are re-allowed. Editing, subagents, web
+access, and MCP tools stay denied - including tools that write files under an
+action name other than `edit` - and reading a `.env` file still asks.
+`actl task run` is denied outright, so the planner can manage the task list
+but can never launch a worker.
 
-`actl task ...` is the only pre-approved shell command: the planner can
-create, list, show, update, and delete tasks without a permission prompt,
-while every other shell command still requires explicit user approval. The
-`actl task run` deny comes after that pre-approval (OpenCode evaluates
-permission rules last-match-wins), so the broad allow cannot launch a task;
-the deny was verified against the installed OpenCode 2.1.2 permission engine.
+The `actl task create`, `actl task list`, `actl task show`,
+`actl task update`, and `actl task delete` subcommands are the only
+pre-approved shell commands: the planner can use them without a permission
+prompt, while every other shell command still requires explicit user approval.
+A broad `actl task *` deny comes before those management allows (OpenCode
+evaluates permission rules last-match-wins), so only the documented forms are
+pre-approved and `actl task run` - including whitespace variants such as
+`actl task  run` - stays denied. The deny was verified against the installed
+OpenCode 2.1.2 permission engine.
 The prompt tells the planner to prefer the native `read`, `glob`, and `grep`
 tools over shell `cat`, `head`, `tail`, `ls`, or `grep` (the `read` tool
 pages through files with offset/limit), and to run inspections one per shell
@@ -203,13 +208,14 @@ system-level, launching the planner does not start a conversation by itself -
 the TUI just waits for input.
 
 Shell **redirection** (`>`, `>>`, `2>&1`) is denied outright. OpenCode
-reports a redirected statement as a single resource string, so a broad allow
-rule like `actl task *` would also match `actl task ... > src/file` and could
-silently overwrite source files; the explicit deny rule comes after the
-pre-approval (OpenCode evaluates permission rules last-match-wins), which
-closes that hole. As a consequence, a literal `>` inside a quoted task title
-or description counts as redirection and is denied too; reword the text or
-run that command yourself outside the planner.
+reports a redirected statement as a single resource string, so a management
+allow rule like `actl task list *` would also match
+`actl task list > src/file` and could silently overwrite source files; the
+explicit deny rule comes after the management allows (OpenCode evaluates
+permission rules last-match-wins), which closes that hole. As a consequence,
+a literal `>` inside a quoted task title or description counts as redirection
+and is denied too; reword the text or run that command yourself outside the
+planner.
 
 actl deliberately pre-approves no other shell commands: OpenCode matches a
 broad allow rule like `git diff *` or `cat *` against commands that write
@@ -312,9 +318,9 @@ without a real model.
   no independent review, no automatic retry or scheduling, and no automatic
   merging; a task with dependencies cannot run until a later stage introduces
   `DONE` after merging.
-- `IMPLEMENTED` only means that the worker exited successfully and left the
-  worktree clean with its changes committed. It says nothing about whether the
-  implementation is correct.
+- `IMPLEMENTED` only means that the worker exited successfully, left the
+  worktree clean, and left committed changes on the task branch relative to
+  `main`. It says nothing about whether the implementation is correct.
 - actl never resets, cleans, rebases, or deletes a task worktree, and it never
   touches `main`. A task that fails keeps its branch, worktree, and log for an
   explicit retry.
@@ -331,5 +337,6 @@ without a real model.
   commits on the task branch before merging anything.
 - The worker prompt asks the worker to commit everything and never merge into
   `main`, and actl checks afterwards that the worktree is still on its task
-  branch and clean; a worker that ignores the instructions is reported as a
-  failure rather than corrected automatically.
+  branch, is clean, and contains committed changes relative to `main`; a
+  worker that ignores the instructions is reported as a failure rather than
+  corrected automatically.

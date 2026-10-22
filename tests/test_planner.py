@@ -114,6 +114,10 @@ class PlannerRulesTests(ActlTestCase):
             "actl task run t1",
             "actl task run 3",
             "actl task run t2 --worker-model provider/model",
+            # Extra whitespace must not turn execution into a management
+            # command that the pre-approval allows.
+            "actl task  run t1",
+            "actl task   run t1",
         ]
         for command in commands:
             with self.subTest(command=command):
@@ -136,7 +140,7 @@ class PlannerRulesTests(ActlTestCase):
 
     def test_task_commands_cannot_redirect_output_to_files(self):
         # OpenCode reports a redirected statement as a single resource string,
-        # so "actl task ... > file" would match the broad "actl task *" allow.
+        # so "actl task ... > file" would match the management pre-approval.
         # The redirect deny is placed after the pre-approval (last match wins)
         # so a silently allowed command can never write or overwrite a file.
         commands = [
@@ -153,8 +157,10 @@ class PlannerRulesTests(ActlTestCase):
                 self.assertEqual(self.ruleset.effect("shell", command), "deny")
 
     def test_task_allow_stops_at_the_command_boundary(self):
-        # Only the literal "actl task" prefix is pre-approved; lookalikes ask.
-        self.assertEqual(self.ruleset.effect("shell", "actl task"), "allow")
+        # Only the documented management forms are pre-approved; bare task
+        # commands and lookalikes are not.
+        self.assertEqual(self.ruleset.effect("shell", "actl task list"), "allow")
+        self.assertEqual(self.ruleset.effect("shell", "actl task"), "deny")
         self.assertEqual(self.ruleset.effect("shell", "actl tasks list"), "ask")
         self.assertEqual(self.ruleset.effect("shell", "actl-task list"), "ask")
         self.assertEqual(self.ruleset.effect("shell", "acctl task list"), "ask")

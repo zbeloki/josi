@@ -348,6 +348,50 @@ class RunFailureTests(TaskRunTestCase):
         self.assertTrue((worktree / "worker-output.txt").is_file())
         self.assertIn("result: FAILED", self.log_text())
 
+    def test_worker_without_committed_changes_fails_the_run(self):
+        self.make_task()
+        self.env["ACTL_FAKE_RUN"] = "none"
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no committed changes", result.stderr)
+
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertEqual(self.rev("actl/t1"), self.base_sha)
+        self.assertEqual(
+            self.git("status", "--porcelain", cwd=self.worktree()).stdout, ""
+        )
+        self.assertIn("result: FAILED", self.log_text())
+
+    def test_worker_with_only_an_empty_commit_fails_the_run(self):
+        self.make_task()
+        self.env["ACTL_FAKE_RUN"] = "empty"
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no committed changes", result.stderr)
+
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertNotEqual(self.rev("actl/t1"), self.base_sha)
+        self.assertEqual(
+            self.git("status", "--porcelain", cwd=self.worktree()).stdout, ""
+        )
+
+    def test_retry_accepts_previously_committed_work_without_a_new_commit(self):
+        self.make_task()
+        self.env["ACTL_FAKE_RUN_EXIT"] = "1"
+        self.assertNotEqual(self.run_task("t1").returncode, 0)
+        first_head = self.rev("actl/t1")
+        self.assertEqual(self.task_status(), "FAILED")
+
+        # The retry succeeds from the existing committed work even when the
+        # worker has nothing new to commit.
+        self.env["ACTL_FAKE_RUN_EXIT"] = "0"
+        self.env["ACTL_FAKE_RUN"] = "none"
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "IMPLEMENTED")
+        self.assertEqual(self.rev("actl/t1"), first_head)
+        self.assertIn("result: IMPLEMENTED", self.log_text())
+
     def test_worker_leaving_another_branch_fails_the_run(self):
         self.make_task()
         self.env["ACTL_FAKE_RUN"] = "detach"

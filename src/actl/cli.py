@@ -62,15 +62,17 @@ PLANNER_AGENT_PATH = Path(".opencode") / "agents" / (PLANNER_AGENT_NAME + ".md")
 # one resource per command in a compound call.
 # Everything else - editing, subagents, web access, MCP tools - stays denied,
 # including tools that write files under an action name other than "edit".
-# "actl task" commands are the only pre-approved shell commands because they
-# only read and write .actl/tasks.db. Running tasks ("actl task run") is
-# denied outright and comes after the broad allow (last match wins): the
-# planner must never launch a worker, only the user runs tasks. The "*>*"
-# deny must come after the pre-approval rule (last match wins): OpenCode
-# reports a redirected statement as a single resource string, so without the
-# deny "actl task ... > src/file" would silently count as an allowed task
-# command and could overwrite source files. The .env "ask" rules must follow
-# the broad read allow to keep their effect.
+# The task management subcommands (create, list, show, update, delete) are the
+# only pre-approved shell commands because they only read and write
+# .actl/tasks.db. A broad "actl task *" deny comes before those allows (last
+# match wins), and the management allows re-enable only the documented forms;
+# "actl task run" - including whitespace variants such as "actl task  run" -
+# stays denied, so the planner can never launch a worker. The "*>*" deny must
+# come after the management allows (last match wins): OpenCode reports a
+# redirected statement as a single resource string, so without the deny
+# "actl task ... > src/file" would silently count as an allowed task command
+# and could overwrite source files. The .env "ask" rules must follow the broad
+# read allow to keep their effect.
 # The body becomes the agent's system prompt. Deployed under
 # .opencode/agents/ so OpenCode discovers it for this project. actl manages
 # this file: ensure_planner_agent() rewrites it when its content differs
@@ -112,10 +114,22 @@ permissions:
     effect: ask
   - action: shell
     resource: "actl task *"
+    effect: deny
+  - action: shell
+    resource: "actl task create *"
     effect: allow
   - action: shell
-    resource: "actl task run*"
-    effect: deny
+    resource: "actl task list *"
+    effect: allow
+  - action: shell
+    resource: "actl task show *"
+    effect: allow
+  - action: shell
+    resource: "actl task update *"
+    effect: allow
+  - action: shell
+    resource: "actl task delete *"
+    effect: allow
   - action: shell
     resource: "*>*"
     effect: deny
@@ -178,13 +192,16 @@ Plan with the user before writing tasks:
 ## Permissions
 
 Read-only repository inspection (read, glob, grep) and user questions are
-allowed. `actl task` shell commands are the only pre-approved shell commands;
-every other shell command asks for confirmation, and each command in a
-compound call is checked separately - run one command per shell call instead
-of chaining them with && or echo separators. `actl task run` is denied
-outright: never execute tasks or launch coding workers. Shell redirection is
-denied outright: never redirect command output to a file, and avoid the `>`
-character in inline task text (for example, write "to" instead of an arrow).
+allowed. The `actl task create`, `actl task list`, `actl task show`,
+`actl task update`, and `actl task delete` subcommands are the only
+pre-approved shell commands; write them with single spaces between the
+command words. Every other shell command asks for
+confirmation, and each command in a compound call is checked separately - run
+one command per shell call instead of chaining them with && or echo
+separators. `actl task run` is denied outright: never execute tasks or launch
+coding workers. Shell redirection is denied outright: never redirect command
+output to a file, and avoid the `>` character in inline task text (for
+example, write "to" instead of an arrow).
 Everything else - editing files, subagents, web access, and MCP tools - is
 denied. If a tool is denied, do not look for a workaround; explain the
 problem and ask the user.
@@ -738,6 +755,12 @@ def _evaluate_run(worktree, exit_code: int):
             tasks.STATUS_FAILED,
             "the worker left the worktree dirty (commit or remove the changes"
             " and run the task again)",
+        )
+    if not execution.worktree_has_committed_changes(worktree.path):
+        return (
+            tasks.STATUS_FAILED,
+            "the worker made no committed changes relative to " + execution.MAIN_BRANCH
+            + " (commit the implementation and run the task again)",
         )
     return tasks.STATUS_IMPLEMENTED, ""
 

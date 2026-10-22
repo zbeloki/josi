@@ -132,6 +132,24 @@ def worktree_dirty(path: Path) -> str:
     return _git(path, "status", "--porcelain").stdout
 
 
+def worktree_has_committed_changes(path: Path) -> bool:
+    """Return whether HEAD has committed changes relative to local ``main``.
+
+    The three-dot diff compares the merge base of ``main`` and HEAD with HEAD,
+    so commits made on the task branch count even when ``main`` has advanced.
+    Empty commits and changes that cancel each other out do not count.
+    """
+    proc = _git(path, "diff", "--quiet", MAIN_BRANCH + "...HEAD", check=False)
+    if proc.returncode == 0:
+        return False
+    if proc.returncode == 1:
+        return True
+    detail = proc.stderr.strip() or proc.stdout.strip() or "no output"
+    raise ExecutionError(
+        "git diff " + MAIN_BRANCH + "...HEAD failed: " + detail
+    )
+
+
 def open_run_log(actl_dir: Path, task_id: int):
     """Open a new log file for one execution and return ``(path, file)``.
 

@@ -39,8 +39,9 @@ Behaviour is controlled through environment variables:
 * ``ACTL_FAKE_SWITCH_EXIT`` - non-zero to make agent switching fail
 * ``ACTL_FAKE_TUI_EXIT``    - exit code for the interactive TUI invocation
 * ``ACTL_FAKE_RUN``         - worker behaviour on ``run``: commit (default),
-                              dirty (leave an uncommitted file), none, or
-                              detach (leave the worktree on a detached HEAD)
+                              dirty (leave an uncommitted file), none, empty
+                              (make an empty commit), or detach (leave the
+                              worktree on a detached HEAD)
 * ``ACTL_FAKE_RUN_EXIT``    - exit code for the noninteractive run
 * ``ACTL_FAKE_RUN_MARKER``  - file receiving the worker PID when it starts
 * ``ACTL_FAKE_RUN_WAIT_FOR`` - the worker waits for this file (max 120s)
@@ -88,6 +89,13 @@ def _run_worker():
     elif behavior == "dirty":
         with open("worker-output.txt", "a", encoding="utf-8") as handle:
             handle.write("uncommitted work\\n")
+    elif behavior == "empty":
+        subprocess.run(
+            ["git", "-c", "user.name=Fake Worker",
+             "-c", "user.email=worker@example.invalid",
+             "commit", "--allow-empty", "-m", "worker: empty commit"],
+            check=True, capture_output=True,
+        )
     elif behavior == "detach":
         subprocess.run(["git", "checkout", "-q", "--detach"], check=True)
     print("fake opencode: worker turn finished")
@@ -444,13 +452,20 @@ class PlanTests(ActlTestCase):
                 },
                 "unexpected permission rule " + repr(rule),
             )
-        # Only task management may be pre-approved. Shell denies are the
-        # "actl task run" block and the redirection guard.
+        # Only task management may be pre-approved. A broad task deny blocks
+        # execution (and formatting variants) before the management allows.
+        management = {
+            "actl task create *",
+            "actl task list *",
+            "actl task show *",
+            "actl task update *",
+            "actl task delete *",
+        }
         for rule in rules:
             if rule["action"] == "shell" and rule["effect"] == "allow":
-                self.assertEqual(rule["resource"], "actl task *")
+                self.assertIn(rule["resource"], management)
             if rule["action"] == "shell" and rule["effect"] == "deny":
-                self.assertIn(rule["resource"], ("actl task run*", "*>*"))
+                self.assertIn(rule["resource"], ("actl task *", "*>*"))
         # The .env asks must follow the broad read allow, otherwise the
         # last-match-wins rule would silently turn them into plain allows.
         broad_read = rules.index({"action": "read", "resource": "*", "effect": "allow"})
@@ -460,25 +475,31 @@ class PlanTests(ActlTestCase):
     def test_plan_agent_preapproves_only_task_commands(self):
         self.assertEqual(self.run_actl("plan").returncode, 0)
         rules = self.planner_rules()
-        # The task CLI is the only pre-approved shell command, so the planner
+        # Only the task management subcommands are pre-approved, so the planner
         # can manage tasks without a prompt on every command...
-        shell_allow = {"action": "shell", "resource": "actl task *", "effect": "allow"}
-        self.assertIn(shell_allow, rules)
+        management_allows = [
+            {"action": "shell", "resource": "actl task " + command + " *",
+             "effect": "allow"}
+            for command in ("create", "list", "show", "update", "delete")
+        ]
+        for shell_allow in management_allows:
+            self.assertIn(shell_allow, rules)
         ask = {"action": "shell", "resource": "*", "effect": "ask"}
         self.assertIn(ask, rules)
         redirect_deny = {"action": "shell", "resource": "*>*", "effect": "deny"}
         self.assertIn(redirect_deny, rules)
-        # ...while executing tasks is denied to the planner, so the broad
-        # allow cannot launch a worker (last match wins).
-        run_deny = {"action": "shell", "resource": "actl task run*", "effect": "deny"}
-        self.assertIn(run_deny, rules)
-        self.assertLess(rules.index(shell_allow), rules.index(run_deny))
+        # ...while executing tasks (including whitespace variants) is denied
+        # by the broad task deny that comes before those allows.
+        task_deny = {"action": "shell", "resource": "actl task *", "effect": "deny"}
+        self.assertIn(task_deny, rules)
+        self.assertLess(rules.index(task_deny), rules.index(management_allows[0]))
         # ...while the rules stay effective: last match wins, so the broad ask
-        # must come before the task allow, and the redirect deny (which blocks
+        # must come before the task deny, and the redirect deny (which blocks
         # "actl task ... > file" silently overwriting files) must come after
-        # the task allow. The catch-all deny comes first.
-        self.assertLess(rules.index(ask), rules.index(shell_allow))
-        self.assertLess(rules.index(shell_allow), rules.index(redirect_deny))
+        # the task allows. The catch-all deny comes first.
+        self.assertLess(rules.index(ask), rules.index(task_deny))
+        for shell_allow in management_allows:
+            self.assertLess(rules.index(shell_allow), rules.index(redirect_deny))
         content = self.agent_path().read_text(encoding="utf-8")
         self.assertIn("actl task create", content)
         self.assertIn("checked separately", content)

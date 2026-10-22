@@ -20,7 +20,7 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
-from actl.cli import PLANNER_PROMPT  # noqa: E402
+from actl.cli import PLANNER_AGENT_NAME  # noqa: E402
 
 FAKE_OPENCODE = '''#!python
 """Fake OpenCode CLI used by actl's test suite.
@@ -33,6 +33,8 @@ Behaviour is controlled through environment variables:
 * ``ACTL_FAKE_CREATE_DIR``  - override the reported session directory on create
 * ``ACTL_FAKE_GET_EXIT``    - non-zero to make session lookup fail
 * ``ACTL_FAKE_GET_DIR``     - override the reported session directory on lookup
+* ``ACTL_FAKE_GET_AGENT``   - agent reported by session lookup
+* ``ACTL_FAKE_SWITCH_EXIT`` - non-zero to make agent switching fail
 * ``ACTL_FAKE_TUI_EXIT``    - exit code for the interactive TUI invocation
 """
 
@@ -73,7 +75,15 @@ def main():
                 "ACTL_FAKE_SESSION_ID", "ses_fake0000000000000000000"
             )
             print(json.dumps({"data": {"id": session_id,
+                                       "agent": body.get("agent"),
                                        "location": {"directory": directory}}}))
+            return 0
+
+        if method == "POST" and path.startswith("/api/session/") and path.endswith("/agent"):
+            code = int(os.environ.get("ACTL_FAKE_SWITCH_EXIT", "0"))
+            if code:
+                print("fake opencode: agent switch failed", file=sys.stderr)
+                return code
             return 0
 
         if method == "GET" and path.startswith("/api/session/"):
@@ -83,7 +93,9 @@ def main():
                 return code
             session_id = path.rsplit("/", 1)[-1]
             directory = os.environ.get("ACTL_FAKE_GET_DIR") or os.getcwd()
+            agent = os.environ.get("ACTL_FAKE_GET_AGENT", "actl-planner")
             print(json.dumps({"data": {"id": session_id,
+                                       "agent": agent,
                                        "location": {"directory": directory}}}))
             return 0
 
@@ -160,6 +172,13 @@ class ActlTestCase(unittest.TestCase):
     def create_calls(self):
         return [c for c in self.calls() if c["argv"][:3] == ["api", "POST", "/api/session"]]
 
+    def switch_calls(self):
+        return [
+            c
+            for c in self.calls()
+            if c["argv"][:2] == ["api", "POST"] and c["argv"][2].endswith("/agent")
+        ]
+
     def tui_calls(self):
         return [c for c in self.calls() if c["argv"][0] != "api"]
 
@@ -168,6 +187,9 @@ class ActlTestCase(unittest.TestCase):
 
     def planner_path(self) -> Path:
         return self.repo / ".actl" / "planner.json"
+
+    def agent_path(self) -> Path:
+        return self.repo / ".opencode" / "agents" / "actl-planner.md"
 
     def planner_session_id(self) -> str:
         return json.loads(self.planner_path().read_text(encoding="utf-8"))["session_id"]
@@ -251,6 +273,7 @@ class PlanTests(ActlTestCase):
         self.assertEqual(len(creates), 1)
         body = self.create_body(creates[0])
         self.assertEqual(body["location"]["directory"], str(self.repo))
+        self.assertEqual(body["agent"], PLANNER_AGENT_NAME)
 
         tuis = self.tui_calls()
         self.assertEqual(len(tuis), 1)
@@ -258,8 +281,27 @@ class PlanTests(ActlTestCase):
         self.assertEqual(argv[0], str(self.repo))
         self.assertEqual(tuis[0]["cwd"], str(self.repo))
         self.assertEqual(argv[argv.index("--session") + 1], "ses_faketest0000000000000001")
-        self.assertEqual(argv[argv.index("--prompt") + 1], PLANNER_PROMPT)
+        self.assertNotIn("--prompt", argv, "no initial user message may be sent")
         self.assertEqual(self.planner_session_id(), "ses_faketest0000000000000001")
+        self.assertEqual(self.switch_calls(), [], "fresh sessions already use the planner agent")
+
+    def test_plan_installs_read_only_planner_agent(self):
+        self.assertEqual(self.run_actl("plan").returncode, 0)
+        content = self.agent_path().read_text(encoding="utf-8")
+        self.assertTrue(content.startswith("---\n"), "agent file needs frontmatter")
+        self.assertIn("mode: primary", content)
+        self.assertIn("action: edit", content)
+        self.assertIn("effect: deny", content)
+        self.assertIn("action: shell", content)
+        self.assertIn("effect: ask", content)
+        self.assertIn("planning assistant for this repository", content)
+
+    def test_plan_does_not_overwrite_existing_planner_agent(self):
+        custom = "---\ndescription: custom planner\nmode: primary\n---\ncustom body\n"
+        self.agent_path().parent.mkdir(parents=True)
+        self.agent_path().write_text(custom, encoding="utf-8")
+        self.assertEqual(self.run_actl("plan").returncode, 0)
+        self.assertEqual(self.agent_path().read_text(encoding="utf-8"), custom)
 
     def test_resumes_existing_session(self):
         self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000002"
@@ -274,7 +316,58 @@ class PlanTests(ActlTestCase):
         self.assertEqual(len(tuis), 2)
         argv = tuis[1]["argv"]
         self.assertEqual(argv[argv.index("--session") + 1], "ses_faketest0000000000000002")
-        self.assertNotIn("--prompt", argv, "resumed sessions are not re-prompted")
+        self.assertNotIn("--prompt", argv, "resumed sessions must not be prompted")
+        self.assertEqual(
+            self.switch_calls(), [], "sessions already using the planner agent are left alone"
+        )
+
+    def test_plan_never_sends_an_initial_prompt(self):
+        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000011"
+        self.assertEqual(self.run_actl("plan").returncode, 0)
+        self.assertEqual(self.run_actl("plan").returncode, 0)
+        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000012"
+        self.assertEqual(self.run_actl("plan", "--new").returncode, 0)
+        self.assertEqual(len(self.tui_calls()), 3)
+        for call in self.tui_calls():
+            self.assertNotIn("--prompt", call["argv"])
+
+    def test_plan_switches_legacy_session_agent(self):
+        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000010"
+        self.assertEqual(self.run_actl("plan").returncode, 0)
+
+        self.env["ACTL_FAKE_GET_AGENT"] = "build"  # session created before agents existed
+        result = self.run_actl("plan")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        switches = self.switch_calls()
+        self.assertEqual(len(switches), 1)
+        argv = switches[0]["argv"]
+        self.assertEqual(argv[2], "/api/session/ses_faketest0000000000000010/agent")
+        self.assertEqual(json.loads(argv[argv.index("--data") + 1]), {"agent": PLANNER_AGENT_NAME})
+
+        calls = self.calls()
+        switch_positions = [i for i, c in enumerate(calls) if c in switches]
+        tui_positions = [i for i, c in enumerate(calls) if c["argv"][0] != "api"]
+        self.assertEqual(len(tui_positions), 2)
+        self.assertLess(switch_positions[0], tui_positions[1], "switch before launch")
+
+    def test_plan_reports_agent_switch_failure(self):
+        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000013"
+        self.assertEqual(self.run_actl("plan").returncode, 0)
+
+        self.env["ACTL_FAKE_GET_AGENT"] = "build"
+        self.env["ACTL_FAKE_SWITCH_EXIT"] = "1"
+        result = self.run_actl("plan")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot select the planner agent", result.stderr)
+        self.assertEqual(len(self.tui_calls()), 1, "OpenCode must not be launched")
+
+    def test_plan_agent_install_failure_is_reported(self):
+        self.agent_path().mkdir(parents=True)  # a directory cannot be overwritten
+        result = self.run_actl("plan")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not write the planner agent", result.stderr)
+        self.assertEqual(self.tui_calls(), [])
 
     def test_plan_new_starts_a_separate_session(self):
         self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000003"
@@ -289,10 +382,11 @@ class PlanTests(ActlTestCase):
         self.assertEqual(second_id, "ses_faketest0000000000000004")
         self.assertNotEqual(first_id, second_id)
         self.assertEqual(len(self.create_calls()), 2)
+        self.assertEqual(self.create_body(self.create_calls()[1])["agent"], PLANNER_AGENT_NAME)
 
         argv = self.tui_calls()[-1]["argv"]
         self.assertEqual(argv[argv.index("--session") + 1], second_id)
-        self.assertIn("--prompt", argv)
+        self.assertNotIn("--prompt", argv)
         # previous sessions are preserved: nothing is ever deleted
         self.assertFalse(any("delete" in c["argv"] for c in self.calls()))
 
@@ -378,6 +472,7 @@ class PlanGuardTests(ActlTestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("actl init", result.stderr)
         self.assertEqual(self.calls(), [])
+        self.assertFalse((self.repo / ".opencode").exists())
 
     def test_plan_with_missing_metadata(self):
         self.init_git()
@@ -386,6 +481,7 @@ class PlanGuardTests(ActlTestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid actl project metadata", result.stderr)
         self.assertEqual(self.calls(), [])
+        self.assertFalse((self.repo / ".opencode").exists())
 
     def test_plan_with_invalid_metadata(self):
         self.init_git()
@@ -404,6 +500,7 @@ class PlanGuardTests(ActlTestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("invalid actl project metadata", result.stderr)
                 self.assertEqual(self.calls(), [])
+                self.assertFalse((self.repo / ".opencode").exists())
 
 
 if __name__ == "__main__":

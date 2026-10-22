@@ -24,8 +24,28 @@ PLANNER_STATE = "planner.json"
 SCHEMA_VERSION = 1
 GITIGNORE_ENTRY = ".actl/"
 PLANNER_TITLE = "actl planner"
+PLANNER_AGENT_NAME = "actl-planner"
+PLANNER_AGENT_PATH = Path(".opencode") / "agents" / (PLANNER_AGENT_NAME + ".md")
 
-PLANNER_PROMPT = """You are the planning assistant for this repository.
+# OpenCode loads this file as a custom agent: the frontmatter declares a
+# primary agent that can read and explore the project but never edits it
+# (shell commands require explicit user approval), and the body becomes the
+# agent's system prompt. Deployed under .opencode/agents/ so OpenCode
+# discovers it for this project.
+PLANNER_AGENT_DOC = """\
+---
+description: "Planning assistant that defines requirements and produces plans without modifying code"
+mode: primary
+permissions:
+  - action: edit
+    resource: "*"
+    effect: deny
+  - action: shell
+    resource: "*"
+    effect: ask
+---
+
+You are the planning assistant for this repository.
 
 Help the user define software requirements and turn them into a clear,
 actionable plan.
@@ -36,7 +56,7 @@ actionable plan.
 - Do not modify project code.
 - Do not execute implementation tasks.
 
-Start by asking the user what they want to build or change.
+Ask clarifying questions before proposing a plan, and never start implementing.
 """
 
 
@@ -130,6 +150,24 @@ def ensure_gitignore(root: Path) -> None:
         path.write_text(entry + "\n", encoding="utf-8")
 
 
+def ensure_planner_agent(root: Path) -> Path:
+    """Install the actl planner agent file if it does not exist yet.
+
+    An existing file is left untouched so users can customize their planner.
+    """
+    path = root / PLANNER_AGENT_PATH
+    if path.is_file():
+        return path
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(PLANNER_AGENT_DOC, encoding="utf-8")
+    except OSError as exc:
+        raise ProjectError(
+            "could not write the planner agent " + str(path) + " (" + str(exc) + ")"
+        )
+    return path
+
+
 def cmd_init(_args) -> int:
     try:
         root = git_toplevel(Path.cwd())
@@ -178,6 +216,10 @@ def cmd_plan(args) -> int:
         binary = opencode.find_binary()
     except opencode.OpenCodeError as exc:
         return _fail(str(exc))
+    try:
+        ensure_planner_agent(root)
+    except ProjectError as exc:
+        return _fail(str(exc))
 
     session_id = None
     if not args.new:
@@ -197,22 +239,38 @@ def cmd_plan(args) -> int:
                 "cannot verify planner session '" + session_id + "': " + str(exc) + "; "
                 "run 'actl plan --new' to start a fresh session"
             )
-        print("Resuming planner session " + session.id + " in " + str(root))
-        return _launch_tui(binary, root, session.id, prompt=None)
+        if session.agent != PLANNER_AGENT_NAME:
+            try:
+                opencode.switch_agent(binary, root, session.id, PLANNER_AGENT_NAME)
+            except opencode.OpenCodeError as exc:
+                return _fail(
+                    "cannot select the planner agent for session '"
+                    + session.id + "': " + str(exc)
+                )
+        print(
+            "Resuming planner session " + session.id
+            + " (agent: " + PLANNER_AGENT_NAME + ") in " + str(root)
+        )
+        return _launch_tui(binary, root, session.id)
 
     try:
-        session = opencode.create_session(binary, root, title=PLANNER_TITLE)
+        session = opencode.create_session(
+            binary, root, title=PLANNER_TITLE, agent=PLANNER_AGENT_NAME
+        )
     except opencode.OpenCodeError as exc:
         return _fail("could not create an OpenCode session: " + str(exc))
     save_planner_session_id(root, session.id)
-    print("Started planner session " + session.id + " in " + str(root))
-    return _launch_tui(binary, root, session.id, prompt=PLANNER_PROMPT)
+    print(
+        "Started planner session " + session.id
+        + " (agent: " + PLANNER_AGENT_NAME + ") in " + str(root)
+    )
+    return _launch_tui(binary, root, session.id)
 
 
-def _launch_tui(binary: str, root: Path, session_id: str, prompt) -> int:
+def _launch_tui(binary: str, root: Path, session_id: str) -> int:
     sys.stdout.flush()
     try:
-        returncode = opencode.launch_tui(binary, root, session_id, prompt=prompt)
+        returncode = opencode.launch_tui(binary, root, session_id)
     except opencode.OpenCodeError as exc:
         return _fail(str(exc))
     if returncode != 0:

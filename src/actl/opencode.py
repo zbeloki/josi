@@ -8,16 +8,18 @@ lives, and launches the TUI against it.
 The integration targets the OpenCode v2 CLI (tested with 2.1.2):
 
 * ``opencode api POST /api/session --data {...}`` creates a session at an
-  explicit location (``{"location": {"directory": "<project root>"}}``) and
-  returns the generated session ID. Creating the session explicitly is
-  necessary because the TUI creates sessions lazily and would otherwise
-  generate an ID actl cannot capture.
+  explicit location (``{"location": {"directory": "<project root>"}}``) using
+  a given agent and returns the generated session ID. Creating the session
+  explicitly is necessary because the TUI creates sessions lazily and would
+  otherwise generate an ID actl cannot capture.
 * ``opencode api GET /api/session/<id>`` returns session metadata, including
-  the directory the session belongs to, so actl can refuse to resume a
-  session that does not belong to the project.
-* ``opencode <directory> --session <id> [--prompt <text>]`` opens the
-  interactive TUI, resuming the given session and sending the prompt as the
-  first message when one is given.
+  the directory the session belongs to and the selected agent, so actl can
+  refuse to resume a session that does not belong to the project and can
+  re-select the planner agent on sessions created before it existed.
+* ``opencode api POST /api/session/<id>/agent --data {"agent": ...}`` switches
+  the agent used by subsequent turns of an existing session.
+* ``opencode <directory> --session <id>`` opens the interactive TUI, resuming
+  the given session and waiting for user input.
 """
 
 from __future__ import annotations
@@ -28,7 +30,6 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from pathlib import Path
-from typing import Optional
 
 BINARY = "opencode"
 
@@ -43,6 +44,7 @@ class Session:
 
     id: str
     directory: str
+    agent: str = ""
 
 
 def find_binary() -> str:
@@ -55,15 +57,15 @@ def find_binary() -> str:
     return path
 
 
-def create_session(binary: str, project_root: Path, title: str) -> Session:
-    """Create a new empty session located at ``project_root``."""
+def create_session(binary: str, project_root: Path, title: str, agent: str) -> Session:
+    """Create a new empty session at ``project_root``, bound to ``agent``."""
     root = _realpath(project_root)
     payload = _api(
         binary,
         project_root,
         "POST",
         "/api/session",
-        {"title": title, "location": {"directory": root}},
+        {"title": title, "agent": agent, "location": {"directory": root}},
     )
     session = _parse_session(payload, "creating an OpenCode session")
     _require_location(session, root)
@@ -84,16 +86,21 @@ def get_session(binary: str, project_root: Path, session_id: str) -> Session:
     return session
 
 
-def launch_tui(
-    binary: str,
-    project_root: Path,
-    session_id: str,
-    prompt: Optional[str] = None,
-) -> int:
+def switch_agent(binary: str, project_root: Path, session_id: str, agent: str) -> None:
+    """Select the agent used by subsequent turns of an existing session."""
+    _api(
+        binary,
+        project_root,
+        "POST",
+        "/api/session/" + session_id + "/agent",
+        {"agent": agent},
+        expect_json=False,
+    )
+
+
+def launch_tui(binary: str, project_root: Path, session_id: str) -> int:
     """Launch the interactive OpenCode TUI on ``session_id`` and return its exit code."""
     command = [binary, str(project_root), "--session", session_id]
-    if prompt is not None:
-        command += ["--prompt", prompt]
     try:
         return subprocess.run(command, cwd=str(project_root)).returncode
     except OSError as exc:
@@ -104,7 +111,7 @@ def _realpath(path: Path) -> str:
     return os.path.realpath(str(path))
 
 
-def _api(binary: str, cwd: Path, method: str, path: str, body=None):
+def _api(binary: str, cwd: Path, method: str, path: str, body=None, expect_json=True):
     command = [binary, "api", method, path]
     if body is not None:
         command += ["--data", json.dumps(body)]
@@ -119,6 +126,8 @@ def _api(binary: str, cwd: Path, method: str, path: str, body=None):
         raise OpenCodeError(
             "OpenCode request " + method + " " + path + " failed: " + detail
         )
+    if not expect_json:
+        return None
     try:
         return json.loads(proc.stdout)
     except json.JSONDecodeError as exc:
@@ -142,7 +151,8 @@ def _parse_session(payload, context: str) -> Session:
         )
     location = data.get("location")
     directory = location.get("directory") if isinstance(location, dict) else None
-    return Session(id=session_id, directory=directory or "")
+    agent = data.get("agent")
+    return Session(id=session_id, directory=directory or "", agent=agent or "")
 
 
 def _require_location(session: Session, expected_root: str) -> None:

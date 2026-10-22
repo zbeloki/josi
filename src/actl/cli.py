@@ -29,11 +29,9 @@ PLANNER_AGENT_PATH = Path(".opencode") / "agents" / (PLANNER_AGENT_NAME + ".md")
 
 # OpenCode loads this file as a custom agent: the frontmatter declares a
 # primary agent that can read and explore the project but never edits it.
-# Safe Git inspection commands are pre-approved; every other shell command
-# requires explicit user approval. File-reading shell commands (cat, head,
-# ls, ...) are intentionally not pre-approved: OpenCode matches output
-# redirection as part of the command string, so "cat *" would also allow
-# "cat file > file" and silently write files.
+# Every shell command requires explicit user approval; actl pre-approves
+# nothing, because a broad allow rule such as "git diff *" also matches
+# commands that write files (for example "git diff --output=file").
 # The body becomes the agent's system prompt. Deployed under
 # .opencode/agents/ so OpenCode discovers it for this project. actl manages
 # this file: ensure_planner_agent() rewrites it when its content differs
@@ -49,57 +47,6 @@ permissions:
   - action: shell
     resource: "*"
     effect: ask
-  - action: shell
-    resource: "git status *"
-    effect: allow
-  - action: shell
-    resource: "git log *"
-    effect: allow
-  - action: shell
-    resource: "git diff *"
-    effect: allow
-  - action: shell
-    resource: "git show *"
-    effect: allow
-  - action: shell
-    resource: "git blame *"
-    effect: allow
-  - action: shell
-    resource: "git rev-parse *"
-    effect: allow
-  - action: shell
-    resource: "git ls-files *"
-    effect: allow
-  - action: shell
-    resource: "git grep *"
-    effect: allow
-  - action: shell
-    resource: "git branch"
-    effect: allow
-  - action: shell
-    resource: "git branch -a"
-    effect: allow
-  - action: shell
-    resource: "git branch -r"
-    effect: allow
-  - action: shell
-    resource: "git branch -v"
-    effect: allow
-  - action: shell
-    resource: "git branch -vv"
-    effect: allow
-  - action: shell
-    resource: "git branch --all"
-    effect: allow
-  - action: shell
-    resource: "git branch --remotes"
-    effect: allow
-  - action: shell
-    resource: "git branch --list *"
-    effect: allow
-  - action: shell
-    resource: "git branch --show-current"
-    effect: allow
 ---
 
 You are the planning assistant for this repository.
@@ -116,12 +63,10 @@ actionable plan.
 - Do not modify project code.
 - Do not execute implementation tasks.
 
-Safe Git inspection commands (git status, git log, git diff, git show,
-git blame, git rev-parse, git ls-files, git grep, and read-only git branch
-listings) are pre-approved. Every other shell command will ask the user for
-confirmation, and each command in a compound call is checked separately, so
-run one pre-approved inspection per shell call instead of chaining commands
-with && or echo separators.
+actl pre-approves no shell commands: every shell command asks the user for
+confirmation, and each command in a compound call is checked separately. Run
+one inspection per shell call instead of chaining commands with && or echo
+separators.
 
 Ask clarifying questions before proposing a plan, and never start implementing.
 """
@@ -149,15 +94,6 @@ def git_toplevel(start: Path) -> Path:
     if proc.returncode != 0 or not proc.stdout.strip():
         raise ProjectError("not inside a Git repository; run 'git init' first")
     return Path(proc.stdout.strip()).resolve()
-
-
-def find_project_root(start: Path):
-    """Walk upward from ``start`` looking for an initialized actl project."""
-    current = start.resolve()
-    for candidate in (current, *current.parents):
-        if (candidate / PROJECT_DIR).is_dir():
-            return candidate
-    return None
 
 
 def load_project_metadata(root: Path) -> dict:
@@ -222,7 +158,7 @@ def ensure_planner_agent(root: Path) -> str:
 
     The file is managed by actl: it is written when missing and rewritten
     when its content differs from :data:`PLANNER_AGENT_DOC`, so definition
-    updates (for example new pre-approved commands) apply on the next plan.
+    updates (for example new permissions) apply on the next plan.
     Returns ``"installed"``, ``"updated"`` or ``"unchanged"``.
     """
     path = root / PLANNER_AGENT_PATH
@@ -276,9 +212,15 @@ def cmd_init(_args) -> int:
 
 
 def cmd_plan(args) -> int:
-    root = find_project_root(Path.cwd())
-    if root is None:
-        return _fail("no actl project found here; run 'actl init' first")
+    try:
+        root = git_toplevel(Path.cwd())
+    except ProjectError as exc:
+        return _fail(str(exc))
+    if not (root / PROJECT_DIR).is_dir():
+        return _fail(
+            "no actl project found at the Git repository root " + str(root)
+            + "; run 'actl init' first"
+        )
     try:
         load_project_metadata(root)
     except MetadataError as exc:

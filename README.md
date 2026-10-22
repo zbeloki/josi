@@ -31,9 +31,9 @@ actl plan --new    # start a fresh planner session
   Running it again is harmless. It also checks that OpenCode is installed.
 - `actl plan` opens the interactive OpenCode TUI from the project root and
   waits for your input - it never sends an initial message. The planner
-  instructions live in a dedicated read-only OpenCode custom agent (see
-  below). Model selection stays interactive inside OpenCode: actl never
-  passes `--model`.
+  instructions live in a dedicated read-only OpenCode custom agent (read-only
+  for the planner's own tool calls; see Limitations). Model selection stays
+  interactive inside OpenCode: actl never passes `--model`.
 - Each project keeps **one active planner session**. The session ID (generated
   by OpenCode) is stored in `.actl/planner.json`. Subsequent `actl plan` runs
   resume that session; `actl plan --new` creates a new one and makes it active,
@@ -50,25 +50,23 @@ On the first `actl plan` (or whenever the file is missing), actl installs
 an OpenCode custom primary agent. Its body is the planner's **system prompt**
 (define requirements, decompose goals into tasks with acceptance criteria,
 never modify code, never execute tasks), and its frontmatter makes the agent
-read-only: `edit` is denied and every shell command requires explicit user
-approval - except safe Git inspection commands (`git status`, `git log`,
-`git diff`, `git show`, `git blame`, `git rev-parse`, `git ls-files`,
-`git grep`, and bare read-only `git branch` listings), which are pre-approved.
-The prompt also tells the planner to prefer the native `read`, `glob`, and
-`grep` tools over shell `cat`, `head`, `tail`, `ls`, or `grep` (the `read`
-tool pages through files with offset/limit), and to run inspections one per
-shell call (each command in a compound `&&` call is checked separately, and
-helpers like `echo` always require confirmation). Because the instructions
-are system-level, launching the planner does not start a conversation by
-itself - the TUI just waits for input.
+read-only: `edit` is denied and **every** shell command requires explicit user
+approval - actl pre-approves no commands, not even Git inspection. The prompt
+also tells the planner to prefer the native `read`, `glob`, and `grep` tools
+over shell `cat`, `head`, `tail`, `ls`, or `grep` (the `read` tool pages
+through files with offset/limit), and to run inspections one per shell call
+(each command in a compound `&&` call is checked separately, and helpers like
+`echo` always require confirmation). Because the instructions are
+system-level, launching the planner does not start a conversation by itself -
+the TUI just waits for input.
 
-File-reading shell commands (`cat`, `head`, `tail`, `ls`, `grep`) are
-deliberately **not** pre-approved: OpenCode matches output redirection as
-part of the tracked command, so an allow rule like `cat *` would also permit
-`cat file > file` and silently write files, defeating the no-modification
-rule. If you still want a specific command pre-approved, choose *Allow
-always* in the permission dialog - OpenCode saves a project-scoped rule that
-actl does not override.
+actl deliberately pre-approves nothing: OpenCode matches a broad allow rule
+like `git diff *` or `cat *` against commands that write files as well
+(`git diff --output=file`, `cat file > file`), which would silently defeat
+the no-modification rule. Approve individual inspections in the permission
+dialog; choose *Allow always* there if you want a specific command
+pre-approved - OpenCode saves a project-scoped rule that actl does not
+override.
 
 actl binds the planner session to this agent (for `--new` and first runs) and
 re-selects it before resuming, so older sessions created before the agent
@@ -76,8 +74,8 @@ existed are upgraded on the next `actl plan`.
 
 The agent file is **managed by actl**: if its content differs from the
 definition shipped with the installed actl version (for example after an
-upgrade adds new pre-approved commands), the next `actl plan` rewrites it and
-prints an `Updated the planner agent definition` notice. Do not hand-edit
+upgrade changes the permissions or the prompt), the next `actl plan` rewrites
+it and prints an `Updated the planner agent definition` notice. Do not hand-edit
 that file; put project-specific guidance in your own `AGENTS.md` instead.
 
 ## How it works
@@ -126,6 +124,16 @@ access, no real OpenCode process, and no model calls.
   verification will fail with a clear error rather than do the wrong thing.
 - One planner session per project. Replacing it with `--new` simply forgets
   the old session ID; the old session remains available inside OpenCode.
-- actl must be run from inside the project; it finds `.actl/` by walking up
-  from the current directory. The project root is the Git repository root.
+- actl must be run from inside the project. It locates the Git repository
+  root (even from a subdirectory) and requires `.actl/` there, so a nested
+  Git repository is never treated as part of its parent's actl project.
+- Subagent delegation is not restricted. The planner can launch OpenCode
+  subagents (for example the built-in `general` agent), and those run with
+  their own permissions rather than the planner's - OpenCode's defaults
+  generally allow edits. The read-only constraint covers the planner's own
+  tool calls only. Accepted for Stage 1.
+- actl writes its managed files (`.actl/`, `.gitignore`, and the planner
+  agent) with plain file writes that follow symlinks. A repository containing
+  a hostile symlink at one of those paths can redirect the write. Run actl
+  only in trusted repositories. Accepted for Stage 1.
 - No task management, worker execution, or validation yet - that is Stage 2.

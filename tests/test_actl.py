@@ -20,7 +20,7 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
-from actl.cli import PLANNER_AGENT_NAME  # noqa: E402
+from actl.cli import PLANNER_AGENT_DOC, PLANNER_AGENT_NAME  # noqa: E402
 
 FAKE_OPENCODE = '''#!python
 """Fake OpenCode CLI used by actl's test suite.
@@ -296,47 +296,15 @@ class PlanTests(ActlTestCase):
         self.assertIn("planning assistant for this repository", content)
         self.assertIn("read, glob, and grep", content)
 
-    def test_plan_agent_preapproves_only_safe_git_inspection(self):
+    def test_plan_agent_preapproves_no_shell_commands(self):
         self.assertEqual(self.run_actl("plan").returncode, 0)
         content = self.agent_path().read_text(encoding="utf-8")
-        for command in (
-            "git status",
-            "git log",
-            "git diff",
-            "git show",
-            "git blame",
-            "git rev-parse",
-            "git ls-files",
-            "git grep",
-        ):
-            with self.subTest(command=command):
-                self.assertIn(
-                    'resource: "' + command + ' *"\n    effect: allow', content
-                )
-        # read-only branch listings; bare forms only, because e.g.
-        # `git branch -v <name>` (which `-v *` would match) creates a branch
-        for listing in (
-            "git branch",
-            "git branch -a",
-            "git branch -r",
-            "git branch -v",
-            "git branch -vv",
-            "git branch --all",
-            "git branch --remotes",
-            "git branch --show-current",
-        ):
-            with self.subTest(listing=listing):
-                self.assertIn(
-                    'resource: "' + listing + '"\n    effect: allow', content
-                )
-        self.assertIn('resource: "git branch --list *"\n    effect: allow', content)
-        self.assertNotIn('resource: "git branch -v *"', content)
-        # The broad `shell *` ask rule comes first and the last matching rule
-        # wins, so only the listed Git commands skip confirmation.
-        shell_ask = content.index('  - action: shell\n    resource: "*"\n    effect: ask')
-        first_git_allow = content.index('resource: "git status *"')
-        self.assertLess(shell_ask, first_git_allow)
-        self.assertIn("Every other shell command will ask the user for", content)
+        # No allow rule of any kind may exist: broad shell prefixes such as
+        # `git diff *` also match commands that write files.
+        self.assertNotIn("effect: allow", content, "nothing may be pre-approved")
+        self.assertIn('  - action: edit\n    resource: "*"\n    effect: deny', content)
+        self.assertIn('  - action: shell\n    resource: "*"\n    effect: ask', content)
+        self.assertIn("pre-approves no shell commands", content)
         self.assertIn("checked separately", content)
 
     def test_plan_installs_planner_agent_once(self):
@@ -358,6 +326,7 @@ class PlanTests(ActlTestCase):
             "permissions:\n"
             '  - action: edit\n    resource: "*"\n    effect: deny\n'
             '  - action: shell\n    resource: "*"\n    effect: ask\n'
+            '  - action: shell\n    resource: "git status *"\n    effect: allow\n'
             "---\n"
             "old planner body\n"
         )
@@ -369,8 +338,8 @@ class PlanTests(ActlTestCase):
         self.assertIn("Updated the planner agent", result.stdout)
         content = self.agent_path().read_text(encoding="utf-8")
         self.assertNotIn("old planner body", content)
-        self.assertIn('resource: "git status *"', content)
-        self.assertIn('resource: "git branch -a"', content)
+        self.assertNotIn("effect: allow", content, "stale pre-approvals must be removed")
+        self.assertEqual(content, PLANNER_AGENT_DOC)
 
     def test_resumes_existing_session(self):
         self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000002"
@@ -468,6 +437,18 @@ class PlanTests(ActlTestCase):
         tui = self.tui_calls()[0]
         self.assertEqual(tui["argv"][0], str(self.repo))
         self.assertEqual(tui["cwd"], str(self.repo))
+
+    def test_plan_does_not_cross_a_nested_git_repository(self):
+        child = self.repo / "child-repo"
+        child.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(child)], check=True, capture_output=True
+        )
+        result = self.run_actl("plan", cwd=child)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("actl init", result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((child / ".opencode").exists())
 
     def test_plan_fails_when_opencode_is_missing(self):
         if shutil.which("opencode", path=MINIMAL_PATH):
@@ -570,6 +551,27 @@ class PlanGuardTests(ActlTestCase):
                 self.assertIn("invalid actl project metadata", result.stderr)
                 self.assertEqual(self.calls(), [])
                 self.assertFalse((self.repo / ".opencode").exists())
+
+    def test_plan_outside_git_repository(self):
+        outside = self.base / "outside"
+        outside.mkdir()
+        result = self.run_actl("plan", cwd=outside)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Git repository", result.stderr)
+        self.assertEqual(self.calls(), [])
+
+    def test_plan_ignores_actl_metadata_outside_git(self):
+        outside = self.base / "copied"
+        (outside / ".actl").mkdir(parents=True)
+        (outside / ".actl" / "project.json").write_text(
+            json.dumps({"schema_version": 1, "name": "copied", "created_at": "x"}),
+            encoding="utf-8",
+        )
+        result = self.run_actl("plan", cwd=outside)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Git repository", result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse((outside / ".opencode").exists())
 
 
 if __name__ == "__main__":

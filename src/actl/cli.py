@@ -1,10 +1,16 @@
 """Command-line interface for actl.
 
-Stage 1 exposes two commands:
+Stage 1 commands:
 
 * ``actl init`` - register the current Git repository as an actl project.
 * ``actl plan`` - start or resume the project's single planner session in the
   OpenCode TUI. ``actl plan --new`` starts a fresh session.
+
+Stage 2 commands:
+
+* ``actl task create|list|show|update|delete`` - manage the project's tasks
+  in a local SQLite database. They are noninteractive and never touch
+  OpenCode.
 """
 
 from __future__ import annotations
@@ -12,12 +18,15 @@ from __future__ import annotations
 import argparse
 import json
 import os
+import re
+import sqlite3
 import subprocess
 import sys
+from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import __version__, opencode
+from . import __version__, opencode, tasks
 
 PROJECT_DIR = ".actl"
 PROJECT_METADATA = "project.json"
@@ -264,6 +273,15 @@ def cmd_init(_args) -> int:
             )
         print("Initialized actl in " + str(root))
 
+    # Creating the task database here (and again, idempotently, on every task
+    # command) is safe: the schema uses CREATE TABLE IF NOT EXISTS, so
+    # existing tasks survive repeated initialization.
+    try:
+        conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+        conn.close()
+    except tasks.TaskError as exc:
+        return _fail(str(exc))
+
     try:
         ensure_gitignore(root)
     except ProjectError as exc:
@@ -374,6 +392,161 @@ def _launch_tui(binary: str, root: Path, session_id: str) -> int:
     return 0
 
 
+@contextmanager
+def _task_database():
+    """Yield a connection to the current project's task database.
+
+    The Git repository root is resolved first and must contain a valid
+    ``.actl/project.json``, so a task command can never read or write another
+    project's database. The database file is created (with the current
+    schema) when it does not exist yet.
+    """
+    root = git_toplevel(Path.cwd())
+    if not (root / PROJECT_DIR).is_dir():
+        raise ProjectError(
+            "no actl project found at the Git repository root " + str(root)
+            + "; run 'actl init' first"
+        )
+    try:
+        load_project_metadata(root)
+    except MetadataError as exc:
+        raise ProjectError("invalid actl project metadata: " + str(exc))
+    conn = tasks.connect(root / PROJECT_DIR / tasks.DATABASE_NAME)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def cmd_task_create(args) -> int:
+    try:
+        description = _resolve_description(args)
+        depends_on = _parse_dependencies(args.depends_on)
+        with _task_database() as conn:
+            task = tasks.create_task(
+                conn, args.title, description if description is not None else "",
+                depends_on,
+            )
+    except (ProjectError, tasks.TaskError, sqlite3.Error) as exc:
+        return _fail(str(exc))
+    print("Created task t" + str(task.id))
+    return 0
+
+
+def cmd_task_list(_args) -> int:
+    try:
+        with _task_database() as conn:
+            items = tasks.list_tasks(conn)
+    except (ProjectError, tasks.TaskError, sqlite3.Error) as exc:
+        return _fail(str(exc))
+    for task in items:
+        print("t" + str(task.id) + "  " + task.status + "  " + task.title)
+    return 0
+
+
+def cmd_task_show(args) -> int:
+    try:
+        task_id = _parse_task_id(args.id)
+        with _task_database() as conn:
+            task = tasks.get_task(conn, task_id)
+    except (ProjectError, tasks.TaskError, sqlite3.Error) as exc:
+        return _fail(str(exc))
+    _print_task(task)
+    return 0
+
+
+def cmd_task_update(args) -> int:
+    try:
+        task_id = _parse_task_id(args.id)
+        description = _resolve_description(args)
+        if args.clear_dependencies:
+            depends_on = []
+        elif args.depends_on is not None:
+            depends_on = _parse_dependencies(args.depends_on)
+        else:
+            depends_on = None
+        with _task_database() as conn:
+            task = tasks.update_task(
+                conn, task_id, title=args.title, description=description,
+                depends_on=depends_on,
+            )
+    except (ProjectError, tasks.TaskError, sqlite3.Error) as exc:
+        return _fail(str(exc))
+    print("Updated task t" + str(task.id))
+    return 0
+
+
+def cmd_task_delete(args) -> int:
+    try:
+        task_id = _parse_task_id(args.id)
+        with _task_database() as conn:
+            tasks.delete_task(conn, task_id)
+    except (ProjectError, tasks.TaskError, sqlite3.Error) as exc:
+        return _fail(str(exc))
+    print("Deleted task t" + str(task_id))
+    return 0
+
+
+def _resolve_description(args):
+    """Return the requested description text, or None when none was given."""
+    if args.description_file is not None:
+        return _read_description_file(args.description_file)
+    return args.description
+
+
+def _read_description_file(path_text: str) -> str:
+    path = Path(path_text)
+    try:
+        content = path.read_text(encoding="utf-8")
+    except OSError as exc:
+        raise tasks.TaskError(
+            "cannot read description file " + str(path) + " (" + str(exc) + ")"
+        )
+    except UnicodeDecodeError as exc:
+        raise tasks.TaskError(
+            "description file " + str(path) + " is not valid UTF-8 (" + str(exc) + ")"
+        )
+    return content.rstrip("\n")
+
+
+_TASK_ID_RE = re.compile(r"[tT]?([0-9]+)")
+
+
+def _parse_task_id(value: str) -> int:
+    match = _TASK_ID_RE.fullmatch(value.strip())
+    if match is None:
+        raise tasks.TaskError(
+            "invalid task id " + repr(value) + " (expected tN or N, e.g. t1)"
+        )
+    task_id = int(match.group(1))
+    if task_id == 0:
+        raise tasks.TaskError("invalid task id " + repr(value) + " (ids start at t1)")
+    return task_id
+
+
+def _parse_dependencies(values) -> list:
+    """Parse repeated or comma-separated ``--depends-on`` values."""
+    dependencies = []
+    for value in values or []:
+        for part in value.split(","):
+            dependencies.append(_parse_task_id(part.strip()))
+    return dependencies
+
+
+def _print_task(task) -> None:
+    print("id: t" + str(task.id))
+    print("title: " + task.title)
+    print("status: " + task.status)
+    print("created_at: " + task.created_at)
+    print("updated_at: " + task.updated_at)
+    print(
+        "depends_on: "
+        + (", ".join("t" + str(dep) for dep in task.depends_on) or "(none)")
+    )
+    print("description:")
+    print(task.description if task.description else "(none)")
+
+
 def _fail(message: str) -> int:
     print("actl: error: " + message, file=sys.stderr)
     return 1
@@ -400,11 +573,62 @@ def build_parser() -> argparse.ArgumentParser:
     plan.add_argument(
         "--new", action="store_true", help="start a fresh planner session"
     )
+
+    task = subparsers.add_parser("task", help="manage project tasks")
+    task_sub = task.add_subparsers(dest="task_command", required=True)
+
+    create = task_sub.add_parser("create", help="create a task")
+    create.add_argument("--title", required=True, help="task title")
+    _add_description_arguments(create)
+    create.add_argument(
+        "--depends-on", action="append", metavar="ID",
+        help="task this task depends on (tN or N); repeatable or comma-separated",
+    )
+
+    task_sub.add_parser("list", help="list tasks")
+
+    show = task_sub.add_parser("show", help="show one task")
+    show.add_argument("id", help="task id (tN or N)")
+
+    update = task_sub.add_parser("update", help="update a task")
+    update.add_argument("id", help="task id (tN or N)")
+    update.add_argument("--title", help="new title")
+    _add_description_arguments(update)
+    dependencies = update.add_mutually_exclusive_group()
+    dependencies.add_argument(
+        "--depends-on", action="append", metavar="ID",
+        help="replace the task's dependencies; repeatable or comma-separated",
+    )
+    dependencies.add_argument(
+        "--clear-dependencies", action="store_true",
+        help="remove all dependencies",
+    )
+
+    delete = task_sub.add_parser("delete", help="delete a task")
+    delete.add_argument("id", help="task id (tN or N)")
     return parser
+
+
+def _add_description_arguments(parser) -> None:
+    group = parser.add_mutually_exclusive_group()
+    group.add_argument("--description", help="task description")
+    group.add_argument(
+        "--description-file", metavar="PATH",
+        help="read the description from a file (trailing newlines are stripped)",
+    )
 
 
 def main(argv=None) -> int:
     args = build_parser().parse_args(argv)
     if args.command == "init":
         return cmd_init(args)
-    return cmd_plan(args)
+    if args.command == "plan":
+        return cmd_plan(args)
+    handlers = {
+        "create": cmd_task_create,
+        "list": cmd_task_list,
+        "show": cmd_task_show,
+        "update": cmd_task_update,
+        "delete": cmd_task_delete,
+    }
+    return handlers[args.task_command](args)

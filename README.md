@@ -1,7 +1,8 @@
 # actl
 
 A lightweight Python CLI for orchestrating AI coding agents through
-[OpenCode](https://opencode.ai). Stage 1 covers project setup and planning.
+[OpenCode](https://opencode.ai). Stage 1 covers project setup and planning;
+Stage 2 adds a project-local task list.
 
 ## Requirements
 
@@ -24,6 +25,7 @@ cd your-project
 actl init          # register the Git repository as an actl project
 actl plan          # start (or resume) the planner session in OpenCode
 actl plan --new    # start a fresh planner session
+actl task list     # list the project's tasks
 ```
 
 - `actl init` requires a Git repository, creates `.actl/project.json`, and adds
@@ -39,6 +41,42 @@ actl plan --new    # start a fresh planner session
   by OpenCode) is stored in `.actl/planner.json`. Subsequent `actl plan` runs
   resume that session; `actl plan --new` creates a new one and makes it active,
   leaving earlier OpenCode sessions untouched.
+
+## Tasks
+
+Stage 2 stores the project's tasks in a SQLite database (`.actl/tasks.db`).
+Task commands are noninteractive: everything comes from arguments and files,
+output is plain text, and problems are reported on stderr with a non-zero
+exit code.
+
+```sh
+actl task create --title "Add the login form" --depends-on t1
+actl task create --title "Write the login tests" --description-file tests.md
+actl task list
+actl task show t1
+actl task update t2 --title "New title" --depends-on t1 --depends-on t3
+actl task delete t2
+```
+
+- Tasks have an integer id, printed as `t1`, `t2`, ...; commands accept both
+  `t1` and `1`. New tasks are `PENDING` - Stage 2 tracks no other status.
+- `--description-file PATH` reads the description from a file (trailing
+  newlines are stripped) and cannot be combined with `--description`.
+- `--depends-on ID` may be repeated or comma-separated. On `create` it adds
+  dependencies; on `update` it replaces them. `--clear-dependencies` removes
+  them all.
+- A dependency must reference an existing task and must not create a cycle
+  (directly or indirectly); self-dependencies are rejected. Deleting a task
+  that other tasks depend on is refused until those dependents are deleted.
+- A task is blocked when a dependency is unfinished; because Stage 2 never
+  completes tasks, blockedness is derived from dependencies instead of being
+  stored as a separate status.
+- The database is created automatically when needed, including for projects
+  initialized by Stage 1. Repeated `actl init` runs and task commands never
+  reset existing tasks.
+- Task commands never invoke OpenCode and never touch another project's
+  database: they resolve the Git repository root first and require `.actl/`
+  there, so a nested repository is never served from its parent's database.
 
 ## Planner agent
 
@@ -105,7 +143,8 @@ actl reports an error instead of resuming the wrong session.
 ```
 .actl/
 ├── project.json   # schema_version, project name, created_at
-└── planner.json   # active planner session id, created_at
+├── planner.json   # active planner session id, created_at
+└── tasks.db       # SQLite task database
 
 .opencode/
 └── agents/
@@ -135,4 +174,5 @@ access, no real OpenCode process, and no model calls.
   agent) with plain file writes that follow symlinks. A repository containing
   a hostile symlink at one of those paths can redirect the write. Run actl
   only in trusted repositories. Accepted for Stage 1.
-- No task management, worker execution, or validation yet - that is Stage 2.
+- No task execution, validation, scheduling, or planner integration yet -
+  Stage 2 only manages the task list.

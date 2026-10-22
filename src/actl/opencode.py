@@ -48,13 +48,19 @@ class Session:
 
 
 def find_binary() -> str:
-    """Return the path of the OpenCode executable, or raise OpenCodeError."""
+    """Return the absolute path of the OpenCode executable, or raise OpenCodeError.
+
+    The result is absolute so that later subprocesses, which run with a
+    different working directory, still execute the same binary that was found
+    here (``shutil.which`` may return a relative path when ``PATH`` contains a
+    relative entry such as ``.``).
+    """
     path = shutil.which(BINARY)
     if path is None:
         raise OpenCodeError(
             "OpenCode is not installed or not on PATH (no 'opencode' executable found)"
         )
-    return path
+    return os.path.abspath(path)
 
 
 def create_session(binary: str, project_root: Path, title: str, agent: str) -> Session:

@@ -205,6 +205,25 @@ class ActlTestCase(unittest.TestCase):
         argv = call["argv"]
         return json.loads(argv[argv.index("--data") + 1])
 
+    def planner_rules(self):
+        """Parse the planner agent's permission rules into a list of dicts."""
+        lines = self.agent_path().read_text(encoding="utf-8").splitlines()
+        self.assertEqual(lines[0], "---", "agent file needs frontmatter")
+        end = lines.index("---", 1)
+        rules = []
+        rule = None
+        for line in lines[1:end]:
+            key, _, value = line.strip().partition(":")
+            value = value.strip()
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+                value = value[1:-1]
+            if key == "- action":
+                rule = {"action": value}
+                rules.append(rule)
+            elif key in ("resource", "effect") and rule is not None:
+                rule[key] = value
+        return rules
+
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
 class InitTests(ActlTestCase):
@@ -257,6 +276,21 @@ class InitTests(ActlTestCase):
         self.initialize()
         self.assertEqual(
             (self.repo / ".gitignore").read_bytes(), before + b".actl/\n"
+        )
+
+    @unittest.skipIf(os.name == "nt", "trailing spaces in directory names are not portable")
+    def test_init_preserves_repository_names_with_trailing_space(self):
+        spaced = self.base / "repo "
+        spaced.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(spaced)], check=True, capture_output=True
+        )
+        result = self.run_actl("init", cwd=spaced)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue((spaced / ".actl" / "project.json").is_file())
+        self.assertFalse(
+            (self.repo / ".actl").exists(),
+            "init must not write into the sibling directory 'repo'",
         )
 
     def test_init_gitignore_with_non_utf8_bytes(self):
@@ -329,20 +363,53 @@ class PlanTests(ActlTestCase):
         content = self.agent_path().read_text(encoding="utf-8")
         self.assertTrue(content.startswith("---\n"), "agent file needs frontmatter")
         self.assertIn("mode: primary", content)
-        self.assertIn("action: edit", content)
-        self.assertIn("effect: deny", content)
-        self.assertIn('  - action: shell\n    resource: "*"\n    effect: ask', content)
         self.assertIn("planning assistant for this repository", content)
         self.assertIn("read, glob, and grep", content)
+        self.assertIn(
+            {"action": "edit", "resource": "*", "effect": "deny"},
+            self.planner_rules(),
+        )
+
+    def test_plan_agent_denies_everything_not_explicitly_reallowed(self):
+        self.assertEqual(self.run_actl("plan").returncode, 0)
+        rules = self.planner_rules()
+        # OpenCode appends agent rules after its broad base "allow everything"
+        # policy and the last matching rule wins, so a catch-all deny must come
+        # first. Mutating tools (edit, MCP writers, subagents, web access) stay
+        # blocked even though they are not named individually.
+        self.assertEqual(rules[0], {"action": "*", "resource": "*", "effect": "deny"})
+        for rule in rules[1:]:
+            self.assertIn(
+                (rule["action"], rule["effect"]),
+                {
+                    ("read", "allow"),
+                    ("read", "ask"),
+                    ("glob", "allow"),
+                    ("grep", "allow"),
+                    ("question", "allow"),
+                    ("edit", "deny"),
+                    ("shell", "ask"),
+                },
+                "unexpected permission rule " + repr(rule),
+            )
+        # The .env asks must follow the broad read allow, otherwise the
+        # last-match-wins rule would silently turn them into plain allows.
+        broad_read = rules.index({"action": "read", "resource": "*", "effect": "allow"})
+        env_ask = rules.index({"action": "read", "resource": "*.env", "effect": "ask"})
+        self.assertLess(broad_read, env_ask)
 
     def test_plan_agent_preapproves_no_shell_commands(self):
         self.assertEqual(self.run_actl("plan").returncode, 0)
+        rules = self.planner_rules()
+        # No shell command may be allowed: broad prefixes such as `git diff *`
+        # also match commands that write files (`git diff --output=file`).
+        self.assertNotIn(
+            ("shell", "allow"),
+            [(rule["action"], rule["effect"]) for rule in rules],
+            "shell commands must never be pre-approved",
+        )
+        self.assertIn({"action": "shell", "resource": "*", "effect": "ask"}, rules)
         content = self.agent_path().read_text(encoding="utf-8")
-        # No allow rule of any kind may exist: broad shell prefixes such as
-        # `git diff *` also match commands that write files.
-        self.assertNotIn("effect: allow", content, "nothing may be pre-approved")
-        self.assertIn('  - action: edit\n    resource: "*"\n    effect: deny', content)
-        self.assertIn('  - action: shell\n    resource: "*"\n    effect: ask', content)
         self.assertIn("pre-approves no shell commands", content)
         self.assertIn("checked separately", content)
 
@@ -377,7 +444,7 @@ class PlanTests(ActlTestCase):
         self.assertIn("Updated the planner agent", result.stdout)
         content = self.agent_path().read_text(encoding="utf-8")
         self.assertNotIn("old planner body", content)
-        self.assertNotIn("effect: allow", content, "stale pre-approvals must be removed")
+        self.assertNotIn("git status", content, "stale pre-approvals must be removed")
         self.assertEqual(content, PLANNER_AGENT_DOC)
 
     def test_resumes_existing_session(self):
@@ -476,6 +543,48 @@ class PlanTests(ActlTestCase):
         tui = self.tui_calls()[0]
         self.assertEqual(tui["argv"][0], str(self.repo))
         self.assertEqual(tui["cwd"], str(self.repo))
+
+    @unittest.skipIf(os.name == "nt", "trailing spaces in directory names are not portable")
+    def test_plan_does_not_resume_a_sibling_repository(self):
+        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000015"
+        self.assertEqual(self.run_actl("plan").returncode, 0)
+        self.assertEqual(len(self.tui_calls()), 1)
+
+        spaced = self.base / "repo "
+        spaced.mkdir()
+        subprocess.run(
+            ["git", "init", "-q", str(spaced)], check=True, capture_output=True
+        )
+        result = self.run_actl("plan", cwd=spaced)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("actl init", result.stderr)
+        self.assertEqual(
+            len(self.tui_calls()), 1, "the sibling's session must not be resumed"
+        )
+
+    def test_plan_uses_the_opencode_selected_from_the_invocation_directory(self):
+        nested = self.repo / "sub"
+        nested.mkdir()
+        selected = nested / "opencode"
+        selected.write_text(
+            FAKE_OPENCODE.replace("#!python", "#!" + sys.executable, 1),
+            encoding="utf-8",
+        )
+        selected.chmod(selected.stat().st_mode | stat.S_IXUSR)
+        decoy = self.repo / "opencode"
+        decoy.write_text("#!/bin/sh\nexit 72\n", encoding="utf-8")
+        decoy.chmod(decoy.stat().st_mode | stat.S_IXUSR)
+        if not shutil.which("git", path=MINIMAL_PATH):
+            self.skipTest("git is not available on the minimal PATH")
+
+        # A relative PATH entry resolves against the invocation directory; the
+        # selected executable must keep working after actl switches its
+        # subprocesses to the project root.
+        self.env["PATH"] = "." + os.pathsep + MINIMAL_PATH
+        result = self.run_actl("plan", cwd=nested)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Started planner session", result.stdout)
+        self.assertEqual(len(self.tui_calls()), 1)
 
     def test_plan_does_not_cross_a_nested_git_repository(self):
         child = self.repo / "child-repo"

@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import os
 import subprocess
 import sys
 from datetime import datetime, timezone
@@ -29,9 +30,15 @@ PLANNER_AGENT_PATH = Path(".opencode") / "agents" / (PLANNER_AGENT_NAME + ".md")
 
 # OpenCode loads this file as a custom agent: the frontmatter declares a
 # primary agent that can read and explore the project but never edits it.
-# Every shell command requires explicit user approval; actl pre-approves
-# nothing, because a broad allow rule such as "git diff *" also matches
-# commands that write files (for example "git diff --output=file").
+# OpenCode appends these rules after its own broad "allow everything" base
+# policy and the last matching rule wins, so the catch-all deny must come
+# first and later rules re-allow only the native read-only inspection tools.
+# Everything else - editing, subagents, web access, MCP tools - stays denied,
+# including tools that write files under an action name other than "edit".
+# The .env "ask" rules must follow the broad read allow to keep their effect.
+# actl pre-approves no shell commands, because a broad allow rule such as
+# "git diff *" also matches commands that write files (for example
+# "git diff --output=file").
 # The body becomes the agent's system prompt. Deployed under
 # .opencode/agents/ so OpenCode discovers it for this project. actl manages
 # this file: ensure_planner_agent() rewrites it when its content differs
@@ -41,6 +48,30 @@ PLANNER_AGENT_DOC = """\
 description: "Planning assistant that defines requirements and produces plans without modifying code"
 mode: primary
 permissions:
+  - action: "*"
+    resource: "*"
+    effect: deny
+  - action: read
+    resource: "*"
+    effect: allow
+  - action: glob
+    resource: "*"
+    effect: allow
+  - action: grep
+    resource: "*"
+    effect: allow
+  - action: question
+    resource: "*"
+    effect: allow
+  - action: read
+    resource: "*.env"
+    effect: ask
+  - action: read
+    resource: "*.env.*"
+    effect: ask
+  - action: read
+    resource: "*.env.example"
+    effect: allow
   - action: edit
     resource: "*"
     effect: deny
@@ -63,10 +94,11 @@ actionable plan.
 - Do not modify project code.
 - Do not execute implementation tasks.
 
-actl pre-approves no shell commands: every shell command asks the user for
-confirmation, and each command in a compound call is checked separately. Run
-one inspection per shell call instead of chaining commands with && or echo
-separators.
+Every tool except read, glob, grep, and asking the user questions is denied.
+actl pre-approves no shell commands: editing, subagents, web access, and MCP
+tools are blocked. Every shell command asks the user for confirmation, and
+each command in a compound call is checked separately. Run one inspection per
+shell call instead of chaining commands with && or echo separators.
 
 Ask clarifying questions before proposing a plan, and never start implementing.
 """
@@ -81,19 +113,29 @@ class MetadataError(ProjectError):
 
 
 def git_toplevel(start: Path) -> Path:
-    """Return the root of the Git repository containing ``start``."""
+    """Return the root of the Git repository containing ``start``.
+
+    Git prints the path followed by a single newline. Only that terminator is
+    removed, so repository names that end in whitespace survive intact;
+    stripping all whitespace here would silently redirect actl to a sibling
+    directory.
+    """
     try:
         proc = subprocess.run(
             ["git", "rev-parse", "--show-toplevel"],
             cwd=str(start),
             capture_output=True,
-            text=True,
         )
     except FileNotFoundError:
         raise ProjectError("Git is not installed or not on PATH")
     if proc.returncode != 0 or not proc.stdout.strip():
         raise ProjectError("not inside a Git repository; run 'git init' first")
-    return Path(proc.stdout.strip()).resolve()
+    output = proc.stdout
+    if output.endswith(b"\n"):
+        output = output[:-1]
+        if os.name == "nt" and output.endswith(b"\r"):
+            output = output[:-1]
+    return Path(os.fsdecode(output)).resolve()
 
 
 def load_project_metadata(root: Path) -> dict:

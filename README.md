@@ -31,9 +31,10 @@ actl plan --new    # start a fresh planner session
   Running it again is harmless. It also checks that OpenCode is installed.
 - `actl plan` opens the interactive OpenCode TUI from the project root and
   waits for your input - it never sends an initial message. The planner
-  instructions live in a dedicated read-only OpenCode custom agent (read-only
-  for the planner's own tool calls; see Limitations). Model selection stays
-  interactive inside OpenCode: actl never passes `--model`.
+  instructions live in a dedicated read-only OpenCode custom agent: editing,
+  subagents, web access, and MCP tools are denied, and shell commands ask for
+  approval. Model selection stays interactive inside OpenCode: actl never
+  passes `--model`.
 - Each project keeps **one active planner session**. The session ID (generated
   by OpenCode) is stored in `.actl/planner.json`. Subsequent `actl plan` runs
   resume that session; `actl plan --new` creates a new one and makes it active,
@@ -49,22 +50,25 @@ On the first `actl plan` (or whenever the file is missing), actl installs
 
 an OpenCode custom primary agent. Its body is the planner's **system prompt**
 (define requirements, decompose goals into tasks with acceptance criteria,
-never modify code, never execute tasks), and its frontmatter makes the agent
-read-only: `edit` is denied and **every** shell command requires explicit user
-approval - actl pre-approves no commands, not even Git inspection. The prompt
-also tells the planner to prefer the native `read`, `glob`, and `grep` tools
-over shell `cat`, `head`, `tail`, `ls`, or `grep` (the `read` tool pages
-through files with offset/limit), and to run inspections one per shell call
-(each command in a compound `&&` call is checked separately, and helpers like
+never modify code, never execute tasks). Its permissions are deny-by-default:
+a catch-all rule blocks every tool, and only the native read-only inspection
+tools (`read`, `glob`, `grep`) and questions are re-allowed. Editing,
+subagents, web access, and MCP tools stay denied - including tools that write
+files under an action name other than `edit`. Every shell command requires
+explicit user approval, and reading a `.env` file still asks. The prompt also
+tells the planner to prefer the native `read`, `glob`, and `grep` tools over
+shell `cat`, `head`, `tail`, `ls`, or `grep` (the `read` tool pages through
+files with offset/limit), and to run inspections one per shell call (each
+command in a compound `&&` call is checked separately, and helpers like
 `echo` always require confirmation). Because the instructions are
 system-level, launching the planner does not start a conversation by itself -
 the TUI just waits for input.
 
-actl deliberately pre-approves nothing: OpenCode matches a broad allow rule
-like `git diff *` or `cat *` against commands that write files as well
-(`git diff --output=file`, `cat file > file`), which would silently defeat
-the no-modification rule. Approve individual inspections in the permission
-dialog; choose *Allow always* there if you want a specific command
+actl deliberately pre-approves no shell commands: OpenCode matches a broad
+allow rule like `git diff *` or `cat *` against commands that write files as
+well (`git diff --output=file`, `cat file > file`), which would silently
+defeat the no-modification rule. Approve individual inspections in the
+permission dialog; choose *Allow always* there if you want a specific command
 pre-approved - OpenCode saves a project-scoped rule that actl does not
 override.
 
@@ -127,11 +131,6 @@ access, no real OpenCode process, and no model calls.
 - actl must be run from inside the project. It locates the Git repository
   root (even from a subdirectory) and requires `.actl/` there, so a nested
   Git repository is never treated as part of its parent's actl project.
-- Subagent delegation is not restricted. The planner can launch OpenCode
-  subagents (for example the built-in `general` agent), and those run with
-  their own permissions rather than the planner's - OpenCode's defaults
-  generally allow edits. The read-only constraint covers the planner's own
-  tool calls only. Accepted for Stage 1.
 - actl writes its managed files (`.actl/`, `.gitignore`, and the planner
   agent) with plain file writes that follow symlinks. A repository containing
   a hostile symlink at one of those paths can redirect the write. Run actl

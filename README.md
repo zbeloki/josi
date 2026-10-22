@@ -39,8 +39,7 @@ actl task run t1   # execute a task: worker, validation, and review
   `actl init --worker-model MODEL` sets (or updates) the project's worker
   model, for example `actl init --worker-model openrouter/anthropic/claude-sonnet-latest`.
   `actl init --reviewer-model MODEL` sets the independent reviewer's model;
-  without one, `actl task run` stops after the worker at `IMPLEMENTED`
-  (Stage 4 behaviour) and prints how to enable review.
+  `actl task run` requires it and refuses to start without one.
   `actl init --base BRANCH` sets the base branch that task branches are
   created from; without it the branch is detected, and when the choice is
   ambiguous actl asks. It works in repositories without commits, where it
@@ -114,8 +113,9 @@ actl task run t1   # first execution, an explicit retry after a failure, or
 
 A run goes through these steps:
 
-1. The project must be initialized and the task must exist, be runnable, and
-   have no dependencies.
+1. The project must be initialized with a worker model and a reviewer model,
+   and the task must exist, be runnable, and have no dependencies. Without a
+   reviewer model the run refuses before any lock, worktree, or task change.
 2. The project-wide execution lock is taken. A second `actl task run` in the
    same project refuses immediately while an execution is active.
 3. The task gets a dedicated branch (`actl/t1`) and worktree
@@ -151,15 +151,16 @@ PENDING → RUNNING → IMPLEMENTED → APPROVED
 
 - `IMPLEMENTED` means the worker exited successfully, left a clean task
   worktree, and left committed changes on the task branch relative to the
-  base branch.
+  base branch. A run normally continues from there to validation and review;
+  a task stays `IMPLEMENTED` only when a run is interrupted or when it was
+  left behind by Stage 4.
 - `APPROVED` means validation passed and the reviewer approved the exact
   validated commit. It does **not** mean the code has been merged.
 - `NEEDS_CHANGES` means the reviewer reported at least one critical or major
   finding; the findings are printed and stored for Stage 6. Stage 5 never
   retries or repairs automatically.
-- Without a configured reviewer model, a successful run stops at
-  `IMPLEMENTED` and reports that review was skipped. Running such a task again
-  refuses; configure a reviewer model first.
+- `actl task run` requires a reviewer model. Without one it refuses before
+  taking the execution lock, creating a worktree, or changing the task.
 - A task that fails can be retried explicitly with `actl task run <id>`: the
   existing branch and worktree are reused as they are, so earlier commits are
   preserved and the worker continues from there. Nothing is reset, cleaned,
@@ -197,11 +198,11 @@ The reviewer model is configured independently:
 actl init --reviewer-model openrouter/anthropic/claude-sonnet-latest
 ```
 
-It is stored as `reviewer_model` in `.actl/project.json`. Without it, actl
-cannot review: the run stops at `IMPLEMENTED` (after validation, when
-commands are configured) and reports that review was skipped. Once a reviewer
-model is configured, re-running the `IMPLEMENTED` task validates and reviews
-it without launching the worker again.
+It is stored as `reviewer_model` in `.actl/project.json`. `actl task run`
+requires it: without a reviewer model the command fails before taking the
+execution lock, creating a worktree, or changing the task, instead of
+silently skipping the independent review. An `IMPLEMENTED` task is validated
+and reviewed without launching the worker again.
 
 The base branch is project-level configuration too:
 
@@ -485,8 +486,9 @@ restore command sequences, skipped validation, every verdict shape
 prose-wrapped output, unknown severities and decisions, contradictory
 verdicts), reviewer isolation, checkout mutation and the temporary
 worktree, a task branch moving during review, the built-in and project
-review policies, the configured models, the recorded branch base, and
-validating/reviewing an `IMPLEMENTED` task without rerunning the worker.
+review policies, the configured models, the missing-reviewer-model preflight,
+the recorded branch base, and validating/reviewing an `IMPLEMENTED` task
+without rerunning the worker.
 
 ## Limitations
 
@@ -515,10 +517,10 @@ validating/reviewing an `IMPLEMENTED` task without rerunning the worker.
   the base branch. `APPROVED` additionally means the configured validation
   commands passed on that exact commit and the reviewer approved it; it does
   not mean the code is merged, and it is not a guarantee of correctness.
-- Review requires the project to configure a reviewer model. Without one, a
-  run stops at `IMPLEMENTED` and reports that review was skipped; an
-  `IMPLEMENTED` task is then validated and reviewed without rerunning the
-  worker once the model is configured.
+- `actl task run` requires both a worker model and a reviewer model. Without
+  a reviewer model it fails before launching anything; an `IMPLEMENTED` task
+  is then validated and reviewed without rerunning the worker once the model
+  is configured.
 - Validation commands run with actl's environment inside the task worktree
   and may create untracked files (caches, reports). Changes to tracked files
   or to `HEAD` fail the task as soon as a command finishes; actl does not

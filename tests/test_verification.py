@@ -51,30 +51,15 @@ class VerificationTestCase(TaskRunTestCase):
         metadata.pop("reviewer_model", None)
         self.write_metadata(metadata)
 
-    def set_reviewer_model(self, model):
-        metadata = self.metadata()
-        metadata["reviewer_model"] = model
-        self.write_metadata(metadata)
+    def set_task_status(self, status, task_id=1):
+        """Simulate a Stage 4 task left behind at the given status."""
+        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        try:
+            tasks.set_task_status(conn, task_id, status)
+        finally:
+            conn.close()
 
     # -- call helpers -----------------------------------------------------
-
-    def all_run_calls(self):
-        return [call for call in self.calls() if call["argv"][:1] == ["run"]]
-
-    @staticmethod
-    def agent_of(call):
-        argv = call["argv"]
-        return argv[argv.index("--agent") + 1] if "--agent" in argv else ""
-
-    def worker_calls(self):
-        return [
-            call for call in self.all_run_calls() if self.agent_of(call) == "build"
-        ]
-
-    def reviewer_calls(self):
-        return [
-            call for call in self.all_run_calls() if self.agent_of(call) == "plan"
-        ]
 
     def reviewer_prompt(self):
         calls = self.reviewer_calls()
@@ -493,18 +478,16 @@ class ReviewTests(VerificationTestCase):
         self.assertIn("exited with status 2", log)
 
     def test_reviewer_evaluates_the_cumulative_task_diff(self):
-        # Without a reviewer model the first run stops at IMPLEMENTED.
-        self.remove_reviewer_model()
         self.make_task("Add the feature")
         self.assertEqual(self.run_task("t1").returncode, 0)
-        self.assertEqual(self.task_status(), "IMPLEMENTED")
+        self.assertEqual(self.task_status(), "APPROVED")
 
-        # A second commit on the task branch (for example a human fix).
+        # Simulate a Stage 4 task left at IMPLEMENTED, then a human fix.
+        self.set_task_status("IMPLEMENTED")
         worktree = self.worktree()
         (worktree / "second.txt").write_text("second change\n", encoding="utf-8")
         self.commit("second change", cwd=worktree)
 
-        self.set_reviewer_model("reviewer/model")
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         prompt = self.reviewer_prompt()
@@ -707,19 +690,19 @@ class Stage5IntegrationTests(VerificationTestCase):
         self.assertIn("openrouter/reviewer#low", reviewer)
 
     def test_implemented_task_is_validated_and_reviewed_without_the_worker(self):
-        self.remove_reviewer_model()
         self.make_task("Add the feature")
         self.set_validation("echo check")
         self.assertEqual(self.run_task("t1").returncode, 0)
-        self.assertEqual(self.task_status(), "IMPLEMENTED")
+        self.assertEqual(self.task_status(), "APPROVED")
         self.assertEqual(len(self.worker_calls()), 1)
 
-        self.set_reviewer_model("reviewer/model")
+        # Simulate a Stage 4 task left at IMPLEMENTED.
+        self.set_task_status("IMPLEMENTED")
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "APPROVED")
         self.assertEqual(len(self.worker_calls()), 1, "the worker must not rerun")
-        self.assertEqual(len(self.reviewer_calls()), 1)
+        self.assertEqual(len(self.reviewer_calls()), 2)
         self.assertIn("Reusing worktree", result.stdout)
         self.assertIn("Validation passed", result.stdout)
 
@@ -740,16 +723,20 @@ class Stage5IntegrationTests(VerificationTestCase):
         self.assertIn("validation log: ", result.stdout)
         self.assertIn("review log: ", result.stdout)
 
-    def test_without_a_reviewer_model_the_run_stops_at_implemented(self):
+    def test_missing_reviewer_model_fails_before_any_work(self):
         self.remove_reviewer_model()
         self.make_task()
         result = self.run_task("t1")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "IMPLEMENTED")
-        self.assertIn("Review skipped", result.stdout)
-        self.assertIn("implemented", result.stdout)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no reviewer model", result.stderr)
+        self.assertEqual(self.task_status(), "PENDING")
+        self.assertEqual(self.worker_calls(), [], "no worker may be launched")
         self.assertEqual(self.reviewer_calls(), [])
-        self.assertIsNone(self.latest_review())
+        self.assertFalse((self.repo / ".actl" / "worktrees").exists())
+        self.assertEqual(
+            list((self.repo / ".actl" / "runs").glob("t1-*.log")), [],
+            "no stage may start without a reviewer model",
+        )
 
     def test_approved_task_is_not_run_again(self):
         self.make_task()
@@ -816,21 +803,24 @@ class Stage5IntegrationTests(VerificationTestCase):
                 self.assertIn("invalid reviewer model", result.stderr)
 
     def test_dirty_worktree_is_refused_before_validation(self):
-        self.remove_reviewer_model()
         self.make_task()
         self.assertEqual(self.run_task("t1").returncode, 0)
-        self.assertEqual(self.task_status(), "IMPLEMENTED")
+        self.assertEqual(self.task_status(), "APPROVED")
+        reviews = len(self.reviewer_calls())
 
-        # A human leaves an uncommitted tracked change behind.
+        # A Stage 4 task left at IMPLEMENTED with an uncommitted tracked
+        # change must not be validated or reviewed.
+        self.set_task_status("IMPLEMENTED")
         (self.worktree() / "worker-output.txt").write_text(
             "uncommitted\n", encoding="utf-8"
         )
-        self.set_reviewer_model("reviewer/model")
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.task_status(), "FAILED")
         self.assertIn("uncommitted changes", result.stderr)
-        self.assertEqual(self.reviewer_calls(), [], "review must not start")
+        self.assertEqual(
+            len(self.reviewer_calls()), reviews, "review must not start"
+        )
 
     def test_a_reviewed_task_can_still_be_deleted(self):
         self.make_task()
@@ -844,32 +834,34 @@ class Stage5IntegrationTests(VerificationTestCase):
         self.assertEqual(listing.stdout, "")
 
     def test_a_deleted_task_branch_is_never_reviewed_empty(self):
-        self.remove_reviewer_model()
         self.make_task()
         self.assertEqual(self.run_task("t1").returncode, 0)
-        self.assertEqual(self.task_status(), "IMPLEMENTED")
+        self.assertEqual(self.task_status(), "APPROVED")
+        reviews = len(self.reviewer_calls())
 
-        # The branch is gone: re-creating it from the base must not turn an
-        # empty implementation into a reviewed task.
+        # A Stage 4 task whose branch is gone: re-creating it from the base
+        # must not turn an empty implementation into a reviewed task.
+        self.set_task_status("IMPLEMENTED")
         self.git("worktree", "remove", "--force", str(self.worktree()))
         self.git("branch", "-D", "actl/t1")
-        self.set_reviewer_model("reviewer/model")
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.task_status(), "FAILED")
         self.assertIn("no committed changes", result.stderr)
-        self.assertEqual(self.reviewer_calls(), [], "review must not start")
+        self.assertEqual(
+            len(self.reviewer_calls()), reviews, "review must not start"
+        )
 
     def test_review_uses_the_recorded_branch_base(self):
-        self.remove_reviewer_model()
         self.make_task("Add the feature")
         self.assertEqual(self.run_task("t1").returncode, 0)
-        self.assertEqual(self.task_status(), "IMPLEMENTED")
+        self.assertEqual(self.task_status(), "APPROVED")
         first_commit = self.rev("actl/t1")
 
-        # The project's base branch is reconfigured after the first task
-        # commit: the review diff must still start at the commit the branch
-        # was created from, not at the new base.
+        # A Stage 4 task left at IMPLEMENTED; the project's base branch is
+        # reconfigured after the first task commit. The review diff must
+        # still start at the commit the branch was created from.
+        self.set_task_status("IMPLEMENTED")
         self.git("branch", "develop", first_commit)
         (self.worktree() / "second.txt").write_text(
             "second change\n", encoding="utf-8"
@@ -877,7 +869,6 @@ class Stage5IntegrationTests(VerificationTestCase):
         self.commit("second change", cwd=self.worktree())
         self.assertEqual(self.run_actl("init", "--base", "develop").returncode, 0)
 
-        self.set_reviewer_model("reviewer/model")
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(

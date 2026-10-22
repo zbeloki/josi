@@ -29,8 +29,9 @@ Stage 5:
 * After the worker succeeds, the configured validation commands run inside the
   task worktree, and an independent reviewer - in a temporary worktree at the
   validated commit - returns a structured verdict. The task ends APPROVED,
-  NEEDS_CHANGES, or FAILED; without a reviewer model configured the run stops
-  at IMPLEMENTED (Stage 4 behaviour). Nothing is retried or merged.
+  NEEDS_CHANGES, or FAILED. Both the worker and reviewer models are required:
+  without a reviewer model the run refuses before launching anything instead
+  of skipping review. Nothing is retried or merged.
 """
 
 from __future__ import annotations
@@ -350,16 +351,19 @@ def _worker_model(metadata: dict) -> str:
     return _parse_worker_model(model)
 
 
-def _reviewer_model(metadata: dict):
-    """Return the project's reviewer model, or None when none is configured.
+def _reviewer_model(metadata: dict) -> str:
+    """Return the project's reviewer model or raise :class:`ProjectError`.
 
-    The reviewer model is optional: without it ``actl task run`` stops at
-    IMPLEMENTED (the Stage 4 behaviour) and prints how to enable validation
-    and review.
+    Review is a required part of ``actl task run``: without a reviewer model
+    the command refuses before launching anything instead of silently
+    skipping the independent review.
     """
     model = metadata.get("reviewer_model")
     if model is None:
-        return None
+        raise ProjectError(
+            "no reviewer model is configured for this project; run"
+            " 'actl init --reviewer-model provider/model' first"
+        )
     if not isinstance(model, str):
         raise ProjectError(
             "project metadata has an invalid 'reviewer_model' value " + repr(model)
@@ -826,12 +830,11 @@ def cmd_task_delete(args) -> int:
 
 
 def cmd_task_run(args) -> int:
-    """Execute one task: worker, validation, and review as configured."""
+    """Execute one task: worker, validation, and review."""
     try:
         task_id = _parse_task_id(args.id)
         root = _project_root()
         metadata = load_project_metadata(root)
-        model = _worker_model(metadata)
         reviewer_model = _reviewer_model(metadata)
         validation_commands = validation.commands_from_metadata(metadata)
         base_branch = _run_base_branch(root, metadata)
@@ -845,8 +848,8 @@ def cmd_task_run(args) -> int:
     try:
         with execution.lock(actl_dir) as lock_fd:
             return _execute_task(
-                binary, root, actl_dir, task_id, model, lock_fd, base_branch,
-                reviewer_model, validation_commands,
+                binary, root, actl_dir, task_id, metadata, lock_fd,
+                base_branch, reviewer_model, validation_commands,
             )
     except (
         ProjectError, tasks.TaskError, sqlite3.Error,
@@ -857,34 +860,34 @@ def cmd_task_run(args) -> int:
 
 
 def _execute_task(
-    binary, root, actl_dir, task_id, model, lock_fd, base_branch,
+    binary, root, actl_dir, task_id, metadata, lock_fd, base_branch,
     reviewer_model, validation_commands,
 ) -> int:
     """Run one task while the execution lock is held.
 
     The task is marked RUNNING before the worktree is prepared, so an
     interrupted attempt keeps RUNNING and a later explicit run continues from
-    its worktree. A completed attempt always ends as IMPLEMENTED or FAILED.
+    its worktree.
 
     After the worker succeeds - or when an IMPLEMENTED task is run again -
-    validation and review run when the project configures a reviewer model;
-    without one the run stops at IMPLEMENTED.
+    validation and review always run. The worker model is only needed when
+    the worker runs; the reviewer model is required for every run.
 
     The terminal shows only actl's own timestamped events; transcripts and
     validation output go straight into their log files while they run.
     """
     task = _load_task(actl_dir, task_id)
-    _require_runnable(task, reviewer_model is not None)
+    _require_runnable(task)
     print("task t" + str(task.id) + ": " + task.title)
-    print("model: " + model)
-    if reviewer_model is not None:
-        print("reviewer model: " + reviewer_model)
-
     if task.status == tasks.STATUS_IMPLEMENTED:
+        print("reviewer model: " + reviewer_model)
         return _verify_task(
             binary, root, actl_dir, task, base_branch, reviewer_model,
             validation_commands, lock_fd, announce_worktree=True,
         )
+    model = _worker_model(metadata)
+    print("model: " + model)
+    print("reviewer model: " + reviewer_model)
 
     if task.status == tasks.STATUS_RUNNING:
         _event(
@@ -963,13 +966,13 @@ def _execute_task(
         )
     return _verify_task(
         binary, root, actl_dir, task, base_branch, reviewer_model,
-        validation_commands, lock_fd, worker_log_path=log_path,
+        validation_commands, lock_fd,
     )
 
 
 def _verify_task(
     binary, root, actl_dir, task, base_branch, reviewer_model,
-    validation_commands, lock_fd, worker_log_path=None, announce_worktree=False,
+    validation_commands, lock_fd, announce_worktree=False,
 ) -> int:
     """Validate and review an implemented task.
 
@@ -978,8 +981,7 @@ def _verify_task(
     and the task branch must still point at that commit before any verdict is
     recorded. Anything else stops the run without repairing it.
 
-    The task stays IMPLEMENTED until the outcome is known; without a reviewer
-    model the run reports that review is skipped and stops there.
+    The task stays IMPLEMENTED until the outcome is known.
     """
     try:
         worktree = execution.ensure_worktree(
@@ -1061,20 +1063,6 @@ def _verify_task(
         _event("Validation passed")
     else:
         _event("Validation skipped (no validation commands configured)")
-
-    if reviewer_model is None:
-        _event(
-            "Review skipped (no reviewer model configured; run"
-            " 'actl init --reviewer-model MODEL' to enable review)"
-        )
-        if worker_log_path is not None:
-            print(
-                "Task t" + str(task.id) + " implemented (log: "
-                + str(worker_log_path) + ")"
-            )
-        else:
-            print("Task t" + str(task.id) + " implemented")
-        return 0
 
     review_log_path, review_log = execution.open_stage_log(
         actl_dir, task.id, "review",
@@ -1398,12 +1386,11 @@ def _evaluate_run(worktree, exit_code: int, base_branch: str):
     return tasks.STATUS_IMPLEMENTED, ""
 
 
-def _require_runnable(task, review_available: bool) -> None:
+def _require_runnable(task) -> None:
     """Refuse tasks that may not be executed in this stage.
 
-    An IMPLEMENTED task may only be run again to validate and review it, and
-    only when the project configures a reviewer model; without one it stays
-    IMPLEMENTED and the refusal explains how to enable review.
+    An IMPLEMENTED task proceeds straight to validation and review without
+    rerunning the worker.
     """
     if task.depends_on:
         dependencies = ", ".join("t" + str(dep) for dep in task.depends_on)
@@ -1413,13 +1400,7 @@ def _require_runnable(task, review_available: bool) -> None:
             " introduces DONE after merging)"
         )
     if task.status == tasks.STATUS_IMPLEMENTED:
-        if review_available:
-            return
-        raise tasks.TaskError(
-            "cannot run task t" + str(task.id) + ": it is already IMPLEMENTED;"
-            " configure a reviewer model with 'actl init --reviewer-model"
-            " MODEL' to validate and review it"
-        )
+        return
     if task.status == tasks.STATUS_NEEDS_CHANGES:
         raise tasks.TaskError(
             "cannot run task t" + str(task.id) + ": it is NEEDS_CHANGES after"
@@ -1550,7 +1531,7 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--reviewer-model", metavar="MODEL",
         help="set the project's reviewer model (provider/model[#variant]);"
-             " without it, task runs stop after the worker",
+             " required by 'actl task run'",
     )
     init.add_argument(
         "--base", metavar="BRANCH",

@@ -389,29 +389,46 @@ class PlanTests(ActlTestCase):
                     ("question", "allow"),
                     ("edit", "deny"),
                     ("shell", "ask"),
+                    ("shell", "allow"),
+                    ("shell", "deny"),
                 },
                 "unexpected permission rule " + repr(rule),
             )
+        # Only task management may be pre-approved, and only redirection is
+        # denied: everything else either stays allowed (read-only inspection)
+        # or asks the user.
+        for rule in rules:
+            if rule["action"] == "shell" and rule["effect"] == "allow":
+                self.assertEqual(rule["resource"], "actl task *")
+            if rule["action"] == "shell" and rule["effect"] == "deny":
+                self.assertEqual(rule["resource"], "*>*")
         # The .env asks must follow the broad read allow, otherwise the
         # last-match-wins rule would silently turn them into plain allows.
         broad_read = rules.index({"action": "read", "resource": "*", "effect": "allow"})
         env_ask = rules.index({"action": "read", "resource": "*.env", "effect": "ask"})
         self.assertLess(broad_read, env_ask)
 
-    def test_plan_agent_preapproves_no_shell_commands(self):
+    def test_plan_agent_preapproves_only_task_commands(self):
         self.assertEqual(self.run_actl("plan").returncode, 0)
         rules = self.planner_rules()
-        # No shell command may be allowed: broad prefixes such as `git diff *`
-        # also match commands that write files (`git diff --output=file`).
-        self.assertNotIn(
-            ("shell", "allow"),
-            [(rule["action"], rule["effect"]) for rule in rules],
-            "shell commands must never be pre-approved",
-        )
-        self.assertIn({"action": "shell", "resource": "*", "effect": "ask"}, rules)
+        # The task CLI is the only pre-approved shell command, so the planner
+        # can manage tasks without a prompt on every command...
+        shell_allow = {"action": "shell", "resource": "actl task *", "effect": "allow"}
+        self.assertIn(shell_allow, rules)
+        ask = {"action": "shell", "resource": "*", "effect": "ask"}
+        self.assertIn(ask, rules)
+        redirect_deny = {"action": "shell", "resource": "*>*", "effect": "deny"}
+        self.assertIn(redirect_deny, rules)
+        # ...while the rules stay effective: last match wins, so the broad ask
+        # must come before the task allow, and the redirect deny (which blocks
+        # "actl task ... > file" silently overwriting files) must come after
+        # the task allow. The catch-all deny comes first.
+        self.assertLess(rules.index(ask), rules.index(shell_allow))
+        self.assertLess(rules.index(shell_allow), rules.index(redirect_deny))
         content = self.agent_path().read_text(encoding="utf-8")
-        self.assertIn("pre-approves no shell commands", content)
+        self.assertIn("actl task create", content)
         self.assertIn("checked separately", content)
+        self.assertIn("never open .actl/tasks.db", content)
 
     def test_plan_installs_planner_agent_once(self):
         first = self.run_actl("plan")

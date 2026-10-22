@@ -11,6 +11,12 @@ Stage 2 commands:
 * ``actl task create|list|show|update|delete`` - manage the project's tasks
   in a local SQLite database. They are noninteractive and never touch
   OpenCode.
+
+Stage 3:
+
+* The planner agent manages the same task list through the ``actl task``
+  commands. Its agent definition documents the CLI and pre-approves exactly
+  those commands, so planning and task management happen in one session.
 """
 
 from __future__ import annotations
@@ -38,16 +44,26 @@ PLANNER_AGENT_NAME = "actl-planner"
 PLANNER_AGENT_PATH = Path(".opencode") / "agents" / (PLANNER_AGENT_NAME + ".md")
 
 # OpenCode loads this file as a custom agent: the frontmatter declares a
-# primary agent that can read and explore the project but never edits it.
-# OpenCode appends these rules after its own broad "allow everything" base
-# policy and the last matching rule wins, so the catch-all deny must come
-# first and later rules re-allow only the native read-only inspection tools.
+# primary agent that can read and explore the project and manage its tasks,
+# but never edits it. OpenCode appends these rules after its own broad
+# "allow everything" base policy and the last matching rule wins, so the
+# catch-all deny must come first and later rules re-allow only the tools the
+# planner may use. The format was verified against the installed OpenCode
+# 2.1.2: a permission rule is {action, resource, effect} with effect
+# allow/deny/ask, action and resource are matched as case-sensitive glob
+# patterns (* matches any characters, ? one), the last matching rule wins,
+# and a request that matches no rule defaults to "ask". Shell commands are
+# checked with action "shell" and the parsed command text as the resource,
+# one resource per command in a compound call.
 # Everything else - editing, subagents, web access, MCP tools - stays denied,
 # including tools that write files under an action name other than "edit".
-# The .env "ask" rules must follow the broad read allow to keep their effect.
-# actl pre-approves no shell commands, because a broad allow rule such as
-# "git diff *" also matches commands that write files (for example
-# "git diff --output=file").
+# "actl task" commands are the only pre-approved shell commands because they
+# only read and write .actl/tasks.db. The "*>*" deny must come after the
+# pre-approval rule (last match wins): OpenCode reports a redirected
+# statement as a single resource string, so without the deny
+# "actl task ... > src/file" would silently count as an allowed task command
+# and could overwrite source files. The .env "ask" rules must follow the
+# broad read allow to keep their effect.
 # The body becomes the agent's system prompt. Deployed under
 # .opencode/agents/ so OpenCode discovers it for this project. actl manages
 # this file: ensure_planner_agent() rewrites it when its content differs
@@ -87,6 +103,12 @@ permissions:
   - action: shell
     resource: "*"
     effect: ask
+  - action: shell
+    resource: "actl task *"
+    effect: allow
+  - action: shell
+    resource: "*>*"
+    effect: deny
 ---
 
 You are the planning assistant for this repository.
@@ -100,16 +122,59 @@ actionable plan.
   files with offset and limit. Those shell commands need confirmation.
 - Decompose development goals into concrete, ordered tasks.
 - For each task, write a clear description and testable acceptance criteria.
+- Ask clarifying questions before proposing a plan, and never start
+  implementing.
 - Do not modify project code.
 - Do not execute implementation tasks.
 
-Every tool except read, glob, grep, and asking the user questions is denied.
-actl pre-approves no shell commands: editing, subagents, web access, and MCP
-tools are blocked. Every shell command asks the user for confirmation, and
-each command in a compound call is checked separately. Run one inspection per
-shell call instead of chaining commands with && or echo separators.
+## Managing tasks with actl
 
-Ask clarifying questions before proposing a plan, and never start implementing.
+The project's tasks live in a SQLite database owned by actl. Manage them
+only through the `actl task` commands - never open .actl/tasks.db or any
+other internal file with sqlite3, cat, or another tool, and never change
+task data by hand. Run the commands from anywhere inside the project; they
+print plain text:
+
+- `actl task create --title "TITLE" --description "TEXT" [--depends-on tN ...]`
+  creates a PENDING task. Use `--description-file PATH` instead of
+  `--description` to read the text from a file.
+- `actl task list` prints one line per task: id, status, and title.
+- `actl task show tN` prints a task with its description and dependencies.
+- `actl task update tN [--title TITLE] [--description TEXT]
+  [--description-file PATH] [--depends-on tN ...] [--clear-dependencies]`
+  changes a task. `--depends-on` replaces the current dependency set and
+  `--clear-dependencies` removes it.
+- `actl task delete tN` deletes a task; it fails while other tasks depend
+  on it.
+
+Ids are printed as `t1`, `t2`, ... and commands also accept the bare number
+(`1`). `--depends-on` may be repeated or comma-separated; a dependency must
+reference an existing task, must not be the task itself, and must not create
+a dependency cycle. Task status is not configurable yet: new tasks are
+PENDING and stay PENDING.
+
+Plan with the user before writing tasks:
+
+- Discuss the requirements and the design first, and agree on scope.
+- Break the work into ordered, actionable tasks, and use `--depends-on` for
+  tasks that must not start before another one is finished.
+- Describe the goal and the expected behavior in the task description.
+- Write acceptance criteria as a short list of observable, testable results
+  (what to run, what to expect).
+- Create, update, or delete tasks only when the user asks you to.
+
+## Permissions
+
+Read-only repository inspection (read, glob, grep) and user questions are
+allowed. `actl task` shell commands are the only pre-approved shell commands;
+every other shell command asks for confirmation, and each command in a
+compound call is checked separately - run one command per shell call instead
+of chaining them with && or echo separators. Shell redirection is denied
+outright: never redirect command output to a file, and avoid the `>`
+character in inline task text (for example, write "to" instead of an arrow).
+Everything else - editing files, subagents, web access, and MCP tools - is
+denied. If a tool is denied, do not look for a workaround; explain the
+problem and ask the user.
 """
 
 

@@ -2,7 +2,8 @@
 
 A lightweight Python CLI for orchestrating AI coding agents through
 [OpenCode](https://opencode.ai). Stage 1 covers project setup and planning;
-Stage 2 adds a project-local task list.
+Stage 2 adds a project-local task list; Stage 3 lets the planner manage that
+task list through the same `actl task` CLI.
 
 ## Requirements
 
@@ -23,7 +24,7 @@ PYTHONPATH=src python -m actl --help
 ```sh
 cd your-project
 actl init          # register the Git repository as an actl project
-actl plan          # start (or resume) the planner session in OpenCode
+actl plan          # start (or resume) the planner; it can manage tasks
 actl plan --new    # start a fresh planner session
 actl task list     # list the project's tasks
 ```
@@ -33,10 +34,11 @@ actl task list     # list the project's tasks
   Running it again is harmless. It also checks that OpenCode is installed.
 - `actl plan` opens the interactive OpenCode TUI from the project root and
   waits for your input - it never sends an initial message. The planner
-  instructions live in a dedicated read-only OpenCode custom agent: editing,
-  subagents, web access, and MCP tools are denied, and shell commands ask for
-  approval. Model selection stays interactive inside OpenCode: actl never
-  passes `--model`.
+  instructions live in a dedicated OpenCode custom agent: editing, subagents,
+  web access, and MCP tools are denied, and shell commands ask for approval
+  except the `actl task` commands, which are pre-approved for task management.
+  Model selection stays interactive inside OpenCode: actl never passes
+  `--model`.
 - Each project keeps **one active planner session**. The session ID (generated
   by OpenCode) is stored in `.actl/planner.json`. Subsequent `actl plan` runs
   resume that session; `actl plan --new` creates a new one and makes it active,
@@ -48,6 +50,10 @@ Stage 2 stores the project's tasks in a SQLite database (`.actl/tasks.db`).
 Task commands are noninteractive: everything comes from arguments and files,
 output is plain text, and problems are reported on stderr with a non-zero
 exit code.
+
+The planner manages the same task list with the same commands: `actl task`
+is the only shell command it may run without a permission prompt, so task
+planning and task management happen in one OpenCode session.
 
 ```sh
 actl task create --title "Add the login form" --depends-on t1
@@ -86,29 +92,51 @@ On the first `actl plan` (or whenever the file is missing), actl installs
 .opencode/agents/actl-planner.md
 ```
 
-an OpenCode custom primary agent. Its body is the planner's **system prompt**
-(define requirements, decompose goals into tasks with acceptance criteria,
-never modify code, never execute tasks). Its permissions are deny-by-default:
-a catch-all rule blocks every tool, and only the native read-only inspection
-tools (`read`, `glob`, `grep`) and questions are re-allowed. Editing,
-subagents, web access, and MCP tools stay denied - including tools that write
-files under an action name other than `edit`. Every shell command requires
-explicit user approval, and reading a `.env` file still asks. The prompt also
-tells the planner to prefer the native `read`, `glob`, and `grep` tools over
-shell `cat`, `head`, `tail`, `ls`, or `grep` (the `read` tool pages through
-files with offset/limit), and to run inspections one per shell call (each
-command in a compound `&&` call is checked separately, and helpers like
-`echo` always require confirmation). Because the instructions are
+an OpenCode custom primary agent. Its body is the planner's **system prompt**:
+discuss requirements and design solutions, decompose goals into tasks with
+descriptions and acceptance criteria, manage the task list only through
+`actl task`, never modify code, and never execute tasks. Its permissions are
+deny-by-default: a catch-all rule blocks every tool, and only the native
+read-only inspection tools (`read`, `glob`, `grep`), questions, and the
+`actl task` shell commands are re-allowed. Editing, subagents, web access,
+and MCP tools stay denied - including tools that write files under an action
+name other than `edit` - and reading a `.env` file still asks.
+
+`actl task ...` is the only pre-approved shell command: the planner can
+create, list, show, update, and delete tasks without a permission prompt,
+while every other shell command still requires explicit user approval. The
+prompt tells the planner to prefer the native `read`, `glob`, and `grep`
+tools over shell `cat`, `head`, `tail`, `ls`, or `grep` (the `read` tool
+pages through files with offset/limit), and to run inspections one per shell
+call (each command in a compound `&&` call is checked separately, and helpers
+like `echo` still require confirmation). Because the instructions are
 system-level, launching the planner does not start a conversation by itself -
 the TUI just waits for input.
 
-actl deliberately pre-approves no shell commands: OpenCode matches a broad
-allow rule like `git diff *` or `cat *` against commands that write files as
-well (`git diff --output=file`, `cat file > file`), which would silently
-defeat the no-modification rule. Approve individual inspections in the
-permission dialog; choose *Allow always* there if you want a specific command
-pre-approved - OpenCode saves a project-scoped rule that actl does not
-override.
+Shell **redirection** (`>`, `>>`, `2>&1`) is denied outright. OpenCode
+reports a redirected statement as a single resource string, so a broad allow
+rule like `actl task *` would also match `actl task ... > src/file` and could
+silently overwrite source files; the explicit deny rule comes after the
+pre-approval (OpenCode evaluates permission rules last-match-wins), which
+closes that hole. As a consequence, a literal `>` inside a quoted task title
+or description counts as redirection and is denied too; reword the text or
+run that command yourself outside the planner.
+
+actl deliberately pre-approves no other shell commands: OpenCode matches a
+broad allow rule like `git diff *` or `cat *` against commands that write
+files as well (`git diff --output=file`, `cat file > file`), which would
+silently defeat the no-modification rule. Approve individual inspections in
+the permission dialog; choose *Allow always* there if you want a specific
+command pre-approved - OpenCode saves a project-scoped rule that actl does
+not override (it is evaluated after the agent rules but cannot override an
+agent deny).
+
+The rule format is verified against the installed OpenCode 2.1.2: a
+permission rule is `{action, resource, effect}` with effect `allow`, `deny`,
+or `ask`; action and resource are matched as glob patterns (`*`, `?`) and
+the last matching rule wins, so ordering matters. Shell commands are checked
+one resource per command, with `action: shell` and the parsed command text
+as the resource.
 
 actl binds the planner session to this agent (for `--new` and first runs) and
 re-selects it before resuming, so older sessions created before the agent
@@ -148,7 +176,7 @@ actl reports an error instead of resuming the wrong session.
 
 .opencode/
 └── agents/
-    └── actl-planner.md   # planner agent: system prompt + read-only permissions
+    └── actl-planner.md   # planner agent: system prompt + task permissions
 ```
 
 ## Tests
@@ -158,7 +186,10 @@ python -m unittest discover -s tests -v
 ```
 
 The tests use a fake `opencode` executable on `PATH`, so they need no network
-access, no real OpenCode process, and no model calls.
+access, no real OpenCode process, and no model calls. The planner tests
+evaluate the installed agent's permission rules with a matcher that mirrors
+OpenCode 2.1.2 (last matching rule wins, `*`/`?` globs, `ask` by default) and
+run the pre-approved `actl task` commands against a real project database.
 
 ## Limitations
 
@@ -174,5 +205,10 @@ access, no real OpenCode process, and no model calls.
   agent) with plain file writes that follow symlinks. A repository containing
   a hostile symlink at one of those paths can redirect the write. Run actl
   only in trusted repositories. Accepted for Stage 1.
-- No task execution, validation, scheduling, or planner integration yet -
-  Stage 2 only manages the task list.
+- The planner is a language model guided by the agent instructions; those
+  instructions are not a sandbox. The permission layer blocks file editing,
+  task execution tools, and shell redirection, but review what the planner
+  proposes before approving anything it asks for.
+- No task execution, validation, review, scheduling, or automatic merging
+  yet - Stage 3 connects the planner to the task list, but actl itself still
+  only stores tasks.

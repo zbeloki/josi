@@ -23,6 +23,14 @@ Stage 4:
 
 * ``actl task run <id>`` executes one task with a noninteractive OpenCode
   worker inside a dedicated Git worktree, under a project-wide execution lock.
+
+Stage 5:
+
+* After the worker succeeds, the configured validation commands run inside the
+  task worktree, and an independent reviewer - in a temporary worktree at the
+  validated commit - returns a structured verdict. The task ends APPROVED,
+  NEEDS_CHANGES, or FAILED; without a reviewer model configured the run stops
+  at IMPLEMENTED (Stage 4 behaviour). Nothing is retried or merged.
 """
 
 from __future__ import annotations
@@ -38,7 +46,7 @@ from contextlib import contextmanager
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import __version__, execution, opencode, tasks
+from . import __version__, execution, opencode, review, tasks, validation
 
 PROJECT_DIR = ".actl"
 PROJECT_METADATA = "project.json"
@@ -302,8 +310,8 @@ def _write_metadata(path: Path, metadata: dict) -> None:
     path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
 
-def _parse_worker_model(value: str) -> str:
-    """Validate a ``provider/model`` (optionally ``#variant``) worker model."""
+def _parse_model(value: str, role: str) -> str:
+    """Validate a ``provider/model`` (optionally ``#variant``) model name."""
     model = value.strip()
     provider, _, rest = model.partition("/")
     if (
@@ -313,10 +321,18 @@ def _parse_worker_model(value: str) -> str:
         or any(char.isspace() for char in model)
     ):
         raise ProjectError(
-            "invalid worker model " + repr(value)
+            "invalid " + role + " model " + repr(value)
             + " (expected provider/model, optionally provider/model#variant)"
         )
     return model
+
+
+def _parse_worker_model(value: str) -> str:
+    return _parse_model(value, "worker")
+
+
+def _parse_reviewer_model(value: str) -> str:
+    return _parse_model(value, "reviewer")
 
 
 def _worker_model(metadata: dict) -> str:
@@ -332,6 +348,23 @@ def _worker_model(metadata: dict) -> str:
             "project metadata has an invalid 'worker_model' value " + repr(model)
         )
     return _parse_worker_model(model)
+
+
+def _reviewer_model(metadata: dict):
+    """Return the project's reviewer model, or None when none is configured.
+
+    The reviewer model is optional: without it ``actl task run`` stops at
+    IMPLEMENTED (the Stage 4 behaviour) and prints how to enable validation
+    and review.
+    """
+    model = metadata.get("reviewer_model")
+    if model is None:
+        return None
+    if not isinstance(model, str):
+        raise ProjectError(
+            "project metadata has an invalid 'reviewer_model' value " + repr(model)
+        )
+    return _parse_reviewer_model(model)
 
 
 def _validate_explicit_base_branch(root: Path, value: str) -> str:
@@ -494,6 +527,12 @@ def cmd_init(args) -> int:
             worker_model = _parse_worker_model(args.worker_model)
         except ProjectError as exc:
             return _fail(str(exc))
+    reviewer_model = None
+    if args.reviewer_model is not None:
+        try:
+            reviewer_model = _parse_reviewer_model(args.reviewer_model)
+        except ProjectError as exc:
+            return _fail(str(exc))
 
     actl_dir = root / PROJECT_DIR
     metadata_path = actl_dir / PROJECT_METADATA
@@ -508,6 +547,11 @@ def cmd_init(args) -> int:
         updates = {}
         if worker_model is not None and metadata.get("worker_model") != worker_model:
             updates["worker_model"] = worker_model
+        if (
+            reviewer_model is not None
+            and metadata.get("reviewer_model") != reviewer_model
+        ):
+            updates["reviewer_model"] = reviewer_model
         stored_base = metadata.get("base_branch")
         if args.base is not None:
             # An explicit --base is the user's decision: it may replace an
@@ -535,6 +579,8 @@ def cmd_init(args) -> int:
                 )
             if "worker_model" in updates:
                 print("Updated the worker model to " + updates["worker_model"])
+            if "reviewer_model" in updates:
+                print("Updated the reviewer model to " + updates["reviewer_model"])
             if "base_branch" in updates:
                 print("Updated the base branch to " + updates["base_branch"])
         else:
@@ -552,6 +598,8 @@ def cmd_init(args) -> int:
         }
         if worker_model is not None:
             metadata["worker_model"] = worker_model
+        if reviewer_model is not None:
+            metadata["reviewer_model"] = reviewer_model
         try:
             actl_dir.mkdir(parents=True, exist_ok=True)
             _write_metadata(metadata_path, metadata)
@@ -778,51 +826,71 @@ def cmd_task_delete(args) -> int:
 
 
 def cmd_task_run(args) -> int:
-    """Execute one task with the OpenCode worker."""
+    """Execute one task: worker, validation, and review as configured."""
     try:
         task_id = _parse_task_id(args.id)
         root = _project_root()
         metadata = load_project_metadata(root)
         model = _worker_model(metadata)
+        reviewer_model = _reviewer_model(metadata)
+        validation_commands = validation.commands_from_metadata(metadata)
         base_branch = _run_base_branch(root, metadata)
         binary = opencode.find_binary()
     except (
         ProjectError, tasks.TaskError, execution.ExecutionError,
-        opencode.OpenCodeError,
+        opencode.OpenCodeError, validation.ValidationError,
     ) as exc:
         return _fail(str(exc))
     actl_dir = root / PROJECT_DIR
     try:
         with execution.lock(actl_dir) as lock_fd:
             return _execute_task(
-                binary, root, actl_dir, task_id, model, lock_fd, base_branch
+                binary, root, actl_dir, task_id, model, lock_fd, base_branch,
+                reviewer_model, validation_commands,
             )
     except (
         ProjectError, tasks.TaskError, sqlite3.Error,
         execution.ExecutionError, opencode.OpenCodeError,
+        validation.ValidationError, review.ReviewError,
     ) as exc:
         return _fail(str(exc))
 
 
-def _execute_task(binary, root, actl_dir, task_id, model, lock_fd, base_branch) -> int:
+def _execute_task(
+    binary, root, actl_dir, task_id, model, lock_fd, base_branch,
+    reviewer_model, validation_commands,
+) -> int:
     """Run one task while the execution lock is held.
 
     The task is marked RUNNING before the worktree is prepared, so an
     interrupted attempt keeps RUNNING and a later explicit run continues from
     its worktree. A completed attempt always ends as IMPLEMENTED or FAILED.
 
-    The terminal shows only actl's own timestamped events; the worker's
-    transcript goes straight into the run log while it executes.
+    After the worker succeeds - or when an IMPLEMENTED task is run again -
+    validation and review run when the project configures a reviewer model;
+    without one the run stops at IMPLEMENTED.
+
+    The terminal shows only actl's own timestamped events; transcripts and
+    validation output go straight into their log files while they run.
     """
     task = _load_task(actl_dir, task_id)
-    _require_runnable(task)
+    _require_runnable(task, reviewer_model is not None)
+    print("task t" + str(task.id) + ": " + task.title)
+    print("model: " + model)
+    if reviewer_model is not None:
+        print("reviewer model: " + reviewer_model)
+
+    if task.status == tasks.STATUS_IMPLEMENTED:
+        return _verify_task(
+            binary, root, actl_dir, task, base_branch, reviewer_model,
+            validation_commands, lock_fd, announce_worktree=True,
+        )
+
     if task.status == tasks.STATUS_RUNNING:
         _event(
             "Retrying task t" + str(task.id)
             + ", left RUNNING by an interrupted execution"
         )
-    print("task t" + str(task.id) + ": " + task.title)
-    print("model: " + model)
 
     log_path, log = execution.open_run_log(actl_dir, task.id)
     with log:
@@ -888,13 +956,343 @@ def _execute_task(binary, root, actl_dir, task_id, model, lock_fd, base_branch) 
 
     _set_task_status(actl_dir, task.id, status)
     _event("Task status: " + status)
-    if status == tasks.STATUS_IMPLEMENTED:
-        print("Task t" + str(task.id) + " implemented (log: " + str(log_path) + ")")
-        return 0
-    return _fail(
-        "task t" + str(task.id) + " failed: " + reason
-        + " (log: " + str(log_path) + ")"
+    if status != tasks.STATUS_IMPLEMENTED:
+        return _fail(
+            "task t" + str(task.id) + " failed: " + reason
+            + " (log: " + str(log_path) + ")"
+        )
+    return _verify_task(
+        binary, root, actl_dir, task, base_branch, reviewer_model,
+        validation_commands, lock_fd, worker_log_path=log_path,
     )
+
+
+def _verify_task(
+    binary, root, actl_dir, task, base_branch, reviewer_model,
+    validation_commands, lock_fd, worker_log_path=None, announce_worktree=False,
+) -> int:
+    """Validate and review an implemented task.
+
+    Validation and review must refer to one exact commit: it is recorded
+    before validation, the task worktree must stay clean and on its branch,
+    and the task branch must still point at that commit before any verdict is
+    recorded. Anything else stops the run without repairing it.
+
+    The task stays IMPLEMENTED until the outcome is known; without a reviewer
+    model the run reports that review is skipped and stops there.
+    """
+    try:
+        worktree = execution.ensure_worktree(
+            root, actl_dir, task, retry=True, base_branch=base_branch,
+        )
+        if announce_worktree:
+            if worktree.created:
+                _event(
+                    "Created worktree " + str(worktree.path)
+                    + " (branch " + worktree.branch + ")"
+                )
+            else:
+                _event(
+                    "Reusing worktree " + str(worktree.path)
+                    + " (branch " + worktree.branch + ")"
+                )
+        commit = _verification_commit(root, worktree, base_branch)
+    except (execution.ExecutionError, opencode.OpenCodeError, OSError) as exc:
+        return _verification_failed(actl_dir, task.id, str(exc))
+
+    validation_result = None
+    validation_log_path = None
+    if validation_commands:
+        validation_log_path, log = execution.open_stage_log(
+            actl_dir, task.id, "validation",
+        )
+        _event("Validation started (" + str(len(validation_commands)) + " commands)")
+        _event("validation log: " + str(validation_log_path))
+        try:
+            with log:
+                log.write("actl validation\n")
+                log.write("task: t" + str(task.id) + " - " + task.title + "\n")
+                log.write("branch: " + worktree.branch + "\n")
+                log.write("commit: " + commit + "\n")
+                log.write("started_at: " + _utc_now() + "\n---\n")
+                validation_result = validation.run(
+                    validation_commands, worktree.path, log,
+                )
+                log.write("---\nfinished_at: " + _utc_now() + "\n")
+                log.write(
+                    "result: "
+                    + ("PASSED" if validation_result.passed else "FAILED") + "\n"
+                )
+                if not validation_result.passed:
+                    log.write("failed_command: " + validation_result.failed + "\n")
+        except OSError as exc:
+            return _verification_failed(
+                actl_dir, task.id, "validation could not run: " + str(exc),
+                log_hint=validation_log_path,
+            )
+        if not validation_result.passed:
+            exit_code = validation_result.results[-1][1]
+            _event(
+                "Validation failed (" + validation_result.failed
+                + ", exit code " + str(exit_code) + ")"
+            )
+            return _verification_failed(
+                actl_dir, task.id,
+                "validation failed: " + validation_result.failed
+                + " exited with status " + str(exit_code),
+                log_hint=validation_log_path,
+            )
+        _event("Validation passed")
+    else:
+        _event("Validation skipped (no validation commands configured)")
+
+    try:
+        _require_commit_intact(root, worktree, commit, "validation")
+    except execution.ExecutionError as exc:
+        return _verification_failed(
+            actl_dir, task.id, str(exc), log_hint=validation_log_path,
+        )
+
+    if reviewer_model is None:
+        _event(
+            "Review skipped (no reviewer model configured; run"
+            " 'actl init --reviewer-model MODEL' to enable review)"
+        )
+        if worker_log_path is not None:
+            print(
+                "Task t" + str(task.id) + " implemented (log: "
+                + str(worker_log_path) + ")"
+            )
+        else:
+            print("Task t" + str(task.id) + " implemented")
+        return 0
+
+    review_log_path, review_log = execution.open_stage_log(
+        actl_dir, task.id, "review",
+    )
+    _event("Reviewer started (model " + reviewer_model + ")")
+    _event("review log: " + str(review_log_path))
+    try:
+        try:
+            verdict = _run_reviewer(
+                binary, root, actl_dir, task, worktree, commit, base_branch,
+                reviewer_model, validation_result, lock_fd, review_log,
+            )
+        finally:
+            review_log.close()
+    except (
+        execution.ExecutionError, opencode.OpenCodeError, review.ReviewError,
+        OSError,
+    ) as exc:
+        _event("Review failed")
+        return _verification_failed(
+            actl_dir, task.id, "review failed: " + str(exc),
+            log_hint=review_log_path,
+        )
+
+    try:
+        _require_commit_intact(root, worktree, commit, "the review")
+    except execution.ExecutionError as exc:
+        return _verification_failed(
+            actl_dir, task.id, str(exc), log_hint=review_log_path,
+        )
+
+    _record_review(actl_dir, task.id, commit, verdict)
+    if verdict.decision == review.DECISION_APPROVED:
+        _set_task_status(actl_dir, task.id, tasks.STATUS_APPROVED)
+        _event(
+            "Review approved ("
+            + (_finding_summary(verdict.findings) or "no findings") + ")"
+        )
+        _print_findings(verdict.findings)
+        print("")
+        print("Task t" + str(task.id) + " \u2192 APPROVED")
+        return 0
+
+    _set_task_status(actl_dir, task.id, tasks.STATUS_NEEDS_CHANGES)
+    _event("Review requested changes (" + _finding_summary(verdict.blocking) + ")")
+    _print_findings(verdict.findings)
+    print("")
+    print("Task t" + str(task.id) + " \u2192 NEEDS_CHANGES")
+    return _fail(
+        "task t" + str(task.id) + " needs changes: "
+        + _finding_summary(verdict.blocking)
+        + " (review log: " + str(review_log_path) + ")"
+    )
+
+
+def _run_reviewer(
+    binary, root, actl_dir, task, worktree, commit, base_branch,
+    reviewer_model, validation_result, lock_fd, log,
+) -> review.Verdict:
+    """Run the reviewer in a temporary worktree at ``commit``.
+
+    The worktree is discarded on every path. The returned verdict has already
+    been validated; malformed output raises :class:`review.ReviewError`.
+    """
+    base_commit = execution.merge_base(
+        root, "refs/heads/" + base_branch, commit,
+    )
+    diff = execution.commit_diff(root, base_commit, commit)
+    policy = review.policy_text(review.load_project_policy(root))
+    prompt = review.build_prompt(
+        task, base_commit, commit, diff,
+        validation.summary(validation_result), policy,
+    )
+
+    review_path = (
+        actl_dir / execution.REVIEW_DIR
+        / ("t" + str(task.id) + "-" + execution.timestamp())
+    )
+    execution.add_review_worktree(root, review_path, commit)
+    try:
+        log.write("actl review\n")
+        log.write("task: t" + str(task.id) + " - " + task.title + "\n")
+        log.write("model: " + reviewer_model + "\n")
+        log.write("commit: " + commit + "\n")
+        log.write("base_commit: " + base_commit + "\n")
+        log.write("review_worktree: " + str(review_path) + "\n")
+        log.write("started_at: " + _utc_now() + "\n---\n")
+        session = opencode.create_session(
+            binary, review_path,
+            title="actl review t" + str(task.id) + ": " + task.title,
+            agent=opencode.REVIEWER_AGENT,
+        )
+        log.write("session: " + session.id + "\n")
+        # Flush before the reviewer starts writing to the same file through
+        # its inherited stdout descriptor, so the header stays on top.
+        log.flush()
+        exit_code = opencode.run_headless(
+            binary, review_path, session.id, reviewer_model, prompt, log,
+            pass_fds=(lock_fd,), agent=opencode.REVIEWER_AGENT,
+            output_format="json",
+        )
+        log.write("---\nfinished_at: " + _utc_now() + "\n")
+        log.write("exit_code: " + str(exit_code) + "\n")
+        log.flush()
+        if exit_code != 0:
+            raise review.ReviewError(
+                "the reviewer exited with status " + str(exit_code)
+            )
+        output = Path(log.name).read_text(encoding="utf-8", errors="replace")
+        verdict = review.verdict_from_output(output)
+        log.write("decision: " + verdict.decision + "\n")
+        log.write(
+            "findings: "
+            + json.dumps([finding.as_dict() for finding in verdict.findings])
+            + "\n"
+        )
+        return verdict
+    finally:
+        problem = execution.remove_review_worktree(root, review_path)
+        if problem:
+            _event(
+                "Warning: could not remove the reviewer worktree "
+                + str(review_path) + " (" + problem + ")"
+            )
+
+
+def _verification_commit(root: Path, worktree, base_branch: str) -> str:
+    """Return the commit to validate, requiring a clean worktree on its branch.
+
+    The branch must still contain committed changes relative to the base: a
+    branch deleted and silently recreated from the base would otherwise be
+    validated and reviewed as an empty implementation.
+    """
+    branch = execution.worktree_branch(worktree.path)
+    if branch != worktree.branch:
+        raise execution.ExecutionError(
+            "the task worktree is on '" + branch + "' instead of '"
+            + worktree.branch + "'"
+        )
+    dirty = execution.worktree_tracked_dirty(worktree.path)
+    if dirty:
+        raise execution.ExecutionError(
+            "the task worktree has uncommitted changes; commit or remove them"
+            " before validation"
+        )
+    if not execution.worktree_has_committed_changes(worktree.path, base_branch):
+        raise execution.ExecutionError(
+            "the task branch has no committed changes relative to "
+            + base_branch + "; refusing to validate or review it"
+        )
+    head = execution.head_commit(worktree.path)
+    if execution.ref_commit(root, "refs/heads/" + worktree.branch) != head:
+        raise execution.ExecutionError(
+            "branch " + worktree.branch + " does not point at the worktree"
+            " commit"
+        )
+    return head
+
+
+def _require_commit_intact(root: Path, worktree, commit: str, stage: str) -> None:
+    """Refuse approval when ``stage`` changed the commit under review."""
+    head = execution.head_commit(worktree.path)
+    ref = execution.ref_commit(root, "refs/heads/" + worktree.branch)
+    if head != commit or ref != commit:
+        raise execution.ExecutionError(
+            stage + " changed the task commit: expected " + commit[:12]
+            + ", found " + head[:12] + " in the worktree and " + ref[:12]
+            + " on " + worktree.branch + "; refusing approval"
+        )
+    if execution.worktree_tracked_dirty(worktree.path):
+        raise execution.ExecutionError(
+            stage + " modified tracked files in the task worktree; refusing"
+            " approval"
+        )
+
+
+def _verification_failed(actl_dir, task_id, reason, log_hint=None) -> int:
+    """Mark a task FAILED after validation or review could not complete."""
+    _set_task_status(actl_dir, task_id, tasks.STATUS_FAILED)
+    print("")
+    print("Task t" + str(task_id) + " \u2192 FAILED")
+    message = "task t" + str(task_id) + " failed: " + reason
+    if log_hint is not None:
+        message += " (log: " + str(log_hint) + ")"
+    return _fail(message)
+
+
+def _record_review(actl_dir: Path, task_id: int, commit: str, verdict) -> None:
+    """Store the verdict (and its findings) for later stages."""
+    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    try:
+        tasks.record_review(
+            conn, task_id, commit, verdict.decision,
+            [finding.as_dict() for finding in verdict.findings],
+        )
+    finally:
+        conn.close()
+
+
+def _finding_summary(findings) -> str:
+    """Describe findings, for example ``"2 minor findings"``."""
+    if not findings:
+        return ""
+    counts = {}
+    for finding in findings:
+        counts[finding.severity] = counts.get(finding.severity, 0) + 1
+    parts = [
+        str(counts[severity]) + " " + severity
+        for severity in review.SEVERITIES
+        if counts.get(severity)
+    ]
+    if len(parts) == 1:
+        return parts[0] + (" finding" if len(findings) == 1 else " findings")
+    return str(len(findings)) + " findings: " + ", ".join(parts)
+
+
+def _print_findings(findings) -> None:
+    """Print findings below their summary event, blocking ones included."""
+    for finding in findings:
+        line = "  [" + finding.severity + "] " + finding.description
+        if finding.location:
+            line += " (" + finding.location + ")"
+        print(line)
+        if finding.scenario:
+            print("      scenario: " + finding.scenario)
+        if finding.impact:
+            print("      impact: " + finding.impact)
 
 
 def _evaluate_run(worktree, exit_code: int, base_branch: str):
@@ -927,8 +1325,13 @@ def _evaluate_run(worktree, exit_code: int, base_branch: str):
     return tasks.STATUS_IMPLEMENTED, ""
 
 
-def _require_runnable(task) -> None:
-    """Refuse tasks that may not be executed in this stage."""
+def _require_runnable(task, review_available: bool) -> None:
+    """Refuse tasks that may not be executed in this stage.
+
+    An IMPLEMENTED task may only be run again to validate and review it, and
+    only when the project configures a reviewer model; without one it stays
+    IMPLEMENTED and the refusal explains how to enable review.
+    """
     if task.depends_on:
         dependencies = ", ".join("t" + str(dep) for dep in task.depends_on)
         raise tasks.TaskError(
@@ -937,8 +1340,21 @@ def _require_runnable(task) -> None:
             " introduces DONE after merging)"
         )
     if task.status == tasks.STATUS_IMPLEMENTED:
+        if review_available:
+            return
         raise tasks.TaskError(
-            "cannot run task t" + str(task.id) + ": it is already IMPLEMENTED"
+            "cannot run task t" + str(task.id) + ": it is already IMPLEMENTED;"
+            " configure a reviewer model with 'actl init --reviewer-model"
+            " MODEL' to validate and review it"
+        )
+    if task.status == tasks.STATUS_NEEDS_CHANGES:
+        raise tasks.TaskError(
+            "cannot run task t" + str(task.id) + ": it is NEEDS_CHANGES after"
+            " review; automatic repair arrives in a later stage"
+        )
+    if task.status == tasks.STATUS_APPROVED:
+        raise tasks.TaskError(
+            "cannot run task t" + str(task.id) + ": it is already APPROVED"
         )
     if task.status not in (
         tasks.STATUS_PENDING, tasks.STATUS_RUNNING, tasks.STATUS_FAILED
@@ -1057,6 +1473,11 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--worker-model", metavar="MODEL",
         help="set the project's worker model (provider/model[#variant])",
+    )
+    init.add_argument(
+        "--reviewer-model", metavar="MODEL",
+        help="set the project's reviewer model (provider/model[#variant]);"
+             " without it, task runs stop after the worker",
     )
     init.add_argument(
         "--base", metavar="BRANCH",

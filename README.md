@@ -4,7 +4,9 @@ A lightweight Python CLI for orchestrating AI coding agents through
 [OpenCode](https://opencode.ai). Stage 1 covers project setup and planning;
 Stage 2 adds a project-local task list; Stage 3 lets the planner manage that
 task list through the same `actl task` CLI; Stage 4 runs one task at a time
-with a noninteractive OpenCode worker in an isolated Git worktree.
+with a noninteractive OpenCode worker in an isolated Git worktree; Stage 5
+validates the worker's commit with project-configured commands and has an
+independent reviewer approve or reject it.
 
 ## Requirements
 
@@ -28,7 +30,7 @@ actl init          # register the Git repository as an actl project
 actl plan          # start (or resume) the planner; it can manage tasks
 actl plan --new    # start a fresh planner session
 actl task list     # list the project's tasks
-actl task run t1   # execute a task with the worker
+actl task run t1   # execute a task: worker, validation, and review
 ```
 
 - `actl init` requires a Git repository, creates `.actl/project.json`, and adds
@@ -36,6 +38,9 @@ actl task run t1   # execute a task with the worker
   Running it again is harmless. It also checks that OpenCode is installed.
   `actl init --worker-model MODEL` sets (or updates) the project's worker
   model, for example `actl init --worker-model openrouter/anthropic/claude-sonnet-latest`.
+  `actl init --reviewer-model MODEL` sets the independent reviewer's model;
+  without one, `actl task run` stops after the worker at `IMPLEMENTED`
+  (Stage 4 behaviour) and prints how to enable review.
   `actl init --base BRANCH` sets the base branch that task branches are
   created from; without it the branch is detected, and when the choice is
   ambiguous actl asks. It works in repositories without commits, where it
@@ -97,11 +102,14 @@ actl task delete t2
 
 ## Running tasks
 
-`actl task run <id>` executes one task with a noninteractive OpenCode worker
-in an isolated Git worktree. No validation, review, or merging happens yet.
+`actl task run <id>` executes one task end to end: a noninteractive OpenCode
+worker implements it in an isolated Git worktree, the project's validation
+commands run on the worker's commit, and an independent reviewer approves or
+rejects that exact commit. Nothing is retried, repaired, or merged.
 
 ```sh
-actl task run t1   # first execution, or an explicit retry after a failure
+actl task run t1   # first execution, an explicit retry after a failure, or
+                   # validation + review of an IMPLEMENTED task
 ```
 
 A run goes through these steps:
@@ -120,12 +128,15 @@ A run goes through these steps:
 5. The worker's complete stdout and stderr are written straight into a log
    file under `.actl/runs/` while it runs; the log path is printed when the
    worker starts, so the run can be followed with `tail -f <logfile>`.
-6. The task status is updated.
+6. After the worker succeeds, the configured validation commands run in the
+   task worktree (see below) and an independent reviewer examines the
+   validated commit in a temporary worktree.
+7. The task status is updated.
 
-The terminal shows only actl's own timestamped events - task and model,
-worktree preparation, worker start, worker exit code, and the final task
-status - plus the run log path. The worker's transcript is never printed to
-the terminal.
+The terminal shows only actl's own timestamped events - task, models,
+worktree preparation, worker start, worker exit code, validation start and
+result, reviewer start and verdict, and the final task status - plus the log
+paths. Transcripts and validation output never reach the terminal.
 
 The worker prompt contains the task title, its description, and the worker
 instructions: implement the task, run the relevant checks, commit the changes
@@ -134,24 +145,31 @@ on the branch, keep the worktree clean, and never merge into the base branch.
 The lifecycle is:
 
 ```text
-PENDING → RUNNING → IMPLEMENTED
-                  ↘ FAILED
+PENDING → RUNNING → IMPLEMENTED → APPROVED
+                  ↘ FAILED         ↘ NEEDS_CHANGES
 ```
 
 - `IMPLEMENTED` means the worker exited successfully, left a clean task
   worktree, and left committed changes on the task branch relative to the
-  base branch. It does not imply validation or approval.
+  base branch.
+- `APPROVED` means validation passed and the reviewer approved the exact
+  validated commit. It does **not** mean the code has been merged.
+- `NEEDS_CHANGES` means the reviewer reported at least one critical or major
+  finding; the findings are printed and stored for Stage 6. Stage 5 never
+  retries or repairs automatically.
+- Without a configured reviewer model, a successful run stops at
+  `IMPLEMENTED` and reports that review was skipped. Running such a task again
+  refuses; configure a reviewer model first.
 - A task that fails can be retried explicitly with `actl task run <id>`: the
   existing branch and worktree are reused as they are, so earlier commits are
   preserved and the worker continues from there. Nothing is reset, cleaned,
   rebased, or merged.
 - Tasks with dependencies stay blocked. Dependency-aware execution arrives in
   a later stage (Stage 7, when successfully merged tasks become `DONE`); in
-  Stage 4 only tasks without dependencies can run.
-- An `IMPLEMENTED` task cannot be run again. The task keeps its branch and
-  worktree after success or failure; actl never removes either.
+  Stage 5 only tasks without dependencies can run.
+- An `APPROVED` or `NEEDS_CHANGES` task cannot be run again.
 - If an execution is interrupted (for example by Ctrl-C or a crash), the task
-  keeps `RUNNING` and its worktree and log are preserved; there is no
+  keeps its status and its worktree and log are preserved; there is no
   automatic recovery, but an explicit `actl task run <id>` continues from the
   preserved worktree.
 - The task is marked `IMPLEMENTED` only when OpenCode exits with status 0,
@@ -173,6 +191,18 @@ edited directly as well). `actl task run` refuses to start until a model is
 configured, and OpenCode fails the run if the model is not available in the
 worktree.
 
+The reviewer model is configured independently:
+
+```sh
+actl init --reviewer-model openrouter/anthropic/claude-sonnet-latest
+```
+
+It is stored as `reviewer_model` in `.actl/project.json`. Without it, actl
+cannot review: the run stops at `IMPLEMENTED` (after validation, when
+commands are configured) and reports that review was skipped. Once a reviewer
+model is configured, re-running the `IMPLEMENTED` task validates and reviews
+it without launching the worker again.
+
 The base branch is project-level configuration too:
 
 ```sh
@@ -193,16 +223,112 @@ selection; a project initialized before `base_branch` existed gains one on
 the next `actl init`, and `actl task run` keeps working by detecting the
 branch without writing metadata.
 
-Every execution writes `.actl/runs/t1-<timestamp>.log`: a short header
-(task, model, branch, worktree, session), the complete worker stdout and
-stderr, and the result (exit code, final status, failure reason). The log is
-written continuously while the worker runs, and its path is printed when the
-worker starts as well as in the final summary; use `tail -f` to watch a run.
+Every execution writes `.actl/runs/t1-<timestamp>.log` for the worker, plus
+`.actl/runs/t1-<timestamp>-validation.log` and
+`.actl/runs/t1-<timestamp>-review.log` when those stages run. Each log starts
+with a header (task, model, branch, commit) and ends with the result (exit
+codes, status, verdict, failure reason). The logs are written continuously
+while the stage runs, and each path is printed when the stage starts as well
+as in the final summary; use `tail -f` to watch a run.
 
 Only one execution may run per project. The lock is an exclusive, nonblocking
 `fcntl.flock` on `.actl/execution.lock`, and the locked file descriptor is
-passed to the OpenCode process (Python's `pass_fds`), so the lock stays held
-while that process is alive even if actl itself is killed.
+passed to the OpenCode worker and reviewer (Python's `pass_fds`), so the lock
+stays held while those processes are alive even if actl itself is killed.
+
+## Validation and review
+
+Validation commands are project configuration in `.actl/project.json`:
+
+```json
+{
+  "validation": {
+    "commands": ["pytest", "ruff check ."]
+  }
+}
+```
+
+- Commands run sequentially in the task worktree, exactly as written (a
+  shell), and stop at the first non-zero exit.
+- Output, exit codes, and the overall result are recorded in the validation
+  log; a failed command fails the task (`FAILED`) and no reviewer starts.
+- A malformed `validation` configuration is an error rather than a silent
+  skip; a missing configuration (or an empty list) skips validation and
+  reports that clearly before review proceeds.
+
+Validation and review refer to one exact commit:
+
+- The commit is recorded before validation runs and stored in both logs.
+- The task worktree must be clean (no uncommitted tracked changes) and on its
+  task branch.
+- If validation modifies tracked files or moves `HEAD`, the task fails
+  instead of being approved.
+- Before any verdict is recorded, the task branch must still point at the
+  validated commit; if it moved, the run stops and the task fails. actl never
+  repairs or resets the branch.
+
+After validation passes, the reviewer runs in a temporary detached worktree
+under `.actl/review/t1-<timestamp>` created at the validated commit, never in
+the task worktree. It is launched with the project's reviewer model and
+OpenCode's built-in read-only `plan` agent:
+
+```sh
+opencode run --agent plan --model REVIEWER_MODEL --session ID --format json "<prompt>"
+```
+
+The reviewer receives the task title and description (requirements and
+acceptance criteria), the cumulative diff of the task branch against the
+commit it was created from, the validation results, and the review policy. It
+can inspect the whole checkout for context. Its temporary worktree is removed
+afterwards on every path, so nothing it does can reach the task worktree or
+the task branch.
+
+The reviewer must answer with one JSON verdict:
+
+```json
+{"decision": "approved", "findings": []}
+```
+
+```json
+{
+  "decision": "changes_requested",
+  "findings": [
+    {
+      "severity": "major",
+      "description": "Authentication accepts an expired token.",
+      "scenario": "An expired JWT is accepted by the verification function.",
+      "impact": "Users can authenticate with expired credentials.",
+      "location": "src/auth.py"
+    }
+  ]
+}
+```
+
+The verdict is parsed strictly. Malformed output, unknown decisions or
+severities, an approval that carries a critical or major finding, and a
+`changes_requested` verdict without a blocking finding are all invalid: the
+task becomes `FAILED` and nothing is recorded as an approval. Every critical
+or major finding must include a scenario, impact, and location. Valid
+verdicts are stored in `.actl/tasks.db` (the `reviews` table) with the commit
+they refer to, so Stage 6 can use the findings.
+
+The review policy is the built-in risk-based policy plus, when present, the
+project's `REVIEW_POLICY.md`:
+
+- The reviewer judges whether the task satisfies its requirements, whether it
+  introduces significant correctness problems, and whether it creates
+  credible security, safety, or data-loss risks.
+- Only **critical** or **major** findings reject a task. **Minor** findings
+  and **suggestions** are reported but never block approval.
+- Blocking findings need a concrete failure scenario, a realistic impact, why
+  they block, and the relevant files; the reviewer weighs likelihood and
+  impact.
+- Style preferences, speculative improvements, extremely unlikely edge cases,
+  nonessential robustness work, features from future stages, and unrelated
+  pre-existing problems never block approval.
+
+`APPROVED` records the validated commit. Nothing is merged, pushed, or
+retried in Stage 5.
 
 ## Planner agent
 
@@ -290,6 +416,8 @@ conversations itself. It uses these OpenCode surfaces:
 | Open the planner TUI | `opencode <project-root> --session <id>` |
 | Create a worker session in a task worktree | `opencode api POST /api/session` (location and agent `build`) |
 | Run the worker noninteractively | `opencode run --agent build --model <model> --session <id> "<prompt>"` |
+| Create a reviewer session in a temporary worktree | `opencode api POST /api/session` (location and agent `plan`) |
+| Run the reviewer and get a machine-readable verdict | `opencode run --agent plan --model <model> --session <id> --format json "<prompt>"` |
 
 Sessions are created explicitly (instead of letting the TUI create them
 lazily) so actl captures the real session ID. Before resuming, actl asks
@@ -301,11 +429,13 @@ actl reports an error instead of resuming the wrong session.
 
 ```
 .actl/
-├── project.json    # schema_version, name, worker_model, base_branch, created_at
+├── project.json    # schema_version, name, worker_model, reviewer_model,
+│                   # validation.commands, base_branch, created_at
 ├── planner.json    # active planner session id, created_at
-├── tasks.db        # SQLite task database
+├── tasks.db        # SQLite task database (tasks, dependencies, reviews)
 ├── execution.lock  # project-wide execution lock (fcntl.flock)
-├── runs/           # one log per execution: tN-<timestamp>.log
+├── runs/           # tN-<timestamp>.log worker, -validation.log, -review.log
+├── review/         # temporary reviewer worktrees (removed after review)
 └── worktrees/      # one Git worktree per task: t1/, t2/, ...
 
 .opencode/
@@ -331,7 +461,13 @@ execution lock (including the inherited lock descriptor) are all exercised
 without a real model. Base-branch selection is covered too: `main`/`master`
 detection, feature branches, the ambiguity prompt, explicit `--base`, the
 remote default branch, repositories without commits, and legacy projects
-without a stored `base_branch`.
+without a stored `base_branch`. The Stage 5 tests cover validation success,
+failure, worktree tampering and `HEAD` movement, skipped validation, every
+verdict shape (approval with and without findings, rejection, malformed
+output, unknown severities and decisions, contradictory verdicts), reviewer
+isolation and the temporary worktree, a task branch moving during review,
+the built-in and project review policies, the configured models, and
+validating/reviewing an `IMPLEMENTED` task without rerunning the worker.
 
 ## Limitations
 
@@ -351,18 +487,27 @@ without a stored `base_branch`.
   instructions are not a sandbox. The permission layer blocks file editing,
   task execution tools, and shell redirection, but review what the planner
   proposes before approving anything it asks for.
-- Stage 4 executes one task at a time and stops there. There is no validation,
-  no independent review, no automatic retry or scheduling, and no automatic
+- Stage 5 executes one task at a time and stops after approval. There is no
+  automatic retry, no repair iteration, no model escalation, and no automatic
   merging; a task with dependencies cannot run until a later stage introduces
   `DONE` after merging.
 - `IMPLEMENTED` only means that the worker exited successfully, left the
   worktree clean, and left committed changes on the task branch relative to
-  the base branch. It says nothing about whether the implementation is
-  correct.
+  the base branch. `APPROVED` additionally means the configured validation
+  commands passed on that exact commit and the reviewer approved it; it does
+  not mean the code is merged, and it is not a guarantee of correctness.
+- Review requires the project to configure a reviewer model. Without one, a
+  run stops at `IMPLEMENTED` and reports that review was skipped; an
+  `IMPLEMENTED` task is then validated and reviewed without rerunning the
+  worker once the model is configured.
+- Validation commands run with actl's environment inside the task worktree
+  and may create untracked files (caches, reports). Only changes to tracked
+  files or to `HEAD` fail the task; actl does not clean anything up.
 - actl never resets, cleans, rebases, or deletes a task worktree, and it never
   touches the base branch. A task that fails keeps its branch, worktree, and
-  log for an explicit retry.
-- The execution lock covers actl and the OpenCode process it spawns. A
+  log for an explicit retry. A reviewer worktree is the one exception: it is
+  temporary and removed after the review.
+- The execution lock covers actl and the OpenCode processes it spawns. A
   detached descendant that does not keep the inherited descriptor (for example
   a daemonized helper the worker starts) can outlive the lock; actl keeps no
   PID tracking, heartbeats, or automatic recovery.
@@ -378,3 +523,11 @@ without a stored `base_branch`.
   its task branch, is clean, and contains committed changes relative to the
   base branch; a worker that ignores the instructions is reported as a
   failure rather than corrected automatically.
+- The reviewer runs with OpenCode's read-only `plan` agent in a disposable
+  worktree at the validated commit; it can still run shell commands, so treat
+  its transcript as untrusted output. Its verdict is parsed strictly and a
+  malformed or contradictory answer always fails the task instead of being
+  approved.
+- The review verdict is bound to the validated commit, but it is a model
+  judgment: minor findings may be missed, and an approval is not a
+  correctness proof. Human review before merging stays necessary.

@@ -52,6 +52,15 @@ Behaviour is controlled through environment variables:
                               after writing the marker and before doing its
                               work
 * ``ACTL_FAKE_RUN_DONE``    - file written when the worker is about to exit
+* ``ACTL_FAKE_REVIEW_JSON`` - the final reviewer message (defaults to an
+                              approval); ``opencode run --agent plan`` prints
+                              it as the text event of ``--format json`` output
+* ``ACTL_FAKE_REVIEW_EXIT`` - exit code for the reviewer invocation
+* ``ACTL_FAKE_REVIEW_MARKER`` - file receiving the reviewer PID when it starts
+* ``ACTL_FAKE_REVIEW_WAIT_FOR`` - the reviewer waits for this file (max 120s)
+* ``ACTL_FAKE_REVIEW_DONE`` - file written when the reviewer is about to exit
+* ``ACTL_FAKE_REVIEW_MUTATE`` - non-empty to write and commit a file in the
+                              reviewer's own checkout
 """
 
 import json
@@ -67,6 +76,43 @@ def _log(argv):
         return
     with open(path, "a", encoding="utf-8") as handle:
         handle.write(json.dumps({"argv": argv, "cwd": os.getcwd()}) + "\\n")
+
+
+def _run_reviewer():
+    """Emulate one noninteractive reviewer turn with --format json output."""
+    marker = os.environ.get("ACTL_FAKE_REVIEW_MARKER")
+    if marker:
+        with open(marker, "w", encoding="utf-8") as handle:
+            handle.write(str(os.getpid()))
+    wait_for = os.environ.get("ACTL_FAKE_REVIEW_WAIT_FOR")
+    deadline = time.time() + 120
+    while wait_for and not os.path.exists(wait_for) and time.time() < deadline:
+        time.sleep(0.05)
+    if os.environ.get("ACTL_FAKE_REVIEW_MUTATE"):
+        with open("reviewer-checkout.txt", "w", encoding="utf-8") as handle:
+            handle.write("reviewer change\\n")
+        subprocess.run(["git", "add", "reviewer-checkout.txt"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Fake Reviewer",
+             "-c", "user.email=reviewer@example.invalid",
+             "commit", "-m", "reviewer: touch the checkout"],
+            check=True, capture_output=True,
+        )
+    print(json.dumps({"type": "step_start",
+                      "part": {"type": "step-start"}}))
+    message = os.environ.get(
+        "ACTL_FAKE_REVIEW_JSON", '{"decision":"approved","findings":[]}'
+    )
+    print(json.dumps({
+        "type": "text",
+        "part": {"type": "text", "messageID": "msg_fake_review",
+                 "text": message},
+    }))
+    done = os.environ.get("ACTL_FAKE_REVIEW_DONE")
+    if done:
+        with open(done, "w", encoding="utf-8") as handle:
+            handle.write("done")
+    return int(os.environ.get("ACTL_FAKE_REVIEW_EXIT", "0"))
 
 
 def _run_worker():
@@ -172,6 +218,8 @@ def main():
             return 0
 
     if argv and argv[0] == "run":
+        if "--agent" in argv and argv[argv.index("--agent") + 1] == "plan":
+            return _run_reviewer()
         return _run_worker()
 
     # Anything after the api and run handling is treated as the interactive

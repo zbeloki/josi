@@ -1,11 +1,15 @@
 """SQLite-backed task storage for actl.
 
 Stage 2 keeps the project's tasks in a small SQLite database at
-``.actl/tasks.db``. The schema has two tables: ``tasks`` and
-``dependencies``. There is no BLOCKED status - whether a task is blocked is
+``.actl/tasks.db``. The schema has three tables: ``tasks``, ``dependencies``,
+and ``reviews``. There is no BLOCKED status - whether a task is blocked is
 derived from its dependencies when needed. A task's status is PENDING,
-RUNNING, IMPLEMENTED, or FAILED (Stage 4); only ``actl task run`` moves a task
-between them.
+RUNNING, IMPLEMENTED, FAILED, APPROVED, or NEEDS_CHANGES (Stage 5); only
+``actl task run`` moves a task between them.
+
+Reviewer verdicts are stored in ``reviews`` (one row per completed review,
+newest last) so later stages can read the findings that belong to a task's
+current implementation.
 
 The module is deliberately small: repository functions over a connection
 opened by the caller. Every write runs inside a ``with conn:`` transaction,
@@ -18,6 +22,7 @@ overlapping commands cannot both validate against the same unchanged graph.
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -28,7 +33,15 @@ STATUS_PENDING = "PENDING"
 STATUS_RUNNING = "RUNNING"
 STATUS_IMPLEMENTED = "IMPLEMENTED"
 STATUS_FAILED = "FAILED"
-STATUSES = (STATUS_PENDING, STATUS_RUNNING, STATUS_IMPLEMENTED, STATUS_FAILED)
+STATUS_APPROVED = "APPROVED"
+STATUS_NEEDS_CHANGES = "NEEDS_CHANGES"
+STATUSES = (
+    STATUS_PENDING, STATUS_RUNNING, STATUS_IMPLEMENTED, STATUS_FAILED,
+    STATUS_APPROVED, STATUS_NEEDS_CHANGES,
+)
+REVIEW_APPROVED = "approved"
+REVIEW_CHANGES_REQUESTED = "changes_requested"
+REVIEW_DECISIONS = (REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED)
 
 # CREATE TABLE IF NOT EXISTS keeps opening the database idempotent: existing
 # tasks are preserved while a missing or older database gains the current
@@ -49,6 +62,15 @@ CREATE TABLE IF NOT EXISTS dependencies (
     depends_on_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
     PRIMARY KEY (task_id, depends_on_id),
     CHECK (task_id <> depends_on_id)
+);
+
+CREATE TABLE IF NOT EXISTS reviews (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+    commit_sha TEXT NOT NULL,
+    decision TEXT NOT NULL,
+    findings TEXT NOT NULL,
+    created_at TEXT NOT NULL
 );
 """
 
@@ -189,6 +211,44 @@ def set_task_status(conn, task_id: int, status: str) -> Task:
     return get_task(conn, task_id)
 
 
+def record_review(conn, task_id: int, commit_sha: str, decision: str, findings) -> None:
+    """Store one reviewer verdict for later stages.
+
+    ``findings`` is a list of plain JSON-safe dicts; it is stored as JSON so
+    Stage 6 can feed the findings back to a repair worker without reopening
+    the reviewer's transcript.
+    """
+    if decision not in REVIEW_DECISIONS:
+        raise TaskError("invalid review decision " + repr(decision))
+    if not isinstance(findings, list):
+        raise TaskError("review findings must be a list")
+    with conn:
+        if not _task_exists(conn, task_id):
+            raise TaskError("task t" + str(task_id) + " does not exist")
+        conn.execute(
+            "INSERT INTO reviews (task_id, commit_sha, decision, findings, created_at)"
+            " VALUES (?, ?, ?, ?, ?)",
+            (task_id, commit_sha, decision, json.dumps(findings), _utc_now()),
+        )
+
+
+def latest_review(conn, task_id: int):
+    """Return the newest stored review for ``task_id``, or None."""
+    row = conn.execute(
+        "SELECT commit_sha, decision, findings, created_at FROM reviews"
+        " WHERE task_id = ? ORDER BY id DESC LIMIT 1",
+        (task_id,),
+    ).fetchone()
+    if row is None:
+        return None
+    return {
+        "commit_sha": row["commit_sha"],
+        "decision": row["decision"],
+        "findings": json.loads(row["findings"]),
+        "created_at": row["created_at"],
+    }
+
+
 def delete_task(conn, task_id: int) -> None:
     """Delete ``task_id`` unless other tasks depend on it.
 
@@ -214,6 +274,7 @@ def delete_task(conn, task_id: int) -> None:
                 + (" depend on it" if len(dependents) > 1 else " depends on it")
             )
         conn.execute("DELETE FROM dependencies WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM reviews WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
 
 

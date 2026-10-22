@@ -4,17 +4,22 @@
 
 * A project-wide ``fcntl.flock`` lock (``.actl/execution.lock``) is taken
   before any work starts. The locked file descriptor is inherited by the
-  OpenCode process, so the lock stays held if actl crashes while the worker
-  is still running.
+  OpenCode processes, so the lock stays held if actl crashes while a worker
+  or reviewer is still running.
 * Each task gets one branch (``actl/tN``) and worktree
   (``.actl/worktrees/tN``), created from the latest local base branch (the
   project's configured ``base_branch``, passed in by the caller) the first
   time the task runs and reused by later explicit runs.
 * One noninteractive OpenCode turn runs inside the worktree and its output is
-  streamed into a log file under ``.actl/runs/``.
+  streamed into a log file under ``.actl/runs/``. Validation and review get
+  their own logs in the same directory.
+* The reviewer gets a temporary detached worktree under ``.actl/review/``
+  (see ``add_review_worktree``), so its checkout can never touch the task
+  worktree.
 
-Worktrees, branches, and logs are never deleted: failed or interrupted work is
-preserved for an explicit retry.
+Task worktrees, branches, and logs are never deleted: failed or interrupted
+work is preserved for an explicit retry. The temporary reviewer worktree is
+the one exception; it is removed after the review.
 """
 
 from __future__ import annotations
@@ -29,6 +34,7 @@ from pathlib import Path
 
 LOCK_NAME = "execution.lock"
 WORKTREES_DIR = "worktrees"
+REVIEW_DIR = "review"
 RUNS_DIR = "runs"
 DEFAULT_BASE_CANDIDATES = ("main", "master")
 
@@ -278,21 +284,84 @@ def worktree_has_committed_changes(path: Path, base_branch: str) -> bool:
     )
 
 
-def open_run_log(actl_dir: Path, task_id: int):
-    """Open a new log file for one execution and return ``(path, file)``.
+def head_commit(cwd: Path) -> str:
+    """Return the commit ``HEAD`` points at in ``cwd``."""
+    return _git(cwd, "rev-parse", "HEAD").stdout.strip()
+
+
+def ref_commit(root: Path, ref: str) -> str:
+    """Return the commit a full ref name points at, or raise."""
+    return _git(root, "rev-parse", "--verify", ref).stdout.strip()
+
+
+def merge_base(root: Path, ref_a: str, ref_b: str) -> str:
+    """Return the best common ancestor of two commits/refs."""
+    return _git(root, "merge-base", ref_a, ref_b).stdout.strip()
+
+
+def worktree_tracked_dirty(path: Path) -> str:
+    """Return ``git status --porcelain`` output for tracked files only.
+
+    Untracked files are ignored: they are part of no commit and cannot change
+    what a reviewer sees, while validation tools routinely create caches and
+    reports.
+    """
+    return _git(path, "status", "--porcelain", "--untracked-files=no").stdout
+
+
+def commit_diff(cwd: Path, base_commit: str, commit: str) -> str:
+    """Return the diff from ``base_commit`` to ``commit``."""
+    return _git(cwd, "diff", base_commit, commit).stdout
+
+
+def add_review_worktree(root: Path, path: Path, commit: str) -> None:
+    """Create a detached temporary worktree at ``commit`` for the reviewer."""
+    _git(root, "worktree", "add", "--detach", str(path), commit)
+
+
+def remove_review_worktree(root: Path, path: Path) -> str:
+    """Remove a temporary reviewer worktree; return an error text or "".
+
+    Removal is forced: the reviewer may have left untracked or modified files
+    in its disposable checkout, and those changes are never rolled back into
+    the task worktree. A failure is reported but never blocks a verdict.
+    """
+    proc = _git(root, "worktree", "remove", "--force", str(path), check=False)
+    if proc.returncode == 0:
+        return ""
+    return proc.stderr.strip() or proc.stdout.strip() or "git worktree remove failed"
+
+
+def timestamp() -> str:
+    """Return a UTC timestamp usable in file and worktree names."""
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
+
+
+def open_stage_log(actl_dir: Path, task_id: int, stage):
+    """Open a new log file for one execution stage and return ``(path, file)``.
 
     The name carries a microsecond timestamp and is created exclusively, so a
-    run can never truncate an earlier run's log.
+    run can never truncate an earlier run's log. ``stage`` (for example
+    ``"validation"`` or ``"review"``) is appended to the worker's plain
+    ``tN-<timestamp>.log`` name.
     """
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
-    path = actl_dir / RUNS_DIR / ("t" + str(task_id) + "-" + stamp + ".log")
+    name = "t" + str(task_id) + "-" + timestamp()
+    if stage:
+        name += "-" + stage
+    path = actl_dir / RUNS_DIR / (name + ".log")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         return path, path.open("x", encoding="utf-8")
     except OSError as exc:
         raise ExecutionError(
-            "cannot open the run log " + str(path) + " (" + str(exc) + ")"
+            "cannot open the " + (stage or "run") + " log " + str(path)
+            + " (" + str(exc) + ")"
         )
+
+
+def open_run_log(actl_dir: Path, task_id: int):
+    """Open a new log file for one worker execution and return ``(path, file)``."""
+    return open_stage_log(actl_dir, task_id, None)
 
 
 def worker_prompt(task, worktree: Worktree, base_branch: str) -> str:

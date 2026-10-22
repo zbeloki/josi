@@ -27,6 +27,10 @@ The integration targets the OpenCode v2 CLI (tested with 2.1.2):
   worker (the built-in ``build`` agent) inside a task worktree; a permission
   that would ask the user in a TUI is auto-rejected in a noninteractive run,
   so the worker never blocks on a prompt.
+* ``opencode run ... --format json`` prints the turn as JSONL events instead
+  of a rendered transcript. actl uses this for the reviewer (the built-in
+  read-only ``plan`` agent), so the final message - the structured verdict -
+  can be read back without scraping the rendered output.
 """
 
 from __future__ import annotations
@@ -45,6 +49,11 @@ BINARY = "opencode"
 # such as reading .env files or reaching outside the project directory, which
 # a noninteractive run rejects instead of prompting).
 WORKER_AGENT = "build"
+
+# The built-in read-only agent used for the reviewer: editing and browser
+# tools are denied, so a review cannot change even its own disposable
+# checkout. Shell inspection commands stay available.
+REVIEWER_AGENT = "plan"
 
 
 class OpenCodeError(RuntimeError):
@@ -134,6 +143,8 @@ def run_headless(
     prompt: str,
     output,
     pass_fds=(),
+    agent: str = WORKER_AGENT,
+    output_format: str = None,
 ) -> int:
     """Run one noninteractive OpenCode turn in ``directory``.
 
@@ -141,15 +152,19 @@ def run_headless(
     turn's stdout and stderr are merged so the log keeps the original order.
     ``pass_fds`` are kept open in the OpenCode process - actl passes the
     execution lock file descriptor so the lock outlives an actl crash.
-    Returns OpenCode's exit status.
+    ``agent`` selects the OpenCode agent; ``output_format`` selects the CLI
+    output format (``"json"`` makes the reviewer's final message machine
+    readable). Returns OpenCode's exit status.
     """
     command = [
         binary, "run",
-        "--agent", WORKER_AGENT,
+        "--agent", agent,
         "--model", model,
         "--session", session_id,
-        prompt,
     ]
+    if output_format is not None:
+        command += ["--format", output_format]
+    command.append(prompt)
     try:
         proc = subprocess.run(
             command,

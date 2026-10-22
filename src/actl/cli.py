@@ -2,7 +2,8 @@
 
 Stage 1 commands:
 
-* ``actl init`` - register the current Git repository as an actl project.
+* ``actl init`` - register the current Git repository as an actl project and
+  record its base branch (``--base``, or detected/selected automatically).
 * ``actl plan`` - start or resume the project's single planner session in the
   OpenCode TUI. ``actl plan --new`` starts a fresh session.
 
@@ -260,6 +261,13 @@ def load_project_metadata(root: Path) -> dict:
         )
     if not isinstance(data.get("name"), str):
         raise MetadataError(str(path) + " is missing a valid 'name'")
+    base_branch = data.get("base_branch")
+    if base_branch is not None and (
+        not isinstance(base_branch, str) or not base_branch.strip()
+    ):
+        raise MetadataError(
+            str(path) + " has an invalid 'base_branch' value " + repr(base_branch)
+        )
     return data
 
 
@@ -324,6 +332,111 @@ def _worker_model(metadata: dict) -> str:
             "project metadata has an invalid 'worker_model' value " + repr(model)
         )
     return _parse_worker_model(model)
+
+
+def _validate_explicit_base_branch(root: Path, value: str) -> str:
+    """Validate ``--base`` and return the branch name.
+
+    The branch must be a literal, valid branch name. In a repository that has
+    commits it must also already exist locally; in a repository without
+    commits an intended branch is accepted because it has no ref yet.
+    """
+    branch = value.strip()
+    if not execution.valid_branch_name(root, branch):
+        raise ProjectError(
+            "invalid base branch name " + repr(value)
+            + " (expected a branch name such as 'main' or 'develop')"
+        )
+    if execution.repo_has_commits(root) and not execution.branch_exists(root, branch):
+        raise ProjectError(
+            "base branch '" + branch + "' does not exist in " + str(root)
+            + " (create it first or pick an existing branch)"
+        )
+    return branch
+
+
+def _prompt_for_base_branch(root: Path) -> str:
+    """Ask the user to pick the base branch from the existing branches."""
+    branches = execution.local_branches(root)
+    if len(branches) == 1:
+        return branches[0]
+    if not branches:
+        raise ProjectError(
+            "cannot determine the base branch: the repository has no branches;"
+            " run 'actl init --base <branch>'"
+        )
+    print("The base branch could not be determined automatically.")
+    print("Existing branches:")
+    for index, branch in enumerate(branches, 1):
+        print("  " + str(index) + ") " + branch)
+    while True:
+        try:
+            answer = input("Base branch (number or name): ").strip()
+        except EOFError:
+            raise ProjectError(
+                "cannot determine the base branch; select one with"
+                " 'actl init --base <branch>'"
+            )
+        if answer.isdigit() and 1 <= int(answer) <= len(branches):
+            return branches[int(answer) - 1]
+        if answer in branches:
+            return answer
+        print(
+            "Enter a number between 1 and " + str(len(branches))
+            + ", or one of the branch names above."
+        )
+
+
+def _resolve_new_base_branch(root: Path, requested) -> str:
+    """Choose the base branch for ``init`` when none is stored yet.
+
+    Priority: the explicit ``--base`` argument, the remote default branch
+    (``origin/HEAD``), the single branch among ``main`` and ``master``, then
+    a question listing the existing branches. A repository without commits
+    uses the unborn branch ``HEAD`` points at unless ``--base`` was given.
+    """
+    if requested is not None:
+        return _validate_explicit_base_branch(root, requested)
+    if not execution.repo_has_commits(root):
+        unborn = execution.unborn_branch(root)
+        if unborn is None:
+            raise ProjectError(
+                "cannot determine the base branch of a repository without"
+                " commits (HEAD is not on a branch); run 'actl init --base"
+                " <branch>'"
+            )
+        return unborn
+    detected = execution.detect_base_branch(root)
+    if detected is not None:
+        return detected
+    return _prompt_for_base_branch(root)
+
+
+def _run_base_branch(root: Path, metadata: dict) -> str:
+    """Return the base branch for ``actl task run``.
+
+    A project may predate the stored ``base_branch`` field; such a project
+    keeps working by detecting the branch, without silently writing metadata.
+    """
+    base_branch = metadata.get("base_branch")
+    if base_branch is not None:
+        if not execution.valid_branch_name(root, base_branch):
+            raise ProjectError(
+                "project metadata has an invalid 'base_branch' value "
+                + repr(base_branch)
+            )
+        return base_branch
+    detected = execution.effective_base_branch(root)
+    if detected is None:
+        raise ProjectError(
+            "no base branch is configured for this project and none could be"
+            " detected; run 'actl init --base <branch>'"
+        )
+    print(
+        "Using detected base branch '" + detected
+        + "' (run 'actl init --base <branch>' to configure it)"
+    )
+    return detected
 
 
 def ensure_gitignore(root: Path) -> None:
@@ -392,22 +505,50 @@ def cmd_init(args) -> int:
                 "existing actl metadata is invalid (" + str(exc) + "); "
                 "remove '" + str(actl_dir) + "' and re-run 'actl init'"
             )
+        updates = {}
         if worker_model is not None and metadata.get("worker_model") != worker_model:
-            metadata["worker_model"] = worker_model
+            updates["worker_model"] = worker_model
+        stored_base = metadata.get("base_branch")
+        if args.base is not None:
+            # An explicit --base is the user's decision: it may replace an
+            # earlier selection, but a plain init never does.
+            try:
+                base_branch = _validate_explicit_base_branch(root, args.base)
+            except ProjectError as exc:
+                return _fail(str(exc))
+            if stored_base != base_branch:
+                updates["base_branch"] = base_branch
+        elif stored_base is None:
+            # Projects initialized before base_branch existed gain a
+            # selection once; from then on it is never changed silently.
+            try:
+                updates["base_branch"] = _resolve_new_base_branch(root, None)
+            except ProjectError as exc:
+                return _fail(str(exc))
+        if updates:
+            metadata.update(updates)
             try:
                 _write_metadata(metadata_path, metadata)
             except OSError as exc:
                 return _fail(
                     "could not write " + str(metadata_path) + " (" + str(exc) + ")"
                 )
-            print("Updated the worker model to " + worker_model)
+            if "worker_model" in updates:
+                print("Updated the worker model to " + updates["worker_model"])
+            if "base_branch" in updates:
+                print("Updated the base branch to " + updates["base_branch"])
         else:
             print("actl is already initialized in " + str(root))
     else:
+        try:
+            base_branch = _resolve_new_base_branch(root, args.base)
+        except ProjectError as exc:
+            return _fail(str(exc))
         metadata = {
             "schema_version": SCHEMA_VERSION,
             "name": root.name,
             "created_at": _utc_now(),
+            "base_branch": base_branch,
         }
         if worker_model is not None:
             metadata["worker_model"] = worker_model
@@ -419,6 +560,7 @@ def cmd_init(args) -> int:
                 "could not write " + str(metadata_path) + " (" + str(exc) + ")"
             )
         print("Initialized actl in " + str(root))
+        print("Base branch: " + base_branch)
 
     # Creating the task database here (and again, idempotently, on every task
     # command) is safe: the schema uses CREATE TABLE IF NOT EXISTS, so
@@ -642,13 +784,19 @@ def cmd_task_run(args) -> int:
         root = _project_root()
         metadata = load_project_metadata(root)
         model = _worker_model(metadata)
+        base_branch = _run_base_branch(root, metadata)
         binary = opencode.find_binary()
-    except (ProjectError, tasks.TaskError, opencode.OpenCodeError) as exc:
+    except (
+        ProjectError, tasks.TaskError, execution.ExecutionError,
+        opencode.OpenCodeError,
+    ) as exc:
         return _fail(str(exc))
     actl_dir = root / PROJECT_DIR
     try:
         with execution.lock(actl_dir) as lock_fd:
-            return _execute_task(binary, root, actl_dir, task_id, model, lock_fd)
+            return _execute_task(
+                binary, root, actl_dir, task_id, model, lock_fd, base_branch
+            )
     except (
         ProjectError, tasks.TaskError, sqlite3.Error,
         execution.ExecutionError, opencode.OpenCodeError,
@@ -656,7 +804,7 @@ def cmd_task_run(args) -> int:
         return _fail(str(exc))
 
 
-def _execute_task(binary, root, actl_dir, task_id, model, lock_fd) -> int:
+def _execute_task(binary, root, actl_dir, task_id, model, lock_fd, base_branch) -> int:
     """Run one task while the execution lock is held.
 
     The task is marked RUNNING before the worktree is prepared, so an
@@ -684,7 +832,8 @@ def _execute_task(binary, root, actl_dir, task_id, model, lock_fd) -> int:
         exit_code = None
         try:
             worktree = execution.ensure_worktree(
-                root, actl_dir, task, retry=task.status != tasks.STATUS_PENDING
+                root, actl_dir, task, retry=task.status != tasks.STATUS_PENDING,
+                base_branch=base_branch,
             )
             log.write("branch: " + worktree.branch + "\n")
             log.write("worktree: " + str(worktree.path) + "\n")
@@ -711,9 +860,10 @@ def _execute_task(binary, root, actl_dir, task_id, model, lock_fd) -> int:
             print("Running task t" + str(task.id) + " with model " + model)
             exit_code = opencode.run_headless(
                 binary, worktree.path, session.id, model,
-                execution.worker_prompt(task, worktree), log, pass_fds=(lock_fd,),
+                execution.worker_prompt(task, worktree, base_branch), log,
+                pass_fds=(lock_fd,),
             )
-            status, reason = _evaluate_run(worktree, exit_code)
+            status, reason = _evaluate_run(worktree, exit_code, base_branch)
         except (execution.ExecutionError, opencode.OpenCodeError, OSError) as exc:
             reason = str(exc)
 
@@ -735,7 +885,7 @@ def _execute_task(binary, root, actl_dir, task_id, model, lock_fd) -> int:
     )
 
 
-def _evaluate_run(worktree, exit_code: int):
+def _evaluate_run(worktree, exit_code: int, base_branch: str):
     """Turn a finished worker run into ``(status, reason)``."""
     if exit_code != 0:
         return (
@@ -756,10 +906,10 @@ def _evaluate_run(worktree, exit_code: int):
             "the worker left the worktree dirty (commit or remove the changes"
             " and run the task again)",
         )
-    if not execution.worktree_has_committed_changes(worktree.path):
+    if not execution.worktree_has_committed_changes(worktree.path, base_branch):
         return (
             tasks.STATUS_FAILED,
-            "the worker made no committed changes relative to " + execution.MAIN_BRANCH
+            "the worker made no committed changes relative to " + base_branch
             + " (commit the implementation and run the task again)",
         )
     return tasks.STATUS_IMPLEMENTED, ""
@@ -886,6 +1036,11 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--worker-model", metavar="MODEL",
         help="set the project's worker model (provider/model[#variant])",
+    )
+    init.add_argument(
+        "--base", metavar="BRANCH",
+        help="base branch for task branches (default: detect, or ask when"
+             " ambiguous)",
     )
     plan = subparsers.add_parser(
         "plan", help="start or resume the project's planner session"

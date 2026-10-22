@@ -204,11 +204,15 @@ class ActlTestCase(unittest.TestCase):
 
     # -- helpers ---------------------------------------------------------
 
-    def run_actl(self, *args, cwd=None):
+    def run_actl(self, *args, cwd=None, input_text=""):
+        # ``input_text`` defaults to empty but never None: stdin is always a
+        # pipe that immediately reaches EOF, so an unexpected interactive
+        # prompt fails the test instead of hanging on the terminal.
         return subprocess.run(
             [sys.executable, "-m", "actl", *args],
             cwd=str(cwd or self.repo),
             env=self.env,
+            input=input_text,
             capture_output=True,
             text=True,
         )
@@ -295,6 +299,13 @@ class InitTests(ActlTestCase):
         self.assertEqual(metadata["schema_version"], 1)
         self.assertEqual(metadata["name"], "repo")
         self.assertIn("created_at", metadata)
+        # A repository without commits stores its unborn HEAD branch.
+        unborn = subprocess.run(
+            ["git", "symbolic-ref", "--short", "HEAD"],
+            cwd=str(self.repo), capture_output=True, text=True, check=True,
+        ).stdout.strip()
+        self.assertEqual(metadata["base_branch"], unborn)
+        self.assertIn("Base branch: " + unborn, result.stdout)
 
         gitignore = (self.repo / ".gitignore").read_text(encoding="utf-8")
         self.assertIn(".actl/", gitignore.splitlines())
@@ -830,6 +841,8 @@ class PlanGuardTests(ActlTestCase):
             json.dumps({}),
             json.dumps({"schema_version": 99, "name": "repo"}),
             json.dumps({"schema_version": 1, "name": 42}),
+            json.dumps({"schema_version": 1, "name": "repo", "base_branch": 42}),
+            json.dumps({"schema_version": 1, "name": "repo", "base_branch": "  "}),
         ]
         for payload in payloads:
             with self.subTest(payload=payload):

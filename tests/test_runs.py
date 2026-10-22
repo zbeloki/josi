@@ -28,10 +28,17 @@ class TaskRunTestCase(ActlTestCase):
 
     def setUp(self):
         super().setUp()
-        self.initialize()
+        self.init_git()
         self.git("symbolic-ref", "HEAD", "refs/heads/main")
+        # Track ``.gitignore`` in the base commit (init would add the entry
+        # itself) so the checkout stays clean for the assertions below.
+        (self.repo / ".gitignore").write_text(".actl/\n", encoding="utf-8")
         (self.repo / "README.md").write_text("base\n", encoding="utf-8")
         self.commit("base commit")
+        # Initialize after the base commit, so ``init`` detects and stores
+        # ``main`` instead of the unborn HEAD of an empty repository.
+        result = self.run_actl("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
         self.base_sha = self.git("rev-parse", "main").stdout.strip()
         result = self.run_actl("init", "--worker-model", "provider/model")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -169,6 +176,24 @@ class RunExecutionTests(TaskRunTestCase):
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.rev("actl/t1~1"), self.rev("main"))
+
+    def test_task_branch_starts_from_the_configured_base_branch(self):
+        # Configure ``develop`` as the base, then let ``main`` advance: the
+        # task branch must start from ``develop``, never from a hardcoded or
+        # newer ``main``.
+        self.git("branch", "develop")
+        result = self.run_actl("init", "--base", "develop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        (self.repo / "later.txt").write_text("later\n", encoding="utf-8")
+        self.commit("later commit on main")
+
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.rev("actl/t1~1"), self.rev("develop"))
+        self.assertEqual(self.rev("develop"), self.base_sha)
+        self.assertNotEqual(self.rev("main"), self.rev("develop"))
+        self.assertIn("Never merge into develop.", self.worker_prompt())
 
     def test_main_branch_and_checkout_are_untouched(self):
         self.make_task()
@@ -439,7 +464,21 @@ class RunFailureTests(TaskRunTestCase):
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("'main' does not exist", result.stderr)
+        self.assertIn("git branch main", result.stderr)
         self.assertEqual(self.task_status(), "FAILED")
+        self.assertFalse(self.worktree().exists())
+
+    def test_invalid_base_branch_in_metadata_is_rejected(self):
+        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
+        metadata["base_branch"] = "main^"
+        self.metadata_path().write_text(
+            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+        )
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid 'base_branch'", result.stderr)
+        self.assertEqual(self.worker_calls(), [])
         self.assertFalse(self.worktree().exists())
 
     def test_first_run_refuses_a_preexisting_branch(self):
@@ -498,6 +537,167 @@ class RunFailureTests(TaskRunTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.worktree().is_dir())
         self.git("merge-base", "--is-ancestor", first_head, "actl/t1")
+
+
+class LegacyProjectTests(TaskRunTestCase):
+    """Projects initialized before ``base_branch`` existed keep working."""
+
+    def strip_base_branch(self):
+        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
+        del metadata["base_branch"]
+        self.metadata_path().write_text(
+            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+        )
+        return self.metadata_path().read_bytes()
+
+    def test_legacy_project_without_base_branch_uses_main(self):
+        before = self.strip_base_branch()
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Using detected base branch 'main'", result.stdout)
+        self.assertEqual(self.rev("actl/t1~1"), self.base_sha)
+        self.assertEqual(self.task_status(), "IMPLEMENTED")
+        # Detection never rewrites the existing configuration by itself.
+        self.assertEqual(self.metadata_path().read_bytes(), before)
+
+    def test_reinit_adds_the_base_branch_to_a_legacy_project(self):
+        self.strip_base_branch()
+        result = self.run_actl("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Updated the base branch to main", result.stdout)
+        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
+        self.assertEqual(metadata["base_branch"], "main")
+        self.assertEqual(metadata["worker_model"], "provider/model")
+        self.assertEqual(metadata["name"], "repo")
+
+    def test_reinit_keeps_an_existing_base_branch(self):
+        before = self.metadata_path().read_bytes()
+        # ``main`` plus ``master`` is ambiguous, but a stored selection wins
+        # and a plain init never changes it.
+        self.git("branch", "master")
+        result = self.run_actl("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already initialized", result.stdout)
+        self.assertEqual(self.metadata_path().read_bytes(), before)
+
+
+@unittest.skipUnless(shutil.which("git"), "git is required")
+class EmptyRepositoryTests(ActlTestCase):
+    """A repository without commits: plan and tasks work, runs refuse."""
+
+    def setUp(self):
+        super().setUp()
+        self.init_git()
+        result = self.run_actl("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
+        unborn = self.git("symbolic-ref", "--short", "HEAD").stdout.strip()
+        self.assertEqual(metadata["base_branch"], unborn)
+        result = self.run_actl("init", "--worker-model", "provider/model")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def git(self, *args, cwd=None, check=True):
+        return subprocess.run(
+            ["git", *args], cwd=str(cwd or self.repo), env=self.env,
+            capture_output=True, text=True, check=check,
+        )
+
+    def make_task(self):
+        result = self.run_actl(
+            "task", "create", "--title", "First task",
+            "--description", "Do the thing.",
+        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def task_status(self):
+        result = self.run_actl("task", "show", "t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for line in result.stdout.splitlines():
+            if line.startswith("status: "):
+                return line.split(": ", 1)[1]
+        self.fail("no status in:\n" + result.stdout)
+
+    def commit_initial(self):
+        (self.repo / "README.md").write_text("initial\n", encoding="utf-8")
+        self.git("add", "-A")
+        self.git(
+            "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "commit", "-m", "Initial commit",
+        )
+
+    def test_initialization_never_creates_a_commit(self):
+        self.assertNotEqual(
+            self.git("rev-parse", "--verify", "HEAD", check=False).returncode, 0
+        )
+
+    def test_plan_and_task_management_work_without_commits(self):
+        self.make_task()
+        listing = self.run_actl("task", "list")
+        self.assertEqual(listing.returncode, 0, listing.stderr)
+        self.assertIn("t1  PENDING  First task", listing.stdout)
+
+        self.env["ACTL_FAKE_SESSION_ID"] = "ses_fakeempty0000000000000001"
+        result = self.run_actl("plan")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Started planner session", result.stdout)
+
+    def test_task_run_refuses_until_the_base_has_a_commit(self):
+        self.make_task()
+        result = self.run_actl("task", "run", "t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("has no commits yet", result.stderr)
+        self.assertIn("git commit --allow-empty", result.stderr)
+        self.assertEqual(self.calls(), [], "no worker session may be created")
+        self.assertFalse((self.repo / ".actl" / "worktrees").exists())
+        self.assertEqual(self.task_status(), "FAILED")
+
+    def test_run_refuses_an_unborn_configured_base_with_guidance(self):
+        self.make_task()
+        result = self.run_actl("init", "--base", "develop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # Nothing was committed: ``develop`` is still an unborn branch.
+        result = self.run_actl("task", "run", "t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("base branch 'develop' has no commits yet", result.stderr)
+        self.assertIn("git checkout -b develop", result.stderr)
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertFalse((self.repo / ".actl" / "worktrees").exists())
+
+    def test_task_run_works_after_the_initial_commit(self):
+        self.make_task()
+        self.commit_initial()
+        result = self.run_actl("task", "run", "t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "IMPLEMENTED")
+        self.assertEqual(
+            self.git("rev-parse", "actl/t1~1").stdout.strip(),
+            self.git("rev-parse", "HEAD").stdout.strip(),
+        )
+
+    def test_configured_base_must_have_commits_before_running(self):
+        self.make_task()
+        result = self.run_actl("init", "--base", "develop")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        # This commits on the unborn HEAD branch, not on ``develop``, so the
+        # configured base still has no commit; the run explains how to
+        # create it.
+        self.commit_initial()
+        result = self.run_actl("task", "run", "t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("branch 'develop' does not exist", result.stderr)
+        self.assertIn("git branch develop", result.stderr)
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertFalse((self.repo / ".actl" / "worktrees").exists())
+
+        self.git("checkout", "-q", "-b", "develop")
+        result = self.run_actl("task", "run", "t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "IMPLEMENTED")
+        self.assertEqual(
+            self.git("rev-parse", "actl/t1~1").stdout.strip(),
+            self.git("rev-parse", "develop").stdout.strip(),
+        )
 
 
 class DependencyTests(TaskRunTestCase):

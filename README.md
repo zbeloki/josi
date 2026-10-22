@@ -36,6 +36,10 @@ actl task run t1   # execute a task with the worker
   Running it again is harmless. It also checks that OpenCode is installed.
   `actl init --worker-model MODEL` sets (or updates) the project's worker
   model, for example `actl init --worker-model openrouter/anthropic/claude-sonnet-latest`.
+  `actl init --base BRANCH` sets the base branch that task branches are
+  created from; without it the branch is detected, and when the choice is
+  ambiguous actl asks. It works in repositories without commits, where it
+  records the unborn `HEAD` branch and never creates a commit itself.
 - `actl plan` opens the interactive OpenCode TUI from the project root and
   waits for your input - it never sends an initial message. The planner
   instructions live in a dedicated OpenCode custom agent: editing, subagents,
@@ -107,8 +111,9 @@ A run goes through these steps:
 2. The project-wide execution lock is taken. A second `actl task run` in the
    same project refuses immediately while an execution is active.
 3. The task gets a dedicated branch (`actl/t1`) and worktree
-   (`.actl/worktrees/t1`) created from the latest local `main`. They are
-   created the first time the task runs - never at `actl task create`.
+   (`.actl/worktrees/t1`) created from the latest local base branch (the
+   project's configured `base_branch`). They are created the first time the
+   task runs - never at `actl task create`.
 4. OpenCode runs one noninteractive turn inside the worktree with the
    project's worker model and the built-in `build` agent
    (`opencode run --agent build --model MODEL --session ID`).
@@ -117,7 +122,7 @@ A run goes through these steps:
 
 The worker prompt contains the task title, its description, and the worker
 instructions: implement the task, run the relevant checks, commit the changes
-on the branch, keep the worktree clean, and never merge into `main`.
+on the branch, keep the worktree clean, and never merge into the base branch.
 
 The lifecycle is:
 
@@ -127,8 +132,8 @@ PENDING → RUNNING → IMPLEMENTED
 ```
 
 - `IMPLEMENTED` means the worker exited successfully, left a clean task
-  worktree, and left committed changes on the task branch relative to `main`.
-  It does not imply validation or approval.
+  worktree, and left committed changes on the task branch relative to the
+  base branch. It does not imply validation or approval.
 - A task that fails can be retried explicitly with `actl task run <id>`: the
   existing branch and worktree are reused as they are, so earlier commits are
   preserved and the worker continues from there. Nothing is reset, cleaned,
@@ -144,9 +149,10 @@ PENDING → RUNNING → IMPLEMENTED
   preserved worktree.
 - The task is marked `IMPLEMENTED` only when OpenCode exits with status 0,
   the worktree is still on its task branch, the worktree is clean, and the
-  branch has committed changes relative to `main`. A worker that leaves
-  uncommitted or untracked files behind, or commits nothing, is a failure.
-  A retry may finish with previously committed work and no new commit.
+  branch has committed changes relative to the base branch. A worker that
+  leaves uncommitted or untracked files behind, or commits nothing, is a
+  failure. A retry may finish with previously committed work and no new
+  commit.
 
 The worker model is project-level configuration:
 
@@ -159,6 +165,26 @@ It is stored as `worker_model` in `.actl/project.json` (the file may be
 edited directly as well). `actl task run` refuses to start until a model is
 configured, and OpenCode fails the run if the model is not available in the
 worktree.
+
+The base branch is project-level configuration too:
+
+```sh
+actl init --base develop
+```
+
+It is stored as `base_branch` in `.actl/project.json` (the file may be edited
+directly as well). Without `--base`, `actl init` uses the remote default
+branch (`origin/HEAD`) when the matching local branch exists, otherwise
+`main` or `master` when exactly one of them exists; when the choice is
+ambiguous it lists the existing branches and asks. It never assumes the
+currently checked-out branch. In a repository without commits it records the
+unborn branch `HEAD` points at. Task branches are always created from the
+configured base branch, and `actl task run` refuses to run while that branch
+has no commits - create an initial commit first, since `actl init` never
+commits. Re-running `actl init` without `--base` never changes an existing
+selection; a project initialized before `base_branch` existed gains one on
+the next `actl init`, and `actl task run` keeps working by detecting the
+branch without writing metadata.
 
 Every execution writes `.actl/runs/t1-<timestamp>.log`: a short header
 (task, model, branch, worktree, session), the worker transcript, and the
@@ -267,7 +293,7 @@ actl reports an error instead of resuming the wrong session.
 
 ```
 .actl/
-├── project.json    # schema_version, project name, worker_model, created_at
+├── project.json    # schema_version, name, worker_model, base_branch, created_at
 ├── planner.json    # active planner session id, created_at
 ├── tasks.db        # SQLite task database
 ├── execution.lock  # project-wide execution lock (fcntl.flock)
@@ -294,7 +320,10 @@ The Stage 4 tests drive `actl task run` against disposable Git repositories;
 the fake worker can commit, leave a dirty worktree, fail, or keep running
 while the test kills actl, so branch and worktree handling, retries, and the
 execution lock (including the inherited lock descriptor) are all exercised
-without a real model.
+without a real model. Base-branch selection is covered too: `main`/`master`
+detection, feature branches, the ambiguity prompt, explicit `--base`, the
+remote default branch, repositories without commits, and legacy projects
+without a stored `base_branch`.
 
 ## Limitations
 
@@ -320,10 +349,11 @@ without a real model.
   `DONE` after merging.
 - `IMPLEMENTED` only means that the worker exited successfully, left the
   worktree clean, and left committed changes on the task branch relative to
-  `main`. It says nothing about whether the implementation is correct.
+  the base branch. It says nothing about whether the implementation is
+  correct.
 - actl never resets, cleans, rebases, or deletes a task worktree, and it never
-  touches `main`. A task that fails keeps its branch, worktree, and log for an
-  explicit retry.
+  touches the base branch. A task that fails keeps its branch, worktree, and
+  log for an explicit retry.
 - The execution lock covers actl and the OpenCode process it spawns. A
   detached descendant that does not keep the inherited descriptor (for example
   a daemonized helper the worker starts) can outlive the lock; actl keeps no
@@ -336,7 +366,7 @@ without a real model.
   guards stay active. Like the planner, this is not a sandbox - review the
   commits on the task branch before merging anything.
 - The worker prompt asks the worker to commit everything and never merge into
-  `main`, and actl checks afterwards that the worktree is still on its task
-  branch, is clean, and contains committed changes relative to `main`; a
-  worker that ignores the instructions is reported as a failure rather than
-  corrected automatically.
+  the base branch, and actl checks afterwards that the worktree is still on
+  its task branch, is clean, and contains committed changes relative to the
+  base branch; a worker that ignores the instructions is reported as a
+  failure rather than corrected automatically.

@@ -103,7 +103,7 @@ def load_project_metadata(root: Path) -> dict:
         raise MetadataError("missing " + str(path))
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise MetadataError(str(path) + " is not readable JSON (" + str(exc) + ")")
     if not isinstance(data, dict):
         raise MetadataError(str(path) + " must contain a JSON object")
@@ -124,7 +124,7 @@ def load_planner_session_id(root: Path):
         return None
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, json.JSONDecodeError) as exc:
+    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
         raise MetadataError(str(path) + " is not readable JSON (" + str(exc) + ")")
     session_id = data.get("session_id") if isinstance(data, dict) else None
     if not isinstance(session_id, str) or not session_id.startswith("ses"):
@@ -135,22 +135,31 @@ def load_planner_session_id(root: Path):
 def save_planner_session_id(root: Path, session_id: str) -> None:
     path = root / PROJECT_DIR / PLANNER_STATE
     payload = {"session_id": session_id, "created_at": _utc_now()}
-    path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    try:
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise MetadataError(
+            "could not save the planner session state " + str(path)
+            + " (" + str(exc) + ")"
+        )
 
 
 def ensure_gitignore(root: Path) -> None:
-    """Make sure ``.actl/`` is ignored, without touching existing content."""
+    """Make sure ``.actl/`` is ignored, preserving existing bytes exactly."""
     path = root / ".gitignore"
-    entry = GITIGNORE_ENTRY
-    if path.exists():
-        content = path.read_text(encoding="utf-8")
-        lines = [line.strip() for line in content.splitlines()]
-        if entry in lines or entry.rstrip("/") in lines:
-            return
-        separator = "" if content == "" or content.endswith("\n") else "\n"
-        path.write_text(content + separator + entry + "\n", encoding="utf-8")
-    else:
-        path.write_text(entry + "\n", encoding="utf-8")
+    entry = GITIGNORE_ENTRY.encode("utf-8")
+    try:
+        if path.exists():
+            content = path.read_bytes()
+            lines = [line.strip() for line in content.splitlines()]
+            if entry in lines or entry.rstrip(b"/") in lines:
+                return
+            separator = b"" if content == b"" or content.endswith(b"\n") else b"\n"
+            path.write_bytes(content + separator + entry + b"\n")
+        else:
+            path.write_bytes(entry + b"\n")
+    except OSError as exc:
+        raise ProjectError("could not update " + str(path) + " (" + str(exc) + ")")
 
 
 def ensure_planner_agent(root: Path) -> str:
@@ -197,18 +206,44 @@ def cmd_init(_args) -> int:
             )
         print("actl is already initialized in " + str(root))
     else:
-        actl_dir.mkdir(parents=True, exist_ok=True)
         metadata = {
             "schema_version": SCHEMA_VERSION,
             "name": root.name,
             "created_at": _utc_now(),
         }
-        metadata_path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
+        try:
+            actl_dir.mkdir(parents=True, exist_ok=True)
+            metadata_path.write_text(
+                json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+            )
+        except OSError as exc:
+            return _fail(
+                "could not write " + str(metadata_path) + " (" + str(exc) + ")"
+            )
         print("Initialized actl in " + str(root))
 
-    ensure_gitignore(root)
+    try:
+        ensure_gitignore(root)
+    except ProjectError as exc:
+        return _fail(str(exc))
     print("Next step: run 'actl plan' to start a planning session.")
     return 0
+
+
+def _select_planner_agent(binary: str, root: Path, session: opencode.Session) -> None:
+    """Switch ``session`` to the planner agent when it is not already selected.
+
+    Raises :class:`ProjectError` when the agent cannot be selected.
+    """
+    if session.agent == PLANNER_AGENT_NAME:
+        return
+    try:
+        opencode.switch_agent(binary, root, session.id, PLANNER_AGENT_NAME)
+    except opencode.OpenCodeError as exc:
+        raise ProjectError(
+            "cannot select the planner agent for session '"
+            + session.id + "': " + str(exc)
+        )
 
 
 def cmd_plan(args) -> int:
@@ -257,14 +292,10 @@ def cmd_plan(args) -> int:
                 "cannot verify planner session '" + session_id + "': " + str(exc) + "; "
                 "run 'actl plan --new' to start a fresh session"
             )
-        if session.agent != PLANNER_AGENT_NAME:
-            try:
-                opencode.switch_agent(binary, root, session.id, PLANNER_AGENT_NAME)
-            except opencode.OpenCodeError as exc:
-                return _fail(
-                    "cannot select the planner agent for session '"
-                    + session.id + "': " + str(exc)
-                )
+        try:
+            _select_planner_agent(binary, root, session)
+        except ProjectError as exc:
+            return _fail(str(exc))
         print(
             "Resuming planner session " + session.id
             + " (agent: " + PLANNER_AGENT_NAME + ") in " + str(root)
@@ -277,7 +308,11 @@ def cmd_plan(args) -> int:
         )
     except opencode.OpenCodeError as exc:
         return _fail("could not create an OpenCode session: " + str(exc))
-    save_planner_session_id(root, session.id)
+    try:
+        _select_planner_agent(binary, root, session)
+        save_planner_session_id(root, session.id)
+    except ProjectError as exc:
+        return _fail(str(exc))
     print(
         "Started planner session " + session.id
         + " (agent: " + PLANNER_AGENT_NAME + ") in " + str(root)

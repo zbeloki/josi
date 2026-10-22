@@ -151,7 +151,15 @@ def _parse_session(payload, context: str) -> Session:
         )
     location = data.get("location")
     directory = location.get("directory") if isinstance(location, dict) else None
+    if directory is not None and not isinstance(directory, str):
+        raise OpenCodeError(
+            "unexpected session directory while " + context + ": " + repr(directory)
+        )
     agent = data.get("agent")
+    if agent is not None and not isinstance(agent, str):
+        raise OpenCodeError(
+            "unexpected session agent while " + context + ": " + repr(agent)
+        )
     return Session(id=session_id, directory=directory or "", agent=agent or "")
 
 

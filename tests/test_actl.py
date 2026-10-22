@@ -27,11 +27,13 @@ FAKE_OPENCODE = '''#!python
 
 Behaviour is controlled through environment variables:
 
-* ``ACTL_FAKE_LOG``         - JSONL file receiving {"argv": [...], "cwd": ...}
-* ``ACTL_FAKE_SESSION_ID``  - session id returned when creating a session
-* ``ACTL_FAKE_CREATE_EXIT`` - non-zero to make session creation fail
-* ``ACTL_FAKE_CREATE_DIR``  - override the reported session directory on create
-* ``ACTL_FAKE_GET_EXIT``    - non-zero to make session lookup fail
+* ``ACTL_FAKE_LOG``             - JSONL file receiving {"argv": [...], "cwd": ...}
+* ``ACTL_FAKE_SESSION_ID``      - session id returned when creating a session
+* ``ACTL_FAKE_CREATE_EXIT``     - non-zero to make session creation fail
+* ``ACTL_FAKE_CREATE_DIR``      - override the reported session directory on create
+* ``ACTL_FAKE_CREATE_LOCATION`` - raw JSON for the reported session `location`
+* ``ACTL_FAKE_CREATE_AGENT``    - override the agent reported by session creation
+* ``ACTL_FAKE_GET_EXIT``        - non-zero to make session lookup fail
 * ``ACTL_FAKE_GET_DIR``     - override the reported session directory on lookup
 * ``ACTL_FAKE_GET_AGENT``   - agent reported by session lookup
 * ``ACTL_FAKE_SWITCH_EXIT`` - non-zero to make agent switching fail
@@ -66,17 +68,22 @@ def main():
             body = {}
             if "--data" in argv:
                 body = json.loads(argv[argv.index("--data") + 1])
-            directory = (
-                os.environ.get("ACTL_FAKE_CREATE_DIR")
-                or body.get("location", {}).get("directory")
-                or os.getcwd()
-            )
+            if "ACTL_FAKE_CREATE_LOCATION" in os.environ:
+                location = json.loads(os.environ["ACTL_FAKE_CREATE_LOCATION"])
+            else:
+                directory = (
+                    os.environ.get("ACTL_FAKE_CREATE_DIR")
+                    or body.get("location", {}).get("directory")
+                    or os.getcwd()
+                )
+                location = {"directory": directory}
             session_id = os.environ.get(
                 "ACTL_FAKE_SESSION_ID", "ses_fake0000000000000000000"
             )
+            agent = os.environ.get("ACTL_FAKE_CREATE_AGENT") or body.get("agent")
             print(json.dumps({"data": {"id": session_id,
-                                       "agent": body.get("agent"),
-                                       "location": {"directory": directory}}}))
+                                       "agent": agent,
+                                       "location": location}}))
             return 0
 
         if method == "POST" and path.startswith("/api/session/") and path.endswith("/agent"):
@@ -243,6 +250,38 @@ class InitTests(ActlTestCase):
             (self.repo / ".gitignore").read_text(encoding="utf-8").splitlines(),
             [".actl/"],
         )
+
+    def test_init_preserves_gitignore_bytes_and_crlf(self):
+        before = b"# Windows project\r\nbuild/\r\n"
+        (self.repo / ".gitignore").write_bytes(before)
+        self.initialize()
+        self.assertEqual(
+            (self.repo / ".gitignore").read_bytes(), before + b".actl/\n"
+        )
+
+    def test_init_gitignore_with_non_utf8_bytes(self):
+        before = b"\xff\xfe legacy\n"
+        (self.repo / ".gitignore").write_bytes(before)
+        self.initialize()
+        self.assertEqual(
+            (self.repo / ".gitignore").read_bytes(), before + b".actl/\n"
+        )
+
+    def test_init_reports_metadata_write_failure(self):
+        self.init_git()
+        (self.repo / ".actl").write_text("not a directory", encoding="utf-8")
+        result = self.run_actl("init")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".actl", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_init_reports_gitignore_read_failure(self):
+        self.init_git()
+        (self.repo / ".gitignore").mkdir()
+        result = self.run_actl("init")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn(".gitignore", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
 
     def test_init_fails_when_opencode_is_missing(self):
         if shutil.which("opencode", path=MINIMAL_PATH):
@@ -513,6 +552,54 @@ class PlanTests(ActlTestCase):
         self.assertIn("--new", result.stderr)
         self.assertEqual(self.tui_calls(), [])
 
+    def test_plan_with_undecodable_planner_state(self):
+        self.planner_path().write_bytes(b"\xff\xfe")
+        result = self.run_actl("plan")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot resume the planner session", result.stderr)
+        self.assertIn("--new", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(self.tui_calls(), [])
+
+    def test_plan_new_ignores_undecodable_state(self):
+        self.planner_path().write_bytes(b"\xff\xfe")
+        result = self.run_actl("plan", "--new")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+    def test_plan_reports_state_write_failure(self):
+        self.planner_path().mkdir()
+        result = self.run_actl("plan", "--new")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not save the planner session state", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(
+            self.tui_calls(), [], "the TUI must not launch without a saved session"
+        )
+
+    def test_plan_rejects_malformed_session_location(self):
+        self.env["ACTL_FAKE_CREATE_LOCATION"] = json.dumps({"directory": ["bad"]})
+        result = self.run_actl("plan")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("unexpected session directory", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertFalse(self.planner_path().exists())
+        self.assertEqual(self.tui_calls(), [])
+
+    def test_plan_switches_agent_on_new_session_when_needed(self):
+        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000014"
+        self.env["ACTL_FAKE_CREATE_AGENT"] = "build"
+        result = self.run_actl("plan")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        switches = self.switch_calls()
+        self.assertEqual(len(switches), 1)
+        argv = switches[0]["argv"]
+        self.assertEqual(argv[2], "/api/session/ses_faketest0000000000000014/agent")
+        self.assertEqual(
+            json.loads(argv[argv.index("--data") + 1]), {"agent": PLANNER_AGENT_NAME}
+        )
+        self.assertEqual(self.planner_session_id(), "ses_faketest0000000000000014")
+        self.assertEqual(len(self.tui_calls()), 1)
+
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
 class PlanGuardTests(ActlTestCase):
@@ -551,6 +638,16 @@ class PlanGuardTests(ActlTestCase):
                 self.assertIn("invalid actl project metadata", result.stderr)
                 self.assertEqual(self.calls(), [])
                 self.assertFalse((self.repo / ".opencode").exists())
+
+    def test_plan_with_undecodable_metadata(self):
+        self.init_git()
+        (self.repo / ".actl").mkdir()
+        (self.repo / ".actl" / "project.json").write_bytes(b"\xff\xfe")
+        result = self.run_actl("plan")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid actl project metadata", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(self.calls(), [])
 
     def test_plan_outside_git_repository(self):
         outside = self.base / "outside"

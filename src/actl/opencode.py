@@ -1,0 +1,155 @@
+"""Minimal wrapper around the OpenCode CLI.
+
+actl delegates everything session-related to OpenCode: OpenCode owns the
+session store, the conversation transcripts, and the interactive TUI. actl
+only creates a project-scoped session, verifies where an existing session
+lives, and launches the TUI against it.
+
+The integration targets the OpenCode v2 CLI (tested with 2.1.2):
+
+* ``opencode api POST /api/session --data {...}`` creates a session at an
+  explicit location (``{"location": {"directory": "<project root>"}}``) and
+  returns the generated session ID. Creating the session explicitly is
+  necessary because the TUI creates sessions lazily and would otherwise
+  generate an ID actl cannot capture.
+* ``opencode api GET /api/session/<id>`` returns session metadata, including
+  the directory the session belongs to, so actl can refuse to resume a
+  session that does not belong to the project.
+* ``opencode <directory> --session <id> [--prompt <text>]`` opens the
+  interactive TUI, resuming the given session and sending the prompt as the
+  first message when one is given.
+"""
+
+from __future__ import annotations
+
+import json
+import os
+import shutil
+import subprocess
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Optional
+
+BINARY = "opencode"
+
+
+class OpenCodeError(RuntimeError):
+    """Raised when OpenCode is unavailable, fails, or returns bad data."""
+
+
+@dataclass(frozen=True)
+class Session:
+    """A session as reported by OpenCode."""
+
+    id: str
+    directory: str
+
+
+def find_binary() -> str:
+    """Return the path of the OpenCode executable, or raise OpenCodeError."""
+    path = shutil.which(BINARY)
+    if path is None:
+        raise OpenCodeError(
+            "OpenCode is not installed or not on PATH (no 'opencode' executable found)"
+        )
+    return path
+
+
+def create_session(binary: str, project_root: Path, title: str) -> Session:
+    """Create a new empty session located at ``project_root``."""
+    root = _realpath(project_root)
+    payload = _api(
+        binary,
+        project_root,
+        "POST",
+        "/api/session",
+        {"title": title, "location": {"directory": root}},
+    )
+    session = _parse_session(payload, "creating an OpenCode session")
+    _require_location(session, root)
+    return session
+
+
+def get_session(binary: str, project_root: Path, session_id: str) -> Session:
+    """Return session metadata, verifying that it belongs to ``project_root``."""
+    root = _realpath(project_root)
+    payload = _api(binary, project_root, "GET", "/api/session/" + session_id)
+    session = _parse_session(payload, "loading OpenCode session " + repr(session_id))
+    if session.id != session_id:
+        raise OpenCodeError(
+            "OpenCode returned session " + repr(session.id)
+            + " instead of the requested " + repr(session_id)
+        )
+    _require_location(session, root)
+    return session
+
+
+def launch_tui(
+    binary: str,
+    project_root: Path,
+    session_id: str,
+    prompt: Optional[str] = None,
+) -> int:
+    """Launch the interactive OpenCode TUI on ``session_id`` and return its exit code."""
+    command = [binary, str(project_root), "--session", session_id]
+    if prompt is not None:
+        command += ["--prompt", prompt]
+    try:
+        return subprocess.run(command, cwd=str(project_root)).returncode
+    except OSError as exc:
+        raise OpenCodeError("could not launch OpenCode: " + str(exc)) from exc
+
+
+def _realpath(path: Path) -> str:
+    return os.path.realpath(str(path))
+
+
+def _api(binary: str, cwd: Path, method: str, path: str, body=None):
+    command = [binary, "api", method, path]
+    if body is not None:
+        command += ["--data", json.dumps(body)]
+    try:
+        proc = subprocess.run(
+            command, cwd=str(cwd), capture_output=True, text=True
+        )
+    except OSError as exc:
+        raise OpenCodeError("could not run OpenCode: " + str(exc)) from exc
+    if proc.returncode != 0:
+        detail = proc.stderr.strip() or proc.stdout.strip() or "no output"
+        raise OpenCodeError(
+            "OpenCode request " + method + " " + path + " failed: " + detail
+        )
+    try:
+        return json.loads(proc.stdout)
+    except json.JSONDecodeError as exc:
+        output = proc.stdout.strip()
+        if len(output) > 200:
+            output = output[:200] + "..."
+        raise OpenCodeError(
+            "OpenCode returned unexpected output for "
+            + method + " " + path + ": " + repr(output)
+        ) from exc
+
+
+def _parse_session(payload, context: str) -> Session:
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        raise OpenCodeError("unexpected OpenCode response while " + context)
+    session_id = data.get("id")
+    if not isinstance(session_id, str) or not session_id.startswith("ses"):
+        raise OpenCodeError(
+            "unexpected OpenCode session id while " + context + ": " + repr(session_id)
+        )
+    location = data.get("location")
+    directory = location.get("directory") if isinstance(location, dict) else None
+    return Session(id=session_id, directory=directory or "")
+
+
+def _require_location(session: Session, expected_root: str) -> None:
+    actual = os.path.realpath(session.directory) if session.directory else ""
+    if actual != expected_root:
+        where = repr(session.directory) if session.directory else "an unknown location"
+        raise OpenCodeError(
+            "session " + repr(session.id) + " belongs to "
+            + where + ", not to " + repr(expected_root)
+        )

@@ -8,9 +8,10 @@ with a noninteractive OpenCode worker in an isolated Git worktree; Stage 5
 validates the worker's commit with project-configured commands and has an
 independent reviewer approve or reject it; Stage 6 repairs rejected
 implementations automatically with up to three worker attempts and escalates
-to a stronger model on the last one; Stage 7 fast-forwards the approved
-commit into the configured base branch and executes several tasks
-sequentially in dependency order.
+to a stronger model on the last one; Stage 7 executes several tasks
+sequentially inside one **run**: every approved task is staged into the run
+branch, and one explicit `actl run merge` fast-forwards the whole run into the
+configured base branch and marks its tasks `DONE`.
 
 ## Requirements
 
@@ -34,9 +35,12 @@ actl init                   # register the Git repository as an actl project
 actl plan                   # start (or resume) the planner; it can manage tasks
 actl plan --new             # start a fresh planner session
 actl task list              # list the project's tasks
-actl task run t1            # run one task: worker, validation, review, merge
+actl task run t1            # run a task: worker, validation, review, staging
 actl task run t1 t2 t3      # run tasks sequentially in the given order
 actl task run --all         # run every eligible task in dependency order
+actl run list               # list runs and their statuses
+actl run show r1            # show one run, its commits, and its tasks
+actl run merge r1           # integrate a completed run into the base branch
 ```
 
 - `actl init` requires a Git repository, creates `.actl/project.json`, and adds
@@ -99,9 +103,11 @@ actl task delete t2
   that other tasks depend on is refused until those dependents are deleted.
 - A task is blocked when a dependency is unfinished; blockedness is derived
   from dependencies instead of being stored as a separate status, and
-  `actl task run` refuses blocked tasks. A dependency is satisfied only by
-  `DONE`, which means the dependency's approved commit was integrated into
-  the base branch; `APPROVED` alone does not unlock dependents.
+  `actl task run` refuses blocked tasks. A dependency is satisfied by `DONE`
+  (its approved commit was integrated into the base branch) or by `STAGED` in
+  the run the dependent is currently executing in (its approved commit is
+  already part of the same run branch). `APPROVED` and `STAGED` in another
+  run do not unlock dependents.
 - The database is created automatically when needed, including for projects
   initialized by Stage 1. Repeated `actl init` runs and task commands never
   reset existing tasks.
@@ -112,120 +118,168 @@ actl task delete t2
 
 ## Running tasks
 
-`actl task run` executes tasks end to end: a noninteractive OpenCode worker
-implements each one in an isolated Git worktree, the project's validation
-commands run on the worker's commit, an independent reviewer approves or
-rejects that exact commit, and the approved commit is fast-forwarded into
-the configured base branch, which marks the task `DONE`. A failed validation
+`actl task run` executes tasks end to end inside a **run**: a noninteractive
+OpenCode worker implements each task in an isolated Git worktree, the
+project's validation commands run on the worker's commit, an independent
+reviewer approves or rejects that exact commit, and the approved commit is
+fast-forwarded into the run branch, which marks the task `STAGED`. The
+configured base branch is never touched during execution; `actl run merge`
+integrates the whole run later and marks its tasks `DONE`. A failed validation
 command or a reviewer rejection with critical or major findings triggers an
 automatic repair: actl runs up to three worker attempts in all and escalates
 the last one to a stronger model.
 
 ```sh
-actl task run t1          # one task: worker, validation, review, and merge
+actl task run t1          # one task: worker, validation, review, and staging
 actl task run t1 t2 t3    # the listed tasks, sequentially, in that order
 actl task run --all       # every eligible task, in dependency order
+actl run merge r1         # integrate the completed run into the base branch
 ```
 
-One run of one task goes through these steps:
+One run goes through these steps:
 
 1. The project must be initialized with a reviewer model and an escalation
-   worker model, and the task must exist, be runnable, and have only `DONE`
-   dependencies. A run that starts the worker also needs the worker model;
-   without a reviewer or escalation model the run refuses before any lock,
+   worker model, and the task must exist, be runnable, and have all its
+   dependencies satisfied (`DONE`, or `STAGED` in the run being executed). A
+   task that starts the worker also needs the worker model; without a
+   reviewer or escalation model the command refuses before any lock,
    worktree, or task change.
 2. The project-wide execution lock is taken. A second `actl task run` in the
    same project refuses immediately while an execution is active, whether it
    is another single task or a multi-task batch.
-3. The task gets a dedicated branch (`actl/t1`) and worktree
-   (`.actl/worktrees/t1`) created from the latest local base branch (the
-   project's configured `base_branch`). They are created the first time the
-   task runs - never at `actl task create`.
-4. OpenCode runs one noninteractive turn inside the worktree with the
+3. The batch creates one run before its first task executes: branch
+   `actl/run/r1` and worktree `.actl/run-worktrees/r1`, starting at the
+   current commit of the project's configured `base_branch`. An interrupted
+   execution that left its run `RUNNING` is resumed instead, so staged tasks
+   stay in the same run. Only one run executes at a time, and the same run
+   serves every task of the batch.
+4. Each task gets a dedicated branch (`actl/t1`) and worktree
+   (`.actl/worktrees/t1`) created from the **run branch**, never directly
+   from the base branch, so a task starts from the previous staged task's
+   result. They are created the first time the task runs in this run - never
+   at `actl task create`.
+5. OpenCode runs one noninteractive turn inside the worktree with the
    project's worker model and the built-in `build` agent
    (`opencode run --agent build --model MODEL --session ID`). A repair
    attempt uses the escalation model on the third attempt and carries the
    previous failure as feedback; the worker continues on the same branch and
    actl never resets the branch or discards earlier commits.
-5. The worker's complete stdout and stderr are written straight into a log
+6. The worker's complete stdout and stderr are written straight into a log
    file under `.actl/runs/` while it runs; the log path is printed when the
    worker starts, so the run can be followed with `tail -f <logfile>`.
-6. After the worker succeeds, the configured validation commands run in the
+7. After the worker succeeds, the configured validation commands run in the
    task worktree (see below) and an independent reviewer examines the
    validated commit in a temporary worktree.
-7. An approval marks the task `APPROVED` and actl integrates it: the base
-   branch is fast-forwarded to the exact validated and approved commit (see
-   below). A failed validation command or a rejection with critical or major
-   findings starts the next worker attempt in the same branch and worktree,
-   with the failure as feedback; when all three attempts are used the task
-   ends `NEEDS_HUMAN`.
-8. Only after the fast-forward merge succeeded is the task marked `DONE`.
-   DONE means the task's approved commit is part of the configured base
-   branch; it is never recorded before the integration, and a task that is
-   already DONE is not executed again.
+8. An approval marks the task `APPROVED` and actl stages it: the exact
+   validated and approved commit is fast-forwarded into the run branch (see
+   below) and the task becomes `STAGED`. A failed validation command or a
+   rejection with critical or major findings starts the next worker attempt
+   in the same branch and worktree, with the failure as feedback; when all
+   three attempts are used the task ends `NEEDS_HUMAN`.
+9. Only after the run is integrated into the base branch with
+   `actl run merge` is a staged task marked `DONE`. DONE means the task's
+   approved commit is part of the configured base branch; it is never
+   recorded while the task is merely staged, and a task that is already DONE
+   is not executed again.
 
 `actl task run t1` after an earlier approval does not repeat any of the
 expensive work either: when the task is already `APPROVED`, actl skips the
-worker, validation, and review and attempts the integration directly with
-the recorded approved commit.
+worker, validation, and review and attempts to stage the recorded approved
+commit into the run.
 
 The terminal shows only actl's own timestamped events - task, models,
 worktree preparation, worker start, worker exit code, validation start and
-result, reviewer start and verdict, the fast-forward merge, and the final
-task status - plus the log paths. Transcripts and validation output never
-reach the terminal. A multi-task run prints a final summary of the completed
-tasks and of the task that stopped it, if any.
+result, reviewer start and verdict, the staging merge, and the final task
+status - plus the log paths and the final reminder with the `actl run merge`
+command. Transcripts and validation output never reach the terminal. A
+multi-task run prints a final summary of the completed tasks and of the task
+that stopped it, if any.
 
-### Automatic integration
+### Staging into the run branch
 
-Reaching `APPROVED` immediately integrates the task. actl merges only the
-exact commit the reviewer approved:
+Reaching `APPROVED` immediately stages the task into its run branch. actl
+merges only the exact commit the reviewer approved:
 
 - The approved commit comes from the recorded review. The task branch must
   still point at it; if the branch moved, nothing is merged.
-- The configured base branch must exist, and the worktree that has it
-  checked out must be clean (no uncommitted or untracked changes). When no
-  worktree has the base branch checked out, actl uses a temporary worktree
-  under `.actl/integrate/` for the merge and removes it afterwards.
+- The run branch must exist, and its worktree must be clean (no uncommitted
+  or untracked changes).
 - The merge is `git merge --ff-only --no-squash --no-overwrite-ignore`:
-  actl never force-pushes, resets, rebases, squashes, or overwrites the
-  base branch, and it never resolves conflicts. When a fast-forward is
-  impossible - the base branch advanced with its own commits, or the branch
-  moved after approval - actl stops and reports the problem instead of
-  changing anything; the merge is likewise refused when it would replace an
-  ignored local file in the base worktree. After the merge, the base branch
-  must really contain the approved commit before the task is reported as
-  integrated.
-- An integration failure keeps the task `APPROVED`, so its branch, worktree,
-  and approval are preserved. Resolving the problem (checking out the base
-  branch, committing or removing local changes) and rerunning
-  `actl task run <id>` merges the same approved commit without rerunning
+  actl never force-pushes, resets, rebases, or squashes. When a fast-forward
+  is impossible, actl stops and reports the problem instead of changing
+  anything. After the merge, the run branch must really contain the approved
+  commit before the task is reported as staged.
+- A staging failure keeps the task `APPROVED`, so its branch, worktree, and
+  approval are preserved. Resolving the problem and rerunning
+  `actl task run <id>` stages the same approved commit without rerunning
   the worker, validation, or review.
-- If Git integration succeeds but recording `DONE` fails (for example
+- If the staging merge succeeds but recording `STAGED` fails (for example
   because actl is interrupted in between), the task stays `APPROVED`; the
-  retry recognizes the completed merge and only records `DONE`. The worker
+  retry recognizes the completed merge and only records `STAGED`. The worker
   is never rerun and no new implementation is created.
+
+### Integrating a run
+
+`actl run merge r1` fast-forwards a completed run into the configured base
+branch and transitions its `STAGED` tasks to `DONE`. The command is
+idempotent and detects a manual integration:
+
+- The run must be `COMPLETE` (execution stopped - a failed batch is complete
+  too, so its staged work can be integrated explicitly) and its branch must
+  still point at the recorded final commit.
+- If the recorded final commit is already an ancestor of the base branch -
+  the user merged the run by hand, with or without a merge commit, or the
+  command is repeated - the Git merge is skipped and only the statuses are
+  finalized.
+- Otherwise the run branch is fast-forwarded into the base branch with
+  `git merge --ff-only --no-squash --no-overwrite-ignore`, in the worktree
+  that has the base branch checked out (or a temporary worktree under
+  `.actl/integrate/` when none has it). The base branch must be clean, and
+  an ignored local file is never silently overwritten.
+- When a fast-forward is impossible (the base branch advanced with its own
+  commits), nothing changes: the run stays `COMPLETE`, its tasks stay
+  `STAGED`, and the command explains the manual Git integration. After the
+  user resolves the merge by hand and commits it, rerunning the same command
+  detects the integration and finalizes the statuses.
+- Squash merges and cherry-picks are not detected automatically; integrate
+  the run with a normal merge or fast-forward.
+- STAGED tasks are marked DONE only here. A task that is merely staged is
+  never reported as DONE.
+
+```sh
+actl run list      # r1  COMPLETE  actl/run/r1  t1, t2
+actl run show r1   # status, branch, commits, and each associated task
+actl run merge r1  # fast-forward the run, then STAGED -> DONE
+```
+
+Runs only ever fast-forward. actl never merges the run branch automatically:
+even a successful batch stops with a reminder such as
+
+```text
+[14:05] Run r1 finished with 2 staged tasks; integrate it with 'actl run merge r1'
+```
 
 ### Multiple tasks
 
 `actl task run t1 t2 t3` executes the listed tasks sequentially in exactly
 that order; actl never reorders the list. Dependencies are checked for each
 task when its turn comes, so a task may depend on an earlier task of the
-same list - by the time it is reached, that task has become `DONE`.
-Execution stops immediately at the first task that cannot complete: the
-tasks completed before it stay `DONE`, and the remaining listed tasks are
-left untouched.
+same list - by the time it is reached, that task has become `STAGED` in the
+same run. Execution stops immediately at the first task that cannot complete:
+the tasks staged before it stay staged in the run branch, and the remaining
+listed tasks are left untouched.
 
 `actl task run --all` selects every eligible task and executes them one at a
 time in dependency order:
 
 - A task is eligible when its status is one the single-task flow accepts:
   `PENDING`, `RUNNING`, `IMPLEMENTED`, `FAILED`, `NEEDS_CHANGES`, or
-  `APPROVED`. `DONE` tasks are already integrated, and `NEEDS_HUMAN` tasks
-  require a human, so neither is selected automatically.
-- Among the tasks whose dependencies are all `DONE`, the one with the
-  smallest id runs first; the task list is re-read after every task, so a
-  finished task immediately unlocks its dependents. Independent tasks
+  `APPROVED`. `STAGED` tasks are already in a run branch, `DONE` tasks are
+  already integrated, and `NEEDS_HUMAN` tasks require a human, so none of
+  them is selected automatically.
+- Among the tasks whose dependencies are satisfied, the one with the smallest
+  id runs first; the task list is re-read after every task, so a staged task
+  immediately unlocks its dependents in the same run. Independent tasks
   therefore run in id order.
 - A task whose dependencies stay unfinished never executes. When no selected
   task is ready, actl reports the blocked tasks and their unfinished
@@ -233,39 +287,68 @@ time in dependency order:
 
 Any task that fails to complete - a worker or reviewer infrastructure
 failure, an exhausted repair budget, human intervention being required, a
-refused or failed merge, or an unexpected state - stops the batch
-immediately. The remaining tasks are left as they are, the failing task is
-reported, and the command exits non-zero; actl never retries a task that
-already needs a human.
+refused or failed staging, or an unexpected state - stops the batch
+immediately. The run branch, task worktrees, logs, and the already staged
+work are preserved; the run is marked `COMPLETE` with the preserved tasks
+still `STAGED`, the failing task is reported, and the command exits
+non-zero. actl never automatically integrates a partially completed run:
+either rerun the remaining work, or integrate the staged tasks explicitly
+with `actl run merge r1`.
+
+Only one unfinished, unmerged run may exist. A completed run that still holds
+`STAGED` tasks must be integrated with `actl run merge` before a new run can
+start, even when its staged tasks have no unfinished dependents; a run that
+stopped before staging anything (a worker or reviewer infrastructure failure)
+does not block a retry. When a task depends on a task that is `STAGED` in
+another run, actl refuses with the exact command that fixes it:
+
+```text
+Cannot execute task t5.
+
+Dependency t3 is STAGED in run r1 and must be
+marked DONE before this task can execute.
+
+Run:
+    actl run merge r1
+
+If you already merged r1 manually, execute the
+same command to finalize its status.
+```
 
 The worker prompt contains the task title, its description, and the worker
 instructions: implement the task, run the relevant checks, commit the changes
-on the branch, keep the worktree clean, and never merge into the base branch.
+on the branch, keep the worktree clean, and never merge into the run branch.
 
 The lifecycle is:
 
 ```text
-PENDING → RUNNING → IMPLEMENTED → APPROVED → DONE
+PENDING → RUNNING → IMPLEMENTED → APPROVED → STAGED → DONE
                   ↘ FAILED         ↘ NEEDS_HUMAN
 ```
 
 - `IMPLEMENTED` means the worker exited successfully, left a clean task
   worktree, and left committed changes on the task branch relative to the
-  base branch. A run normally continues from there to validation and review;
+  run branch. A run normally continues from there to validation and review;
   a task stays `IMPLEMENTED` when an execution is interrupted between the
   worker and the next stage, and a later run validates and reviews that same
   commit - before starting another worker attempt - when it was never
   rejected.
 - `APPROVED` means validation passed and the reviewer approved the exact
   validated commit, possibly after repairs. Approval is immediately followed
-  by integration: the base branch is fast-forwarded to that commit and the
-  task becomes `DONE`. An `APPROVED` task found by a later run (for example
-  after an integration failure or an interruption) skips the worker,
-  validation, and review and only makes the integration another attempt.
-- `DONE` means the task's approved commit is part of the configured base
-  branch. It is recorded only after the fast-forward merge succeeded, is
-  never recorded on an integration failure, and satisfies the task's
-  dependents. A `DONE` task is not executed again.
+  by staging: the run branch is fast-forwarded to that commit and the task
+  becomes `STAGED`. An `APPROVED` task found by a later run (for example
+  after a staging failure or an interruption) skips the worker, validation,
+  and review and only makes the staging another attempt.
+- `STAGED` means the task's approved commit is part of its run branch. It is
+  recorded only after the staging fast-forward succeeded, satisfies the
+  task's dependents that execute in the same run, and is preserved when a
+  batch stops at a failed task. A STAGED task is not executed again; it must
+  be integrated with `actl run merge` to become `DONE`.
+- `DONE` means the containing run was integrated into the configured base
+  branch. It is recorded only by `actl run merge`, after the run branch was
+  fast-forwarded (or found already merged) into the base branch; it is never
+  recorded while the task is merely staged, and it satisfies dependents in
+  any later run. A `DONE` task is not executed again.
 - `NEEDS_HUMAN` means all three worker attempts were used without an
   approval: the reviewer still reported critical or major findings, or a
   validation command kept failing. The findings, logs, branch, and worktree
@@ -294,29 +377,32 @@ PENDING → RUNNING → IMPLEMENTED → APPROVED → DONE
   existing branch and worktree are reused as they are, so earlier commits are
   preserved and the worker continues from there. Nothing is reset, cleaned,
   rebased, or merged, except that an approved task is fast-forwarded into the
-  base branch as described above. An explicit retry continues the recorded
+  run branch as described above. An explicit retry continues the recorded
   attempt accounting; it never silently restarts the budget. A worker attempt
   counts only once it completes, so an interrupted attempt is retried under
   the same attempt number and does not consume the budget.
-- A task may run only when all its dependencies are `DONE`; `APPROVED` does
-  not satisfy them. `actl task run` refuses a task with unfinished
+- A task may run only when all its dependencies are satisfied: `DONE`, or
+  `STAGED` in the run being executed. `APPROVED`, and `STAGED` in another
+  run, do not satisfy them. `actl task run` refuses a task with unfinished
   dependencies, and `--all` never executes one (it reports the blocked task
   and its dependencies instead).
-- An `APPROVED` task can be run again, but only to integrate its already
-  approved commit - the worker, validation, and review are skipped. A `DONE`
-  task is never run again.
+- An `APPROVED` task can be run again, but only to stage its already approved
+  commit - the worker, validation, and review are skipped. A `STAGED` task
+  is not executed again until its run is integrated, and a `DONE` task is
+  never run again.
 - If an execution is interrupted (for example by Ctrl-C or a crash), the task
-  keeps its status and its worktree and log are preserved; there is no
-  automatic recovery, but an explicit `actl task run <id>` continues from the
-  preserved worktree and the recorded attempts. An interrupted worker attempt
-  is retried under the same attempt number and does not count against the
-  budget. An interruption between the successful merge and recording `DONE`
-  leaves the task `APPROVED`; the retry detects the completed merge and
-  records `DONE` without rerunning anything - actl never blindly repeats Git
-  operations or marks an uncertain task `DONE`.
+  keeps its status and its worktree and log are preserved, and the run stays
+  `RUNNING`; there is no automatic recovery, but an explicit `actl task run`
+  resumes that run and continues from the preserved worktree and the recorded
+  attempts. An interrupted worker attempt is retried under the same attempt
+  number and does not count against the budget. An interruption between the
+  successful staging merge and recording `STAGED` leaves the task `APPROVED`;
+  the retry detects the completed merge and records `STAGED` without
+  rerunning anything - actl never blindly repeats Git operations or marks an
+  uncertain task DONE.
 - The task is marked `IMPLEMENTED` only when OpenCode exits with status 0,
   the worktree is still on its task branch, the worktree is clean, and the
-  branch has committed changes relative to the base branch. A worker that
+  branch has committed changes relative to the run branch. A worker that
   leaves uncommitted or untracked files behind, or commits nothing, is a
   failure. A retry may finish with previously committed work and no new
   commit.
@@ -373,9 +459,10 @@ branch (`origin/HEAD`) when the matching local branch exists, otherwise
 `main` or `master` when exactly one of them exists; when the choice is
 ambiguous it lists the existing branches and asks. It never assumes the
 currently checked-out branch. In a repository without commits it records the
-unborn branch `HEAD` points at. Task branches are always created from the
-configured base branch, and approved commits are fast-forwarded back into
-it after review; `actl task run` refuses to run while that branch
+unborn branch `HEAD` points at. A run branch is always created from the
+configured base branch, task branches are created from the run branch, and a
+completed run is fast-forwarded back into the base branch only by
+`actl run merge`; `actl task run` refuses to start a run while that branch
 has no commits - create an initial commit first, since `actl init` never
 commits. Re-running `actl init` without `--base` never changes an existing
 selection; a project initialized before `base_branch` existed gains one on
@@ -397,8 +484,11 @@ passed to the OpenCode worker and reviewer (Python's `pass_fds`), so the lock
 stays held while those processes are alive even if actl itself is killed. A
 multi-task run holds that one lock for the whole batch - it is never released
 between tasks - so a concurrent `actl task run` recognizes the active
-execution immediately. Planner operations (`actl plan`, `actl task create`,
-...) stay separate from execution and never take the lock.
+execution immediately; `actl run merge` takes the same lock while it
+integrates a run. A run that is left `RUNNING` by an interrupted execution is
+resumed by the next `actl task run`: a project never has two running runs.
+Planner operations (`actl plan`, `actl task create`, ...) stay separate from
+execution and never take the lock.
 
 ## Repair and escalation
 
@@ -448,16 +538,21 @@ task t1: Add authentication
 [14:12] Validation passed
 [14:12] Reviewer started
 [14:13] Review approved (no findings)
-[14:13] Fast-forward merging...
+[14:13] Fast-forward merging into run r1...
 
-Task t1 → DONE
+Task t1 → STAGED (run r1)
+
+Summary: completed: t1
+[14:13] Run r1 finished with 1 staged task; integrate it with 'actl run merge r1'
 ```
 
-Approval is immediately followed by the integration of the approved commit
-(see "Automatic integration" above); the `Task t1 → APPROVED` line appears
-instead when the merge was refused, and the task then keeps its approved
-state for a later retry. A `--all` or multi-id run wraps the same events and
-ends with a summary such as `Summary: completed: t1, t2`.
+Approval is immediately followed by staging the approved commit into the run
+branch (see "Staging into the run branch" above); the
+`Task t1 → APPROVED (not staged)` line appears instead when the merge was
+refused, and the task then keeps its approved state for a later retry. A
+`--all` or multi-id run wraps the same events and ends with a summary such as
+`Summary: completed: t1, t2`. The run is not integrated automatically: run
+`actl run merge r1` to move its staged tasks to `DONE`.
 
 Attempt accounting lives in `.actl/attempts/t1`, a small JSON record with the
 number of used attempts and the feedback for the next worker, so restarting
@@ -580,9 +675,10 @@ project's `REVIEW_POLICY.md`:
   pre-existing problems never block approval.
 
 `APPROVED` records the validated commit and is immediately followed by the
-integration described above: the task ends `DONE` once the base branch has
-fast-forwarded to that commit, and keeps `APPROVED` when the integration was
-refused. Nothing is ever pushed to a remote.
+staging described above: the task becomes `STAGED` once its run branch has
+fast-forwarded to that commit, keeps `APPROVED` when the staging was refused,
+and only becomes `DONE` when the run is integrated with `actl run merge`.
+Nothing is ever pushed to a remote.
 
 ## Planner agent
 
@@ -601,8 +697,9 @@ read-only inspection tools (`read`, `glob`, `grep`), questions, and the
 `actl task` management subcommands are re-allowed. Editing, subagents, web
 access, and MCP tools stay denied - including tools that write files under an
 action name other than `edit` - and reading a `.env` file still asks.
-`actl task run` is denied outright, so the planner can manage the task list
-but can never launch a worker.
+`actl task run` and `actl run` are denied outright, so the planner can manage
+the task list but can never launch a worker or integrate a run into the base
+branch.
 
 The `actl task create`, `actl task list`, `actl task show`,
 `actl task update`, and `actl task delete` subcommands are the only
@@ -611,8 +708,9 @@ prompt, while every other shell command still requires explicit user approval.
 A broad `actl task *` deny comes before those management allows (OpenCode
 evaluates permission rules last-match-wins), so only the documented forms are
 pre-approved and `actl task run` - including whitespace variants such as
-`actl task  run` - stays denied. The deny was verified against the installed
-OpenCode 2.1.2 permission engine.
+`actl task  run` - stays denied; `actl run *` is denied as well, so the
+planner can never integrate a run. The denials were verified against the
+installed OpenCode 2.1.2 permission engine.
 The prompt tells the planner to prefer the native `read`, `glob`, and `grep`
 tools over shell `cat`, `head`, `tail`, `ls`, or `grep` (the `read` tool
 pages through files with offset/limit), and to run inspections one per shell
@@ -687,13 +785,14 @@ actl reports an error instead of resuming the wrong session.
 │                   # escalation_worker_model, validation.commands,
 │                   # base_branch, created_at
 ├── planner.json    # active planner session id, created_at
-├── tasks.db        # SQLite task database (tasks, dependencies, reviews)
+├── tasks.db        # SQLite database (tasks, dependencies, reviews, runs)
 ├── execution.lock  # project-wide execution lock (fcntl.flock)
 ├── base/           # branch-creation commit per task: t1, t2, ...
 ├── attempts/       # used worker attempts + next-attempt feedback: t1, t2, ...
 ├── runs/           # tN-<timestamp>.log worker, -validation.log, -review.log
 ├── review/         # temporary reviewer worktrees (removed after review)
 ├── integrate/      # temporary merge worktrees (removed after the merge)
+├── run-worktrees/  # one Git worktree per run: r1/, r2/, ...
 └── worktrees/      # one Git worktree per task: t1/, t2/, ...
 
 .opencode/
@@ -739,18 +838,22 @@ attempt on an explicit retry, the persisted attempt budget across invocations
 (including an interrupted run and legacy `NEEDS_CHANGES` tasks), the explicit
 reset path, the required escalation model and its preflight ordering before
 the execution lock, and the escalation model configuration. The Stage 7
-tests cover integration and sequential execution: an approved task merging
-and becoming `DONE`, `DONE` only after a successful merge, the configured
-base branch (including one that is not checked out anywhere), a dirty base
-worktree, a non-fast-forward base, a task branch that moved after approval,
-an already approved task integrating without rerunning any agent, an
-already `DONE` task refusing to run, a completed merge whose `DONE` record
-was lost, dependencies unlocking only after `DONE`, explicit task lists,
-`--all` in dependency order, deterministic id order for independent tasks,
-stopping at the first failure or at a task that needs a human, never
-executing a task with unfinished dependencies, an ignored local file the
-merge must never overwrite, branch squash options that cannot fake a
-successful integration, and one execution lock per batch.
+tests cover run-level integration and sequential execution: the run branch
+and worktree being created from the configured base branch; several tasks
+staged sequentially into one run branch, each starting from the previous
+staged task's result; the base branch staying untouched during execution;
+STAGED dependencies satisfied inside the same run and blocking from another
+run (including the exact actionable message); fast-forward integration and
+the `STAGED -> DONE` transitions; detection of a manual merge, plain or with
+a merge commit; a repeated `actl run merge` being safe; a non-fast-forward
+that requires manual Git integration and then finalizes the statuses; a dirty
+base worktree and a run branch that moved after completion; a failed batch
+preserving its staged work, worktrees, logs, and run; an ignored local file
+the merge must never overwrite; branch squash options that cannot fake a
+successful integration; already approved, staged, and DONE tasks; explicit
+task lists; `--all` in dependency order; deterministic id order for
+independent tasks; stopping at the first failure or at a task that needs a
+human; `actl run list` and `actl run show`; and one execution lock per batch.
 
 ## Limitations
 
@@ -775,19 +878,22 @@ successful integration, and one execution lock per batch.
   at most three completed worker attempts, the third with the escalation
   model; after that it is `NEEDS_HUMAN` and only explicit human intervention
   continues. There is no automatic rebasing, no conflict resolution, no pull
-  requests or GitHub/GitLab integration, and no automatic crash recovery.
+  requests or GitHub/GitLab integration, no automatic crash recovery, and no
+  parallel or background runs: only one run executes at a time, an
+  interrupted run is resumed by the next `actl task run`, and a completed
+  run stays unintegrated until the user runs `actl run merge`.
 - `IMPLEMENTED` only means that the worker exited successfully, left the
   worktree clean, and left committed changes on the task branch relative to
-  the base branch. `APPROVED` additionally means the configured validation
+  the run branch. `APPROVED` additionally means the configured validation
   commands passed on that exact commit and the reviewer approved it, possibly
-  after repairs; `DONE` then means that exact commit was fast-forwarded into
-  the base branch. None of these states is a guarantee of correctness.
+  after repairs; `STAGED` then means that exact commit is part of the run
+  branch, and `DONE` means the whole run was fast-forwarded into the base
+  branch. None of these states is a guarantee of correctness.
 - `actl task run` requires a reviewer model and an escalation worker model
   for every run, and a worker model whenever the worker runs. Without any of
   them the run fails before launching anything; an `IMPLEMENTED` task is
   validated and reviewed with just the reviewer and escalation models, and
-  an `APPROVED` task is integrated the same way, without rerunning the
-  worker.
+  an `APPROVED` task is staged the same way, without rerunning the worker.
 - A validation command that changes tracked files or moves `HEAD` fails the
   task immediately and is never repaired by another worker: the cause is the
   validation command, not the implementation. actl reports it instead of
@@ -798,25 +904,31 @@ successful integration, and one execution lock per batch.
   and may create untracked files (caches, reports). Changes to tracked files
   or to `HEAD` fail the task as soon as a command finishes; actl does not
   clean anything up.
-- actl never resets, cleans, rebases, or deletes a task worktree. A task that
-  fails keeps its branch, worktree, and log for an explicit retry. Two kinds
-  of worktree are temporary and removed again: the reviewer's checkout and
-  the merge worktree used when no worktree has the base branch checked out.
-- Integration is a plain `git merge --ff-only` of the exact approved commit;
-  `--no-squash` and `--no-overwrite-ignore` keep branch configuration from
-  staging a squash and from replacing an ignored local file. actl never
-  rewrites the base branch: when the base branch advanced with its own
-  commits, the merge is refused and a human must reconcile it by hand.
-  Merging also refuses while an uncommitted or untracked file sits in the
-  worktree that has the base branch checked out, instead of touching the
-  user's work; every refusal keeps the task `APPROVED` for a later retry.
-  When no worktree has the base branch checked out, a temporary worktree
-  performs the merge, so that checkout does not see the new files until it
-  is updated.
-- `actl task run --all` does not select `DONE` or `NEEDS_HUMAN` tasks. It
-  reports the tasks that still need a human and stops when no selected task
-  can progress, so a project with an abandoned `NEEDS_HUMAN` task can still
-  finish and report success for everything else that was runnable.
+- actl never resets, cleans, rebases, or deletes a task worktree or a run
+  worktree. A task that fails keeps its branch, worktree, and log for an
+  explicit retry, and a failed batch keeps its run branch and every staged
+  commit. Two kinds of worktree are temporary and removed again: the
+  reviewer's checkout and the merge worktree used when no worktree has the
+  integration target checked out.
+- Every automatic Git integration is a plain `git merge --ff-only` of a
+  validated commit: staging an approved task into the run branch, and
+  integrating a completed run into the base branch. `--no-squash` and
+  `--no-overwrite-ignore` keep branch configuration from staging a squash
+  and from replacing an ignored local file. actl never rewrites the base
+  branch: when it advanced with its own commits, `actl run merge` is refused
+  and a human must reconcile the run by hand (then the same command detects
+  the manual merge and finalizes the statuses). Merging also refuses while an
+  uncommitted or untracked file sits in the worktree that has the base branch
+  checked out, instead of touching the user's work. When no worktree has the
+  base branch checked out, a temporary worktree performs the merge, so that
+  checkout does not see the new files until it is updated.
+- `actl task run --all` does not select `STAGED`, `DONE`, or `NEEDS_HUMAN`
+  tasks. It reports the tasks that still need a human and stops when no
+  selected task can progress, so a project with an abandoned `NEEDS_HUMAN`
+  task can still finish and report success for everything else that was
+  runnable. A task whose dependency is staged in another run is refused with
+  the exact `actl run merge` command; actl never integrates that other run
+  automatically.
 - The execution lock covers actl and the OpenCode processes it spawns. A
   detached descendant that does not keep the inherited descriptor (for example
   a daemonized helper the worker starts) can outlive the lock; actl keeps no
@@ -827,12 +939,12 @@ successful integration, and one execution lock per batch.
   `.env` file or touching a path outside the worktree) is auto-rejected and
   the worker continues without it. actl does not pass `--auto`, so those
   guards stay active. Like the planner, this is not a sandbox - an approved
-  task is merged automatically, so review the resulting base-branch history
-  and commits instead of trusting the worker.
-- The worker prompt asks the worker to commit everything and never merge into
-  the base branch, and actl checks afterwards that the worktree is still on
-  its task branch, is clean, and contains committed changes relative to the
-  base branch; a worker that ignores the instructions is reported as a
+  task is staged into its run branch automatically, so review the run
+  branch (and later the merge) instead of trusting the worker.
+- The worker prompt asks the worker to commit everything and never merge
+  into the run branch, and actl checks afterwards that the worktree is still
+  on its task branch, is clean, and contains committed changes relative to
+  the run branch; a worker that ignores the instructions is reported as a
   failure rather than corrected automatically.
 - The reviewer runs with OpenCode's read-only `plan` agent in a disposable
   worktree at the validated commit; it can still run shell commands, so treat
@@ -844,6 +956,12 @@ successful integration, and one execution lock per batch.
 - The review verdict is bound to the validated commit, but it is a model
   judgment: minor findings may be missed, and an approval is not a
   correctness proof. Because an approval immediately fast-forwards that
-  commit into the base branch, review what the worker produced with
-  `git log`/`git diff` on the base branch as well; actl never pushes, so a
-  wrong merge can still be corrected locally.
+  commit into the run branch, review what the worker produced with
+  `git log`/`git diff` on the run branch; the base branch only moves when
+  the user runs `actl run merge`. actl never pushes, so a wrong merge can
+  still be corrected locally.
+- A completed run stays unmerged until `actl run merge` runs, and while it
+  still holds `STAGED` tasks no new run can start; a run that stopped before
+  staging anything does not block a retry. Because every new run starts from
+  the current base branch, integrate a finished run before starting work
+  that builds on it.

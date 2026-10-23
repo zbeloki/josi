@@ -1,27 +1,32 @@
-"""Task execution: the project lock, task worktrees, and run logs.
+"""Task execution: the project lock, run and task worktrees, and logs.
 
-``actl task run`` executes one task at a time per project:
+``actl task run`` executes one task at a time inside a run:
 
 * A project-wide ``fcntl.flock`` lock (``.actl/execution.lock``) is taken
   before any work starts. The locked file descriptor is inherited by the
   OpenCode processes, so the lock stays held if actl crashes while a worker
   or reviewer is still running.
+* Each run gets one branch (``actl/run/rN``) and worktree
+  (``.actl/run-worktrees/rN``), created from the configured base branch the
+  first time a task of the run starts and reused while the run is active
+  (see ``ensure_run_worktree``).
 * Each task gets one branch (``actl/tN``) and worktree
-  (``.actl/worktrees/tN``), created from the latest local base branch (the
-  project's configured ``base_branch``, passed in by the caller) the first
-  time the task runs and reused by later explicit runs.
+  (``.actl/worktrees/tN``), created from the run branch - never directly from
+  the base branch - the first time the task runs and reused by later explicit
+  runs, so a task starts from the previous staged task's result.
 * One noninteractive OpenCode turn runs inside the worktree and its output is
   streamed into a log file under ``.actl/runs/``. Validation and review get
   their own logs in the same directory.
 * The reviewer gets a temporary detached worktree under ``.actl/review/``
   (see ``add_review_worktree``), so its checkout can never touch the task
   worktree.
-* An approved task is integrated with ``git merge --ff-only``
-  (see ``integrate_commit``): the base branch is fast-forwarded to the exact
-  approved commit in the worktree that has the base branch checked out, or -
-  when no worktree has it checked out - in a temporary worktree under
-  ``.actl/integrate/``. The base branch is never reset, rebased, or forced;
-  the merge runs with ``--no-squash`` and ``--no-overwrite-ignore``, so
+* An approved task is staged into its run branch and, later, the completed
+  run is integrated into the base branch with ``git merge --ff-only`` (see
+  ``integrate_commit``): the target branch is fast-forwarded to the exact
+  approved commit in the worktree that has it checked out, or - when no
+  worktree has it checked out - in a temporary worktree under
+  ``.actl/integrate/``. No branch is ever reset, rebased, or forced; the
+  merge runs with ``--no-squash`` and ``--no-overwrite-ignore``, so
   inherited branch configuration cannot stage a squash instead, and an
   ignored local file is never silently overwritten.
 * Each task records how many worker attempts it has used in
@@ -29,9 +34,9 @@
   the three-attempt repair budget survives CLI invocations and an interrupted
   run never silently resets it.
 
-Task worktrees, branches, and logs are never deleted: failed or interrupted
-work is preserved for an explicit retry. The temporary reviewer worktree is
-the one exception; it is removed after the review.
+Run worktrees, task worktrees, branches, and logs are never deleted: failed
+or interrupted work is preserved for an explicit retry. The temporary
+reviewer worktree is the one exception; it is removed after the review.
 """
 
 from __future__ import annotations
@@ -47,6 +52,7 @@ from pathlib import Path
 
 LOCK_NAME = "execution.lock"
 WORKTREES_DIR = "worktrees"
+RUN_WORKTREES_DIR = "run-worktrees"
 REVIEW_DIR = "review"
 INTEGRATE_DIR = "integrate"
 BASE_DIR = "base"
@@ -118,9 +124,10 @@ def ensure_worktree(
 
     The base branch is validated before any worktree is created or reused, so
     a retry fails before the worker starts when the base was deleted since
-    the previous attempt.
+    the previous attempt. Callers pass the run branch here: task branches are
+    created from the run branch, never directly from the configured base.
     """
-    _require_base(root, base_branch)
+    require_base(root, base_branch)
     branch = branch_name(task.id)
     path = actl_dir / WORKTREES_DIR / ("t" + str(task.id))
     registered = _registered_worktrees(root)
@@ -158,6 +165,57 @@ def ensure_worktree(
         "refs/heads/" + base_branch,
     )
     record_branch_base(actl_dir, task.id, ref_commit(root, "refs/heads/" + branch))
+    return Worktree(branch=branch, path=path, created=True)
+
+
+def ensure_run_worktree(root: Path, actl_dir: Path, run) -> Worktree:
+    """Create or reuse the run's branch and worktree.
+
+    The run branch is created from the run's recorded base branch the first
+    time a task of the run starts, and its worktree lives under
+    ``.actl/run-worktrees/rN``. An interrupted run reuses both as they are -
+    never resetting, cleaning, or checking out anything - and a run whose
+    worktree directory was removed re-attaches the existing branch. The base
+    branch is validated first, so a run fails before any worktree work when
+    the base disappeared while the run was waiting.
+    """
+    require_base(root, run.base_branch)
+    branch = run.branch
+    path = actl_dir / RUN_WORKTREES_DIR / ("r" + str(run.id))
+    registered = _registered_worktrees(root)
+    key = os.path.realpath(str(path))
+
+    if key in registered:
+        if not branch_exists(root, branch):
+            raise ExecutionError(
+                "run branch " + branch + " no longer exists; the run cannot"
+                " continue without it (restore the branch or intervene by hand)"
+            )
+        actual = registered[key]
+        if actual != "refs/heads/" + branch:
+            raise ExecutionError(
+                "run worktree " + str(path) + " is not on branch " + branch
+                + " (found " + (repr(actual) if actual else "a detached HEAD") + ")"
+            )
+        if not path.is_dir():
+            raise ExecutionError(
+                "run worktree " + str(path) + " is registered but its directory"
+                " is missing; run 'git worktree prune' and run the task again to"
+                " re-attach the run branch"
+            )
+        return Worktree(branch=branch, path=path, created=False)
+    if path.exists():
+        raise ExecutionError(
+            str(path) + " exists but is not a registered Git worktree of"
+            " this repository"
+        )
+    if branch_exists(root, branch):
+        _git(root, "worktree", "add", str(path), branch)
+        return Worktree(branch=branch, path=path, created=True)
+    _git(
+        root, "worktree", "add", "-b", branch, str(path),
+        "refs/heads/" + run.base_branch,
+    )
     return Worktree(branch=branch, path=path, created=True)
 
 
@@ -416,22 +474,27 @@ def integrate_commit(
 ) -> Path:
     """Fast-forward ``base_branch`` to ``commit``; return the merge worktree.
 
-    The approved commit is merged exactly as it was validated and approved:
-    the task branch must still point at it, the base branch must exist, and
-    the worktree holding the base branch (or a temporary one, when no
+    Used for both steps of the run model: staging an approved task into its
+    run branch (``base_branch`` is the run branch) and integrating a
+    completed run into the configured base branch (``base_branch`` is the
+    base branch, ``commit`` the recorded final commit).
+
+    The commit is merged exactly as it was validated and approved: the
+    source branch must still point at it, the target branch must exist, and
+    the worktree holding the target branch (or a temporary one, when no
     worktree has it checked out) must be clean before ``git merge --ff-only``
-    runs. A non-fast-forward merge, a moved task branch, a missing base
-    branch, and a dirty base worktree all raise :class:`ExecutionError`
+    runs. A non-fast-forward merge, a moved source branch, a missing target
+    branch, and a dirty target worktree all raise :class:`ExecutionError`
     without changing anything: actl never resets, rebases, force-pushes, or
-    resolves conflicts, so the caller can keep the task APPROVED for a
-    deliberate retry.
+    resolves conflicts, so the caller can keep the task APPROVED (or the run
+    COMPLETE) for a deliberate retry.
 
     The merge always runs with ``--no-squash`` and ``--no-overwrite-ignore``,
     so branch configuration cannot turn it into a squash that only stages
-    the changes, and an ignored local file in the base worktree (which does
-    not make it dirty) is refused instead of silently overwritten. After the
-    merge, the base branch must really contain the approved commit;
-    otherwise the integration fails and the task stays APPROVED.
+    the changes, and an ignored local file in the target worktree (which
+    does not make it dirty) is refused instead of silently overwritten.
+    After the merge, the target branch must really contain the commit;
+    otherwise the integration fails and the status stays unchanged.
 
     A temporary merge worktree is removed on every path; the branch ref keeps
     the merge either way.
@@ -439,13 +502,13 @@ def integrate_commit(
     current = ref_commit(root, "refs/heads/" + branch)
     if current != commit:
         raise ExecutionError(
-            "task branch " + branch + " moved after approval: expected "
+            "branch " + branch + " moved after approval: expected "
             + commit[:12] + ", found " + current[:12]
             + "; refusing to merge"
         )
     if not branch_exists(root, base_branch):
         raise ExecutionError(
-            "base branch '" + base_branch + "' does not exist in " + str(root)
+            "branch '" + base_branch + "' does not exist in " + str(root)
             + "; refusing to merge"
         )
     worktree = worktree_for_branch(root, base_branch)
@@ -476,21 +539,21 @@ def integrate_commit(
         dirty = worktree_dirty(worktree)
         if dirty:
             raise ExecutionError(
-                "the base worktree " + str(worktree)
+                "the worktree " + str(worktree)
                 + " has uncommitted or untracked changes; commit or remove"
-                " them before merging (the task keeps its APPROVED state)"
+                " them before merging"
             )
         _git(
             worktree, "merge", "--ff-only", "--no-squash",
             "--no-overwrite-ignore", commit,
         )
         # Command-line options override branch configuration, but never
-        # report a completed integration unless the base branch really
-        # contains the approved commit (a squash, for example, stages the
-        # changes and exits successfully without moving the branch).
+        # report a completed integration unless the target branch really
+        # contains the commit (a squash, for example, stages the changes and
+        # exits successfully without moving the branch).
         if not is_ancestor(root, commit, "refs/heads/" + base_branch):
             raise ExecutionError(
-                "the merge reported success but the approved commit "
+                "the merge reported success but commit "
                 + commit[:12] + " is not an ancestor of " + base_branch
                 + "; refusing to report the integration as complete"
             )
@@ -650,7 +713,7 @@ def worker_prompt(
     return "\n".join(lines)
 
 
-def _require_base(root: Path, base_branch: str) -> None:
+def require_base(root: Path, base_branch: str) -> None:
     """Refuse execution until the base branch exists and has a commit.
 
     A branch ref only exists once it has at least one commit, so a missing

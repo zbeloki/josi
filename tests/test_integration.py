@@ -1,13 +1,14 @@
-"""End-to-end tests for actl Stage 7: integration and sequential execution.
+"""End-to-end tests for actl Stage 7: run-level integration.
 
 Every test runs the CLI against a disposable Git repository and the fake
-``opencode`` executable. The fake worker and reviewer make each task reach
-APPROVED without a real model; the tests then exercise the fast-forward
-integration into the configured base branch, the DONE state, dependency-aware
-scheduling, and the batch execution modes (``actl task run t1 t2`` and
-``actl task run --all``), including every refusal path: a dirty base
-worktree, a non-fast-forward merge, a moved task branch, squash branch
-options, and an ignored local file the merge would overwrite.
+``opencode`` executable. Execution is grouped into runs: ``actl task run``
+creates the run branch ``actl/run/rN`` from the configured base branch, stages
+every approved task into it, and never touches the base branch. ``actl run
+merge rN`` integrates a completed run into the base branch exactly once and
+turns its STAGED tasks DONE; the tests cover fast-forward integration, a
+manual merge (plain or merge commit), a non-fast-forward that needs human
+intervention, idempotent repeats, dependency handling inside and across runs,
+failed runs preserving staged work, and the execution lock over a batch.
 """
 
 from __future__ import annotations
@@ -49,23 +50,12 @@ class IntegrationTestCase(TaskRunTestCase):
         return result.stdout.split()[-1]
 
     def dirty_base(self):
-        (self.repo / "base-scratch.txt").write_text(
-            "dirty\n", encoding="utf-8"
-        )
+        (self.repo / "base-scratch.txt").write_text("dirty\n", encoding="utf-8")
 
     def clean_base(self):
         path = self.repo / "base-scratch.txt"
         if path.exists():
             path.unlink()
-
-    def approve_without_integrating(self, task_id="t1"):
-        """Run a task with a dirty base so it ends APPROVED, not merged."""
-        self.dirty_base()
-        result = self.run_task(task_id)
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("Task " + task_id + " \u2192 APPROVED (not merged)", result.stdout)
-        self.assertEqual(self.task_status(task_id), "APPROVED")
-        return result
 
     def worker_cwds(self):
         return [
@@ -86,124 +76,370 @@ class IntegrationTestCase(TaskRunTestCase):
         finally:
             conn.close()
 
+    def run_show(self, run_id="r1"):
+        result = self.run_actl("run", "show", run_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        fields = {"output": result.stdout}
+        for line in result.stdout.splitlines():
+            key, _, value = line.partition(": ")
+            if key != line:
+                fields[key] = value
+        return fields
 
-class MergeTests(IntegrationTestCase):
-    def test_approved_task_is_merged_and_marked_done(self):
+
+class RunBranchTests(IntegrationTestCase):
+    def test_run_branch_and_worktree_are_created_from_the_base(self):
         self.create("Add the feature")
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Review approved", result.stdout)
-        self.assertIn("Fast-forward merging...", result.stdout)
-        self.assertIn("Task t1 \u2192 DONE", result.stdout)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertIn("Created run r1", result.stdout)
 
-        # The base branch fast-forwarded to the reviewed commit; the task
-        # branch and worktree are preserved and the repository stays clean.
-        self.assertEqual(self.rev("main"), self.rev("actl/t1"))
-        stored = self.latest_review()
-        self.assertEqual(stored["commit_sha"], self.rev("main"))
-        self.assertTrue(self.worktree().is_dir())
-        self.assertEqual(self.git("status", "--porcelain").stdout, "")
+        worktree = self.repo / ".actl" / "run-worktrees" / "r1"
+        self.assertTrue(worktree.is_dir())
+        self.assertEqual(
+            self.git("rev-parse", "--abbrev-ref", "HEAD", cwd=worktree).stdout.strip(),
+            "actl/run/r1",
+        )
+        listed = self.git("worktree", "list", "--porcelain").stdout
+        self.assertIn(str(worktree), listed)
+
+        # The run started exactly at the base commit and finished at the
+        # approved task commit; the base branch never moved.
+        shown = self.run_show()
+        self.assertEqual(shown["status"], "COMPLETE")
+        self.assertEqual(shown["branch"], "actl/run/r1")
+        self.assertEqual(shown["base_branch"], "main")
+        self.assertEqual(shown["start_commit"], self.base_sha)
+        self.assertEqual(shown["final_commit"], self.rev("actl/t1"))
+        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t1"))
+        self.assertEqual(self.rev("main"), self.base_sha)
+
+    def test_run_list_shows_status_branch_and_tasks(self):
+        self.create("First")
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        result = self.run_actl("run", "list")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            result.stdout.strip(), "r1  COMPLETE  actl/run/r1  t1"
+        )
+
+        empty = self.run_actl("run", "list")
+        self.assertEqual(empty.returncode, 0)
+
+    def test_run_show_refuses_an_unknown_run(self):
+        result = self.run_actl("run", "show", "r9")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("run r9 does not exist", result.stderr)
+        result = self.run_actl("run", "merge", "r9")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("run r9 does not exist", result.stderr)
+
+    def test_multiple_tasks_share_one_run_and_stage_in_order(self):
+        t1 = self.create("First")
+        t2 = self.create("Second")
+        t3 = self.create("Third")
+        result = self.run_task(t1, t2, t3)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for task_id in (t1, t2, t3):
+            self.assertEqual(self.task_status(task_id), "STAGED")
+        self.assertEqual(self.worker_cwds(), [t1, t2, t3])
+
+        # One run holds all three tasks; the run branch advanced with every
+        # staged task and the base branch stayed put.
+        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t3"))
+        self.assertEqual(self.rev("actl/t2~1"), self.rev("actl/t1"))
+        self.assertEqual(self.rev("actl/t3~1"), self.rev("actl/t2"))
+        self.assertEqual(self.rev("main"), self.base_sha)
+        shown = self.run_show()
+        self.assertIn("tasks:\nt1  STAGED  First", shown["output"])
+
+    def test_task_starts_from_the_previous_staged_task_result(self):
+        self.create("First")
+        self.create("Second")
+        self.assertEqual(self.run_task("t1", "t2").returncode, 0)
+
+        # The second task started from the run branch after the first task
+        # was staged: it sees the first task's committed file.
+        content = (self.worktree("t2") / "worker-output.txt").read_text(
+            encoding="utf-8"
+        )
+        self.assertIn("worker change", content)
+        self.assertEqual(self.rev("actl/t2~1"), self.rev("actl/t1"))
+
+    def test_base_branch_remains_unchanged_during_execution(self):
+        self.create("First")
+        self.create("Second", "--depends-on", "t1")
+        result = self.run_task("--all")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.rev("main"), self.base_sha)
         self.assertEqual(
             self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip(), "main"
         )
+        self.assertEqual(self.git("status", "--porcelain").stdout, "")
 
-    def test_done_is_recorded_only_after_successful_integration(self):
-        self.create("Add the feature")
-        self.approve_without_integrating()
-        # The merge was refused: the base branch did not move and the task
-        # kept its approved state instead of becoming DONE.
+    def test_failed_batch_preserves_staged_work_and_the_run(self):
+        self.env["ACTL_FAKE_RUN_SEQUENCE"] = json.dumps(
+            [{"behavior": "commit"}, {"behavior": "commit", "exit": 1}]
+        )
+        self.env["ACTL_FAKE_RUN_COUNT_FILE"] = str(self.base / "worker-count")
+        t1 = self.create("First")
+        t2 = self.create("Second")
+        result = self.run_task(t1, t2)
+        self.assertNotEqual(result.returncode, 0)
+
+        # The batch stopped at t2 but t1's approved work is preserved in the
+        # run branch; the base branch and the run statuses are untouched.
+        self.assertEqual(self.task_status(t1), "STAGED")
+        self.assertEqual(self.task_status(t2), "FAILED")
+        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t1"))
         self.assertEqual(self.rev("main"), self.base_sha)
-        self.assertNotEqual(self.task_status(), "DONE")
+        self.assertEqual(self.run_status(), "COMPLETE")
+        self.assertTrue(self.worktree("t2").is_dir(), "worktree preserved")
+        self.assertTrue(self.log_paths("t2"), "logs preserved")
+
+        # The staged work can be integrated explicitly; the failed task
+        # stays behind.
+        self.assertEqual(self.integrate().returncode, 0)
+        self.assertEqual(self.task_status(t1), "DONE")
+        self.assertEqual(self.task_status(t2), "FAILED")
+
+    def test_unmerged_run_with_staged_tasks_blocks_a_new_run(self):
+        # Only one unfinished, unmerged run may exist: a completed run that
+        # still holds staged tasks must be integrated before new work starts,
+        # even for an independent task.
+        t1 = self.create("First")
+        t2 = self.create("Second")
+        self.assertEqual(self.run_task(t1).returncode, 0)
         workers = len(self.worker_calls())
 
-        # After the problem is resolved, a plain rerun integrates the exact
-        # approved commit without running the worker again.
-        self.clean_base()
+        result = self.run_task(t2)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            result.stderr,
+            "actl: error: "
+            "Cannot start a new run: run r1 still holds staged\n"
+            "tasks and must be integrated first.\n"
+            "\n"
+            "Run:\n"
+            "    actl run merge r1\n"
+            "\n"
+            "If you already merged r1 manually, execute the\n"
+            "same command to finalize its status.\n",
+        )
+        self.assertNotIn("t2", self.worker_cwds())
+        self.assertEqual(self.task_status(t2), "PENDING")
+
+        self.assertEqual(self.integrate().returncode, 0)
+        result = self.run_task(t2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(t2), "STAGED")
+        self.assertEqual(self.run_status("r2"), "COMPLETE")
+        self.assertEqual(len(self.worker_calls()), workers + 1)
+
+    def test_run_without_staged_tasks_does_not_block_a_new_run(self):
+        # A run stopped before staging anything leaves nothing to integrate;
+        # a retry starts its own run from the unchanged base branch.
+        self.create("First")
+        self.env["ACTL_FAKE_RUN_EXIT"] = "1"
+        self.assertNotEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertEqual(self.run_status("r1"), "COMPLETE")
+
+        self.env["ACTL_FAKE_RUN_EXIT"] = "0"
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "DONE")
-        self.assertEqual(self.rev("main"), self.rev("actl/t1"))
-        self.assertEqual(len(self.worker_calls()), workers)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(self.run_status("r2"), "COMPLETE")
+        self.assertEqual(self.rev("main"), self.base_sha)
 
-    def test_merge_uses_the_configured_base_branch(self):
+
+class RunMergeTests(IntegrationTestCase):
+    def test_run_merge_fast_forwards_the_base_and_marks_tasks_done(self):
+        t1 = self.create("First")
+        t2 = self.create("Second")
+        self.assertEqual(self.run_task(t1, t2).returncode, 0)
+        self.assertEqual(self.rev("main"), self.base_sha)
+
+        result = self.integrate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("integrated into main", result.stdout)
+        self.assertEqual(self.rev("main"), self.rev("actl/run/r1"))
+        self.assertEqual(self.task_status(t1), "DONE")
+        self.assertEqual(self.task_status(t2), "DONE")
+        self.assertEqual(self.run_status(), "INTEGRATED")
+        self.assertEqual(
+            self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip(), "main"
+        )
+        self.assertEqual(self.git("status", "--porcelain").stdout, "")
+
+    def test_repeated_run_merge_is_safe(self):
+        self.create("First")
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(self.integrate().returncode, 0)
+        head = self.rev("main")
+
+        second = self.integrate()
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("already integrated", second.stdout)
+        self.assertEqual(self.rev("main"), head)
+        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.run_status(), "INTEGRATED")
+
+    def test_run_merge_detects_a_manual_fast_forward(self):
+        # Git integration succeeded by hand; the command still finalizes the
+        # statuses without repeating the merge.
+        self.create("Add the feature")
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        self.git("merge", "--ff-only", "actl/run/r1")
+        self.assertEqual(self.rev("main"), self.rev("actl/run/r1"))
+
+        result = self.integrate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already integrated", result.stdout)
+        self.assertIn("merged by hand", result.stdout)
+        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.run_status(), "INTEGRATED")
+
+    def test_run_merge_detects_a_manual_merge_commit(self):
+        # A normal merge commit (for example after resolving conflicts by
+        # hand) also counts as an integration of the recorded final commit.
+        self.create("Add the feature")
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        (self.repo / "main-change.txt").write_text("main\n", encoding="utf-8")
+        self.commit("main moves independently")
+        self.git(
+            "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "merge", "--no-ff", "--no-edit", "actl/run/r1",
+        )
+        self.git("merge-base", "--is-ancestor", self.rev("actl/run/r1"), "main")
+
+        result = self.integrate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already integrated", result.stdout)
+        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.run_status(), "INTEGRATED")
+
+    def test_non_fast_forward_merge_requires_manual_integration(self):
+        self.create("Add the feature")
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        # The base branch diverges: a fast-forward is impossible.
+        (self.repo / "base-moves.txt").write_text("base\n", encoding="utf-8")
+        self.commit("base moves on")
+        base_head = self.rev("main")
+        self.assertNotEqual(base_head, self.rev("actl/run/r1"))
+
+        result = self.integrate()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("manual Git integration", result.stderr)
+        self.assertIn("git checkout main && git merge actl/run/r1", result.stdout)
+        # Nothing changed: statuses, run, and branches are preserved.
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(self.run_status(), "COMPLETE")
+        self.assertEqual(self.rev("main"), base_head)
+        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t1"))
+
+        # After the user resolves the integration by hand, the same command
+        # detects it and finalizes the statuses.
+        self.git(
+            "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
+            "merge", "--no-edit", "actl/run/r1",
+        )
+        result = self.integrate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.run_status(), "INTEGRATED")
+
+    def test_run_merge_refuses_a_dirty_base_worktree(self):
+        self.create("Add the feature")
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        self.dirty_base()
+
+        result = self.integrate()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("uncommitted or untracked changes", result.stdout)
+        self.assertIn("manual Git integration", result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(self.run_status(), "COMPLETE")
+        self.assertEqual(self.rev("main"), self.base_sha)
+
+        self.clean_base()
+        self.assertEqual(self.integrate().returncode, 0)
+        self.assertEqual(self.task_status(), "DONE")
+
+    def test_run_merge_uses_the_configured_base_branch(self):
         self.git("branch", "develop")
         result = self.run_actl("init", "--base", "develop")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.create("Add the feature")
+        self.assertEqual(self.run_task("t1").returncode, 0)
 
-        # ``develop`` is not checked out anywhere: actl fast-forwards it
-        # through a temporary merge worktree, and ``main`` never moves.
-        result = self.run_task("t1")
+        # ``develop`` is not checked out anywhere: actl integrates it through
+        # a temporary merge worktree, and ``main`` never moves.
+        result = self.integrate()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "DONE")
         self.assertEqual(self.rev("develop"), self.rev("actl/t1"))
         self.assertEqual(self.rev("main"), self.base_sha)
         self.assertEqual(
-            list((self.repo / ".actl" / "integrate").glob("*")),
-            [],
+            list((self.repo / ".actl" / "integrate").glob("*")), [],
             "the temporary merge worktree must be removed",
         )
 
-    def test_dirty_base_worktree_prevents_merging(self):
-        self.create("Add the feature")
-        (self.repo / "README.md").write_text("user edit\n", encoding="utf-8")
-        result = self.run_task("t1")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("integration failed", result.stderr)
-        self.assertIn("uncommitted or untracked changes", result.stderr)
-        self.assertIn("Task t1 \u2192 APPROVED (not merged)", result.stdout)
-        self.assertEqual(self.task_status(), "APPROVED")
-        self.assertEqual(self.rev("main"), self.base_sha)
+    def test_run_merge_updates_the_worktree_checking_out_the_base(self):
+        self.git("branch", "develop")
         self.assertEqual(
-            (self.repo / "README.md").read_text(encoding="utf-8"), "user edit\n",
-            "actl must never touch the user's uncommitted changes",
+            self.run_actl("init", "--base", "develop").returncode, 0
         )
-
-    def test_non_fast_forward_merge_is_refused(self):
+        second = self.base / "develop-worktree"
+        self.git("worktree", "add", str(second), "develop")
         self.create("Add the feature")
-        self.approve_without_integrating()
-        self.clean_base()
-        # The base branch diverges: the approved commit is no longer a
-        # descendant of it, so --ff-only must refuse.
-        (self.repo / "base-moves.txt").write_text("base\n", encoding="utf-8")
-        self.commit("base moves on")
-        base_head = self.rev("main")
-        self.assertNotEqual(base_head, self.rev("actl/t1"))
+        self.assertEqual(self.run_task("t1").returncode, 0)
 
-        workers = len(self.worker_calls())
-        reviewers = len(self.reviewer_calls())
-        result = self.run_task("t1")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("integration failed", result.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
-        self.assertEqual(self.rev("main"), base_head, "main must not move")
-        self.assertEqual(len(self.worker_calls()), workers)
-        self.assertEqual(len(self.reviewer_calls()), reviewers)
-
-    def test_task_branch_moving_after_approval_refuses_merging(self):
-        self.create("Add the feature")
-        self.approve_without_integrating()
-        self.clean_base()
-        approved = self.rev("actl/t1")
-
-        # A human commits on the task branch after the approval: the branch
-        # no longer points at the approved commit, so nothing may merge.
-        (self.worktree() / "human.txt").write_text("human\n", encoding="utf-8")
-        self.commit("human change", cwd=self.worktree())
-        self.assertNotEqual(self.rev("actl/t1"), approved)
-
-        result = self.run_task("t1")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("moved after approval", result.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
+        result = self.integrate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(
+            self.rev("HEAD", cwd=second),
+            self.rev("actl/t1"),
+            "the worktree with the base branch checked out is updated",
+        )
         self.assertEqual(self.rev("main"), self.base_sha)
 
-    def test_ignored_local_file_is_never_overwritten_by_merging(self):
-        # The base worktree ignores a local file that the task's approved
-        # commit starts tracking. Ignored files do not make the worktree
-        # dirty, so only the merge itself can refuse instead of silently
-        # replacing the human's local data.
+    def test_run_merge_refuses_when_the_run_branch_moved(self):
+        self.create("Add the feature")
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        run_worktree = self.run_worktree()
+        (run_worktree / "human.txt").write_text("human\n", encoding="utf-8")
+        self.commit("human change on the run branch", cwd=run_worktree)
+        moved = self.rev("actl/run/r1")
+        final = self.run_show()["final_commit"]
+        self.assertNotEqual(moved, final)
+
+        result = self.integrate()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("moved after the run finished", result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(self.run_status(), "COMPLETE")
+        self.assertEqual(self.rev("main"), self.base_sha)
+        self.assertEqual(self.rev("actl/run/r1"), moved)
+
+    def test_run_merge_refuses_a_running_run(self):
+        self.create("Add the feature")
+        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        try:
+            tasks.create_run(conn, "main", self.base_sha)
+        finally:
+            conn.close()
+
+        result = self.integrate()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("still marked RUNNING", result.stderr)
+        self.assertEqual(self.run_status(), "RUNNING")
+
+    def test_ignored_local_file_is_never_overwritten_by_run_merge(self):
+        # The base worktree ignores a local file that the staged task commit
+        # starts tracking. Ignored files do not make the worktree dirty, so
+        # only the merge itself can refuse instead of silently replacing the
+        # human's local data.
         (self.repo / ".gitignore").write_text(
             ".actl/\nlocal-notes.txt\n", encoding="utf-8"
         )
@@ -213,13 +449,14 @@ class MergeTests(IntegrationTestCase):
         base = self.rev("main")
         self.create("Track the local notes")
         self.env["ACTL_FAKE_RUN"] = "ignore-collision"
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(self.task_status(), "STAGED")
 
-        result = self.run_task("t1")
+        result = self.integrate()
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("integration failed", result.stderr)
-        self.assertIn("local-notes.txt", result.stderr)
-        self.assertIn("Task t1 \u2192 APPROVED (not merged)", result.stdout)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertIn("local-notes.txt", result.stdout)
+        self.assertIn("manual Git integration", result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
         self.assertEqual(self.rev("main"), base, "main must not move")
         self.assertEqual(
             (self.repo / "local-notes.txt").read_text(encoding="utf-8"),
@@ -227,13 +464,12 @@ class MergeTests(IntegrationTestCase):
             "the ignored local file must never be silently overwritten",
         )
 
-        # The human resolves the collision and the same approved commit
-        # integrates without rerunning the worker, validation, or review.
+        # The human resolves the collision and the run integrates without
+        # rerunning the worker, validation, or review.
         workers = len(self.worker_calls())
         reviewers = len(self.reviewer_calls())
         (self.repo / "local-notes.txt").unlink()
-        result = self.run_task("t1")
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.integrate().returncode, 0)
         self.assertEqual(self.task_status(), "DONE")
         self.assertEqual(self.rev("main"), self.rev("actl/t1"))
         self.assertEqual(
@@ -243,18 +479,17 @@ class MergeTests(IntegrationTestCase):
         self.assertEqual(len(self.worker_calls()), workers)
         self.assertEqual(len(self.reviewer_calls()), reviewers)
 
-    def test_branch_squash_options_cannot_fake_a_done_integration(self):
+    def test_branch_squash_options_cannot_fake_a_run_merge(self):
         self.create("Add the feature")
-        self.approve_without_integrating()
-        self.clean_base()
+        self.assertEqual(self.run_task("t1").returncode, 0)
         workers = len(self.worker_calls())
         reviewers = len(self.reviewer_calls())
         # A branch-level option turns a plain merge into a squash that only
-        # stages the changes; actl must still fast-forward and may report
-        # DONE only once the approved commit is really in the base branch.
+        # stages the changes; actl must still fast-forward and may report DONE
+        # only once the approved commit is really in the base branch.
         self.git("config", "branch.main.mergeOptions", "--squash")
 
-        result = self.run_task("t1")
+        result = self.integrate()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "DONE")
         approved = self.rev("actl/t1")
@@ -264,116 +499,128 @@ class MergeTests(IntegrationTestCase):
         self.assertEqual(len(self.worker_calls()), workers)
         self.assertEqual(len(self.reviewer_calls()), reviewers)
 
-    def test_already_approved_task_integrates_without_rerunning_agents(self):
-        self.create("Add the feature")
-        self.approve_without_integrating()
-        workers = len(self.worker_calls())
-        reviewers = len(self.reviewer_calls())
-
-        self.clean_base()
-        result = self.run_task("t1")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "DONE")
-        self.assertEqual(self.rev("main"), self.rev("actl/t1"))
-        self.assertEqual(len(self.worker_calls()), workers)
-        self.assertEqual(len(self.reviewer_calls()), reviewers)
-
-    def test_already_done_task_is_not_executed_again(self):
+    def test_staged_task_is_not_executed_again_until_done(self):
         self.create("Add the feature")
         self.assertEqual(self.run_task("t1").returncode, 0)
-        head = self.rev("main")
         workers = len(self.worker_calls())
         reviewers = len(self.reviewer_calls())
+        head = self.rev("actl/t1")
 
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("already DONE", result.stderr)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertIn("Task t1 is STAGED in run r1", result.stderr)
+        self.assertIn("actl run merge r1", result.stderr)
         self.assertEqual(len(self.worker_calls()), workers)
         self.assertEqual(len(self.reviewer_calls()), reviewers)
-        self.assertEqual(self.rev("main"), head)
+        self.assertEqual(self.rev("actl/t1"), head)
+        self.assertEqual(self.rev("main"), self.base_sha)
 
-    def test_interrupted_integration_never_reruns_the_worker(self):
-        # Git integration succeeded but persisting DONE failed: the task is
-        # still APPROVED while its approved commit is already in the base
-        # branch. The retry recognizes the completed fast-forward, records
-        # DONE, and never creates a new implementation.
+    def test_approved_task_is_staged_without_rerunning_agents(self):
         self.create("Add the feature")
-        self.approve_without_integrating()
-        self.clean_base()
-        self.git("merge", "--ff-only", "actl/t1")
-        self.assertEqual(self.rev("main"), self.rev("actl/t1"))
+        self.assertEqual(self.run_task("t1").returncode, 0)
         workers = len(self.worker_calls())
         reviewers = len(self.reviewer_calls())
 
-        result = self.run_task("t1")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "DONE")
-        self.assertEqual(self.rev("main"), self.rev("actl/t1"))
-        self.assertEqual(len(self.worker_calls()), workers)
-        self.assertEqual(len(self.reviewer_calls()), reviewers)
-
-    def test_approved_task_without_a_recorded_review_is_refused(self):
-        self.create("Add the feature")
+        # Simulate an interruption between the approval and the staging
+        # status: the run is still RUNNING and the task is APPROVED. The
+        # retry resumes the same run and stages the recorded commit.
         self.set_task_status("APPROVED")
+        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        try:
+            tasks.set_run_status(conn, 1, tasks.RUN_RUNNING)
+        finally:
+            conn.close()
         result = self.run_task("t1")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("no approved review is recorded", result.stderr)
-        self.assertEqual(self.task_status(), "APPROVED")
-        self.assertEqual(self.worker_calls(), [])
-        self.assertEqual(self.rev("main"), self.base_sha)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t1"))
+        self.assertEqual(self.run_status(), "COMPLETE")
+        self.assertEqual(len(self.worker_calls()), workers)
+        self.assertEqual(len(self.reviewer_calls()), reviewers)
 
-    def test_merge_happens_in_the_worktree_that_checks_out_the_base(self):
-        self.git("branch", "develop")
-        self.assertEqual(
-            self.run_actl("init", "--base", "develop").returncode, 0
-        )
-        second = self.base / "develop-worktree"
-        self.git("worktree", "add", str(second), "develop")
-        self.create("Add the feature")
+    def test_interrupted_run_after_staging_is_resumed_and_finished(self):
+        # A crash between staging t1 and finishing the run leaves the run
+        # RUNNING; the next run continues it, notices the task is already
+        # staged, and completes the run without touching any agent.
+        self.create("First")
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        try:
+            tasks.set_run_status(conn, 1, tasks.RUN_RUNNING)
+        finally:
+            conn.close()
+        workers = len(self.worker_calls())
+        reviewers = len(self.reviewer_calls())
 
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "DONE")
-        self.assertEqual(self.rev("develop"), self.rev("actl/t1"))
-        self.assertEqual(
-            self.rev("HEAD", cwd=second),
-            self.rev("actl/t1"),
-            "the worktree with the base branch checked out is updated",
-        )
-        self.assertEqual(self.rev("main"), self.base_sha)
+        self.assertIn("already STAGED in run r1", result.stdout)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(self.run_status(), "COMPLETE")
+        self.assertEqual(len(self.worker_calls()), workers)
+        self.assertEqual(len(self.reviewer_calls()), reviewers)
 
-    def test_merge_worktree_is_removed_after_a_configured_base_merge(self):
-        self.git("worktree", "list", "--porcelain")
-        self.git("branch", "develop")
-        self.assertEqual(
-            self.run_actl("init", "--base", "develop").returncode, 0
-        )
-        self.create("Add the feature")
-        self.assertEqual(self.run_task("t1").returncode, 0)
-        listed = self.git("worktree", "list", "--porcelain").stdout
-        self.assertNotIn(".actl/integrate", listed)
+        self.assertEqual(self.integrate().returncode, 0)
+        self.assertEqual(self.task_status(), "DONE")
 
 
 class DependencySchedulingTests(IntegrationTestCase):
+    def test_staged_dependency_is_satisfied_in_the_same_run(self):
+        t1 = self.create("First")
+        t2 = self.create("Second", "--depends-on", t1)
+        result = self.run_task(t1, t2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(t1), "STAGED")
+        self.assertEqual(self.task_status(t2), "STAGED")
+        self.assertEqual(self.rev("actl/t2~1"), self.rev("actl/t1"))
+        self.assertNotIn("STAGED in run", result.stderr)
+
+    def test_staged_dependency_in_another_run_blocks_execution(self):
+        t1 = self.create("First")
+        t2 = self.create("Second", "--depends-on", t1)
+        self.assertEqual(self.run_task(t1).returncode, 0)
+        self.assertEqual(self.task_status(t1), "STAGED")
+
+        # t1 is staged in r1, not DONE: a new run must not start t2, and the
+        # refusal names the run and the exact command that fixes it.
+        result = self.run_task(t2)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(
+            result.stderr,
+            "actl: error: "
+            "Cannot execute task t2.\n"
+            "\n"
+            "Dependency t1 is STAGED in run r1 and must be\n"
+            "marked DONE before this task can execute.\n"
+            "\n"
+            "Run:\n"
+            "    actl run merge r1\n"
+            "\n"
+            "If you already merged r1 manually, execute the\n"
+            "same command to finalize its status.\n",
+        )
+        self.assertEqual(self.task_status(t2), "PENDING")
+        self.assertNotIn("t2", self.worker_cwds())
+
+        # After integration the dependency is DONE and the dependent runs in
+        # its own, new run.
+        self.assertEqual(self.integrate().returncode, 0)
+        self.assertEqual(self.task_status(t1), "DONE")
+        result = self.run_task(t2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(t2), "STAGED")
+        self.assertEqual(self.run_status("r2"), "COMPLETE")
+
     def test_approved_dependency_does_not_satisfy_dependents(self):
         t1 = self.create("First")
         t2 = self.create("Second", "--depends-on", t1)
-        self.approve_without_integrating(t1)
+        self.set_task_status("APPROVED", 1)
 
-        # APPROVED is not DONE: the dependent stays blocked and untouched.
         result = self.run_task(t2)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("depends on t1 (APPROVED)", result.stderr)
         self.assertEqual(self.task_status(t2), "PENDING")
         self.assertFalse(self.worktree(t2).exists())
-
-        # Integrating t1 makes t2 eligible.
-        self.clean_base()
-        self.assertEqual(self.run_task(t1).returncode, 0)
-        self.assertEqual(self.task_status(t1), "DONE")
-        self.assertEqual(self.run_task(t2).returncode, 0)
-        self.assertEqual(self.task_status(t2), "DONE")
 
     def test_unfinished_dependencies_refuse_execution(self):
         t1 = self.create("First")
@@ -381,7 +628,7 @@ class DependencySchedulingTests(IntegrationTestCase):
         result = self.run_task(t2)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("depends on t1 (PENDING)", result.stderr)
-        self.assertIn("all its dependencies are DONE", result.stderr)
+        self.assertIn("DONE or STAGED in the current run", result.stderr)
         self.assertEqual(self.worker_calls(), [])
         self.assertEqual(self.task_status(t2), "PENDING")
 
@@ -392,9 +639,10 @@ class DependencySchedulingTests(IntegrationTestCase):
         result = self.run_task(t1, t2, t3)
         self.assertEqual(result.returncode, 0, result.stderr)
         for task_id in (t1, t2, t3):
-            self.assertEqual(self.task_status(task_id), "DONE")
+            self.assertEqual(self.task_status(task_id), "STAGED")
         self.assertEqual(self.worker_cwds(), [t1, t2, t3])
-        self.assertEqual(self.rev("main"), self.rev("actl/" + t3))
+        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t3"))
+        self.assertEqual(self.rev("main"), self.base_sha)
         self.assertIn("Summary: completed: t1, t2, t3", result.stdout)
 
     def test_explicit_task_list_stops_at_the_first_failure(self):
@@ -408,6 +656,7 @@ class DependencySchedulingTests(IntegrationTestCase):
         self.assertNotIn("t2", self.worker_cwds(), "t2 must not run")
         self.assertIn("stopped at t1", result.stdout)
         self.assertIn("Summary:", result.stdout)
+        self.assertEqual(self.run_status(), "COMPLETE")
 
     def test_all_runs_in_dependency_order(self):
         t1 = self.create("First")
@@ -416,9 +665,10 @@ class DependencySchedulingTests(IntegrationTestCase):
         result = self.run_task("--all")
         self.assertEqual(result.returncode, 0, result.stderr)
         for task_id in (t1, t2, t3):
-            self.assertEqual(self.task_status(task_id), "DONE")
+            self.assertEqual(self.task_status(task_id), "STAGED")
         self.assertEqual(self.worker_cwds(), [t1, t2, t3])
-        self.assertEqual(self.rev("main"), self.rev("actl/t3"))
+        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t3"))
+        self.assertEqual(self.rev("main"), self.base_sha)
         self.assertIn("Summary: completed: t1, t2, t3", result.stdout)
 
     def test_all_executes_independent_tasks_in_id_order(self):
@@ -458,6 +708,20 @@ class DependencySchedulingTests(IntegrationTestCase):
         self.assertIn("blocked", result.stdout)
         self.assertIn("progress is blocked", result.stderr)
 
+    def test_all_reports_the_actionable_message_for_a_staged_dependency(self):
+        t1 = self.create("First")
+        t2 = self.create("Second", "--depends-on", t1)
+        self.assertEqual(self.run_task(t1).returncode, 0)
+        workers = len(self.worker_calls())
+
+        result = self.run_task("--all")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Dependency t1 is STAGED in run r1", result.stderr)
+        self.assertIn("actl run merge r1", result.stderr)
+        self.assertEqual(
+            len(self.worker_calls()), workers, "t2 must never execute"
+        )
+
     def test_all_reports_tasks_that_already_need_a_human(self):
         self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(MAJOR)
         self.create("First")
@@ -471,11 +735,13 @@ class DependencySchedulingTests(IntegrationTestCase):
         self.assertIn("needs human intervention: t1", result.stdout)
         self.assertEqual(len(self.worker_calls()), workers, "no retry")
 
-    def test_all_with_nothing_to_run_succeeds(self):
+    def test_all_with_nothing_to_run_succeeds_without_a_run(self):
         result = self.run_task("--all")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Summary: completed: none", result.stdout)
         self.assertEqual(self.worker_calls(), [])
+        run_list = self.run_actl("run", "list")
+        self.assertEqual(run_list.stdout, "", "no empty run is created")
 
     def test_run_requires_ids_or_all(self):
         result = self.run_task()
@@ -551,40 +817,45 @@ class BatchLockTests(IntegrationTestCase):
                 out, err = parent.communicate()
 
         self.assertEqual(parent.returncode, 0, err)
-        self.assertEqual(self.task_status("t1"), "DONE")
-        self.assertEqual(self.task_status("t2"), "DONE")
-        self.assertEqual(self.rev("main"), self.rev("actl/t2"))
+        self.assertEqual(self.task_status("t1"), "STAGED")
+        self.assertEqual(self.task_status("t2"), "STAGED")
+        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t2"))
+        self.assertEqual(self.rev("main"), self.base_sha)
         self.assertIn("Summary: completed: t1, t2", out)
 
 
 class IntegrationOutputTests(IntegrationTestCase):
-    def test_terminal_shows_merge_events_and_the_summary(self):
+    def test_terminal_shows_staging_events_and_the_summary(self):
         self.create("First")
         self.create("Second", "--depends-on", "t1")
         result = self.run_task("--all")
         self.assertEqual(result.returncode, 0, result.stderr)
         stdout = result.stdout
         self.assertLess(
-            stdout.index("Review approved"), stdout.index("Fast-forward merging...")
+            stdout.index("Review approved"),
+            stdout.index("Fast-forward merging into run r1..."),
         )
         self.assertLess(
-            stdout.index("Fast-forward merging..."),
-            stdout.index("Task t1 \u2192 DONE"),
+            stdout.index("Fast-forward merging into run r1..."),
+            stdout.index("Task t1 \u2192 STAGED (run r1)"),
         )
         self.assertLess(
-            stdout.index("Task t1 \u2192 DONE"), stdout.index("task t2:")
+            stdout.index("Task t1 \u2192 STAGED (run r1)"),
+            stdout.index("task t2:"),
         )
         self.assertIn("Summary: completed: t1, t2", stdout)
+        self.assertIn("integrate it with 'actl run merge r1'", stdout)
         self.assertNotIn("fake opencode:", stdout)
         self.assertNotIn("fake opencode:", result.stderr)
 
-    def test_run_logs_are_preserved_after_integration(self):
+    def test_logs_and_worktrees_are_preserved_after_staging(self):
         self.create("First")
         self.assertEqual(self.run_task("t1").returncode, 0)
         self.assertTrue(self.log_paths("t1"))
         log = self.log_text("t1")
         self.assertIn("result: IMPLEMENTED", log)
         self.assertTrue(self.worktree().is_dir())
+        self.assertTrue(self.run_worktree().is_dir())
 
 
 if __name__ == "__main__":

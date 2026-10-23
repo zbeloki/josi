@@ -567,6 +567,55 @@ class TaskProjectTests(ActlTestCase):
         self.assertEqual(len(foreign_keys), 2)
         self.assertEqual({row[2] for row in foreign_keys}, {"tasks"})
 
+    def test_old_database_gains_the_runs_schema_without_losing_tasks(self):
+        # A database created before Stage 7 has no runs table and no
+        # tasks.run_id column; opening it migrates it in place.
+        self.initialize()
+        db = self.repo / ".actl" / "tasks.db"
+        conn = sqlite3.connect(str(db))
+        try:
+            conn.executescript(
+                "DROP TABLE reviews; DROP TABLE dependencies;"
+                " DROP TABLE tasks;"
+                " CREATE TABLE tasks ("
+                "  id INTEGER PRIMARY KEY AUTOINCREMENT,"
+                "  title TEXT NOT NULL,"
+                "  description TEXT NOT NULL DEFAULT '',"
+                "  status TEXT NOT NULL DEFAULT 'PENDING',"
+                "  created_at TEXT NOT NULL,"
+                "  updated_at TEXT NOT NULL"
+                " );"
+                " INSERT INTO tasks (title, description, status, created_at,"
+                "  updated_at) VALUES ('Legacy', 'From stage 6', 'DONE',"
+                "  '2026-01-01T00:00:00', '2026-01-01T00:00:00');"
+            )
+            conn.commit()
+        finally:
+            conn.close()
+
+        result = self.run_actl("task", "list")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("t1  DONE  Legacy", result.stdout)
+        result = self.run_actl("run", "list")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(result.stdout, "")
+
+        conn = sqlite3.connect(str(db))
+        try:
+            columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(tasks)")
+            }
+            tables = {
+                row[0]
+                for row in conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type = 'table'"
+                )
+            }
+        finally:
+            conn.close()
+        self.assertIn("run_id", columns)
+        self.assertIn("runs", tables)
+
 
 if __name__ == "__main__":
     unittest.main()

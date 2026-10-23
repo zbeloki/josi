@@ -86,8 +86,31 @@ class TaskRunTestCase(ActlTestCase):
                 return line.split(": ", 1)[1]
         self.fail("no status in:\n" + result.stdout)
 
+    def run_status(self, run_id="r1"):
+        result = self.run_actl("run", "show", run_id)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        for line in result.stdout.splitlines():
+            if line.startswith("status: "):
+                return line.split(": ", 1)[1]
+        self.fail("no status in:\n" + result.stdout)
+
+    def integrate(self, run_id="r1"):
+        """Run ``actl run merge`` for ``run_id``."""
+        return self.run_actl("run", "merge", run_id)
+
     def worktree(self, task_id="t1") -> Path:
         return self.repo / ".actl" / "worktrees" / task_id
+
+    def run_worktree(self, run_id="r1") -> Path:
+        return self.repo / ".actl" / "run-worktrees" / run_id
+
+    def rewind_run_to_base(self, run_id="r1"):
+        """Reset a run branch to its start commit, as if staging never ran.
+
+        Only tests use this to simulate an execution that was interrupted
+        before a task was staged into the run.
+        """
+        self.git("reset", "--hard", self.base_sha, cwd=self.run_worktree(run_id))
 
     def log_paths(self, task_id="t1"):
         return [
@@ -165,7 +188,7 @@ class RunExecutionTests(TaskRunTestCase):
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Task status: IMPLEMENTED", result.stdout)
-        self.assertIn("Task t1 \u2192 DONE", result.stdout)
+        self.assertIn("Task t1 \u2192 STAGED (run r1)", result.stdout)
         self.assertIn("log:", result.stdout)
 
         worktree = self.worktree()
@@ -181,8 +204,18 @@ class RunExecutionTests(TaskRunTestCase):
         self.assertEqual(subjects[0], "worker: implement task")
         self.assertIn("base commit", subjects)
 
-        self.assertEqual(self.task_status(), "DONE")
-        self.assertEqual(self.rev("main"), self.rev("actl/t1"))
+        # The task is STAGED in its run branch; the base branch never moved.
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t1"))
+        self.assertEqual(self.rev("main"), self.base_sha)
+        self.assertTrue(self.run_worktree().is_dir())
+        self.assertEqual(
+            self.git(
+                "rev-parse", "--abbrev-ref", "HEAD", cwd=self.run_worktree()
+            ).stdout.strip(),
+            "actl/run/r1",
+        )
+        self.assertEqual(self.run_status(), "COMPLETE")
 
         log = self.log_text()
         self.assertTrue(log.startswith("actl task run\n"), log[:80])
@@ -207,34 +240,52 @@ class RunExecutionTests(TaskRunTestCase):
         later = self.rev("main")
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
+        # The run branch starts at the latest local base commit and the task
+        # branch continues from the run branch; after staging, the run branch
+        # points at the approved task commit.
         self.assertEqual(self.rev("actl/t1~1"), later)
-        self.assertEqual(self.rev("main"), self.rev("actl/t1"))
+        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t1"))
+        self.assertEqual(self.rev("main"), later)
 
     def test_task_branch_starts_from_the_configured_base_branch(self):
         # Configure ``develop`` as the base, then let ``main`` advance: the
-        # task branch must start from ``develop``, never from a hardcoded or
+        # run branch must start from ``develop``, never from a hardcoded or
         # newer ``main``.
         self.git("branch", "develop")
         result = self.run_actl("init", "--base", "develop")
         self.assertEqual(result.returncode, 0, result.stderr)
         (self.repo / "later.txt").write_text("later\n", encoding="utf-8")
         self.commit("later commit on main")
+        later = self.rev("main")
 
         self.make_task()
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.rev("actl/t1~1"), self.base_sha)
-        self.assertEqual(self.rev("develop"), self.rev("actl/t1"))
+        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t1"))
         self.assertNotEqual(self.rev("main"), self.rev("develop"))
-        self.assertIn("Never merge into develop.", self.worker_prompt())
+        self.assertIn("Never merge into actl/run/r1.", self.worker_prompt())
+        self.assertEqual(self.rev("develop"), self.base_sha, "develop stays put")
 
-    def test_main_branch_is_fast_forwarded_and_clean(self):
+        self.assertEqual(self.integrate().returncode, 0)
+        self.assertEqual(self.rev("develop"), self.rev("actl/t1"))
+        self.assertEqual(self.rev("main"), later)
+
+    def test_base_branch_stays_untouched_during_execution(self):
         self.make_task()
         main_before = self.rev("main")
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        # Stage 7 fast-forwards the base branch to the approved commit; it
-        # never rewrites history and the base checkout stays clean.
+        # Execution only stages into the run branch; the base branch moves
+        # exactly once, when the run is integrated explicitly.
+        self.assertEqual(self.rev("main"), main_before)
+        self.assertNotEqual(self.rev("actl/run/r1"), main_before)
+        self.assertEqual(
+            self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip(), "main"
+        )
+        self.assertEqual(self.git("status", "--porcelain").stdout, "")
+
+        self.assertEqual(self.integrate().returncode, 0)
         self.assertEqual(self.rev("main"), self.rev("actl/t1"))
         self.git("merge-base", "--is-ancestor", main_before, "main")
         self.assertEqual(
@@ -350,10 +401,13 @@ class TerminalOutputTests(TaskRunTestCase):
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
 
-        self.assertIn("Preparing worktree", result.stdout)
-        self.assertIn("Task status: FAILED", result.stdout)
+        # The run cannot start without its base branch: the refusal happens
+        # before any worktree or worker, and the task stays PENDING.
         self.assertNotIn("Starting worker", result.stdout)
         self.assertIn("'main' does not exist", result.stderr)
+        self.assertIn("cannot start a run", result.stderr)
+        self.assertEqual(self.task_status(), "PENDING")
+        self.assertFalse((self.repo / ".actl" / "run-worktrees").exists())
 
     def test_log_keeps_the_complete_worker_output(self):
         self.make_task()
@@ -561,7 +615,7 @@ class RunFailureTests(TaskRunTestCase):
         self.env["ACTL_FAKE_RUN"] = "none"
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
         self.assertEqual(self.rev("actl/t1"), first_head)
         self.assertIn("result: IMPLEMENTED", self.log_text())
 
@@ -573,9 +627,30 @@ class RunFailureTests(TaskRunTestCase):
         self.assertIn("instead of", result.stderr)
         self.assertEqual(self.task_status(), "FAILED")
 
-    def test_successful_task_is_not_run_again(self):
+    def test_staged_task_is_not_run_again(self):
         self.make_task()
         self.assertEqual(self.run_task("t1").returncode, 0)
+        head = self.rev("actl/t1")
+        workers = len(self.worker_calls())
+        reviewers = len(self.reviewer_calls())
+
+        # A STAGED task is already part of its run branch; it must be marked
+        # DONE through 'actl run merge' before it can execute again.
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("Cannot execute task t1.", result.stderr)
+        self.assertIn("Task t1 is STAGED in run r1", result.stderr)
+        self.assertIn("actl run merge r1", result.stderr)
+        self.assertEqual(len(self.worker_calls()), workers)
+        self.assertEqual(len(self.reviewer_calls()), reviewers)
+        self.assertEqual(self.rev("actl/t1"), head)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(self.rev("main"), self.base_sha)
+
+    def test_done_task_is_not_run_again(self):
+        self.make_task()
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(self.integrate().returncode, 0)
         head = self.rev("actl/t1")
         workers = len(self.worker_calls())
         reviewers = len(self.reviewer_calls())
@@ -601,7 +676,7 @@ class RunFailureTests(TaskRunTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Reusing worktree", result.stdout)
 
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
         second_head = self.rev("actl/t1")
         self.assertNotEqual(second_head, first_head)
         # The first attempt's commit is still an ancestor: nothing was reset.
@@ -616,7 +691,8 @@ class RunFailureTests(TaskRunTestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("'main' does not exist", result.stderr)
         self.assertIn("git branch main", result.stderr)
-        self.assertEqual(self.task_status(), "FAILED")
+        self.assertIn("cannot start a run", result.stderr)
+        self.assertEqual(self.task_status(), "PENDING")
         self.assertFalse(self.worktree().exists())
 
     def test_retry_refuses_when_the_base_branch_was_removed(self):
@@ -627,7 +703,8 @@ class RunFailureTests(TaskRunTestCase):
         self.assertEqual(len(self.worker_calls()), 1)
 
         # The base disappears between attempts: the retry must fail before
-        # launching another worker, not after the run.
+        # launching another worker, not after the run. The first run is
+        # COMPLETE, so the retry would create its own run from the base.
         self.git("checkout", "-b", "feature")
         self.git("branch", "-D", "main")
         self.env["ACTL_FAKE_RUN_EXIT"] = "0"
@@ -637,6 +714,7 @@ class RunFailureTests(TaskRunTestCase):
         self.assertEqual(len(self.worker_calls()), 1, "no worker may be launched")
         self.assertEqual(self.rev("actl/t1"), before)
         self.assertEqual(self.task_status(), "FAILED")
+        self.assertEqual(self.run_status("r1"), "COMPLETE")
 
     def test_invalid_base_branch_in_metadata_is_rejected(self):
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
@@ -681,7 +759,7 @@ class RunFailureTests(TaskRunTestCase):
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(self.worktree().is_dir())
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
         # The earlier commit is still there: the branch was re-attached, not
         # recreated.
         self.git("merge-base", "--is-ancestor", first_head, "actl/t1")
@@ -727,7 +805,8 @@ class LegacyProjectTests(TaskRunTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Using detected base branch 'main'", result.stdout)
         self.assertEqual(self.rev("actl/t1~1"), self.base_sha)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(self.rev("main"), self.base_sha)
         # Detection never rewrites the existing configuration by itself.
         self.assertEqual(self.metadata_path().read_bytes(), before)
 
@@ -826,7 +905,8 @@ class EmptyRepositoryTests(ActlTestCase):
         self.assertIn("git commit --allow-empty", result.stderr)
         self.assertEqual(self.calls(), [], "no worker session may be created")
         self.assertFalse((self.repo / ".actl" / "worktrees").exists())
-        self.assertEqual(self.task_status(), "FAILED")
+        self.assertFalse((self.repo / ".actl" / "run-worktrees").exists())
+        self.assertEqual(self.task_status(), "PENDING")
 
     def test_run_refuses_an_unborn_configured_base_with_guidance(self):
         self.make_task()
@@ -837,18 +917,33 @@ class EmptyRepositoryTests(ActlTestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("base branch 'develop' has no commits yet", result.stderr)
         self.assertIn("git checkout -b develop", result.stderr)
-        self.assertEqual(self.task_status(), "FAILED")
+        self.assertEqual(self.task_status(), "PENDING")
         self.assertFalse((self.repo / ".actl" / "worktrees").exists())
 
     def test_task_run_works_after_the_initial_commit(self):
         self.make_task()
         self.commit_initial()
+        head_before = self.git("rev-parse", "HEAD").stdout.strip()
         result = self.run_actl("task", "run", "t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
+        # The run branch is created from the initial commit and the task
+        # branch continues from it; the base branch stays put.
+        self.assertEqual(
+            self.git("rev-parse", "actl/t1~1").stdout.strip(), head_before
+        )
+        self.assertEqual(
+            self.git("rev-parse", "actl/run/r1").stdout.strip(),
+            self.git("rev-parse", "actl/t1").stdout.strip(),
+        )
+        self.assertEqual(self.git("rev-parse", "HEAD").stdout.strip(), head_before)
+
+        result = self.run_actl("run", "merge", "r1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "DONE")
         self.assertEqual(
-            self.git("rev-parse", "actl/t1~1").stdout.strip(),
-            self.git("rev-parse", "HEAD~1").stdout.strip(),
+            self.git("rev-parse", "HEAD").stdout.strip(),
+            self.git("rev-parse", "actl/t1").stdout.strip(),
         )
 
     def test_configured_base_must_have_commits_before_running(self):
@@ -863,20 +958,23 @@ class EmptyRepositoryTests(ActlTestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("branch 'develop' does not exist", result.stderr)
         self.assertIn("git branch develop", result.stderr)
-        self.assertEqual(self.task_status(), "FAILED")
+        self.assertEqual(self.task_status(), "PENDING")
         self.assertFalse((self.repo / ".actl" / "worktrees").exists())
 
         self.git("checkout", "-q", "-b", "develop")
         develop_before = self.git("rev-parse", "develop").stdout.strip()
         result = self.run_actl("task", "run", "t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
         self.assertEqual(
             self.git("rev-parse", "actl/t1~1").stdout.strip(), develop_before
         )
         self.assertEqual(
-            self.git("rev-parse", "develop").stdout.strip(),
+            self.git("rev-parse", "actl/run/r1").stdout.strip(),
             self.git("rev-parse", "actl/t1").stdout.strip(),
+        )
+        self.assertEqual(
+            self.git("rev-parse", "develop").stdout.strip(), develop_before
         )
 
 
@@ -892,7 +990,7 @@ class DependencyTests(TaskRunTestCase):
         result = self.run_task("t2")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("depends on t1 (PENDING)", result.stderr)
-        self.assertIn("all its dependencies are DONE", result.stderr)
+        self.assertIn("DONE or STAGED in the current run", result.stderr)
         self.assertEqual(self.task_status("t2"), "PENDING")
         self.assertFalse(self.worktree("t2").exists())
         self.assertEqual(self.worker_calls(), [])
@@ -906,12 +1004,25 @@ class DependencyTests(TaskRunTestCase):
             0,
         )
         self.assertEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(self.task_status("t1"), "STAGED")
+
+        # STAGED in another (completed) run is not DONE: the dependent must
+        # wait until the run is integrated.
+        refused = self.run_task("t2")
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("Dependency t1 is STAGED in run r1", refused.stderr)
+        self.assertIn("actl run merge r1", refused.stderr)
+        self.assertEqual(self.task_status("t2"), "PENDING")
+
+        self.assertEqual(self.integrate().returncode, 0)
         self.assertEqual(self.task_status("t1"), "DONE")
 
         result = self.run_task("t2")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status("t2"), "DONE")
-        self.assertEqual(self.rev("main"), self.rev("actl/t2"))
+        self.assertEqual(self.task_status("t2"), "STAGED")
+        self.assertEqual(self.rev("actl/run/r2"), self.rev("actl/t2"))
+        self.assertEqual(self.rev("main"), self.rev("actl/t1"))
+        self.git("merge-base", "--is-ancestor", "actl/t1", "actl/t2")
 
 
 class ExecutionLockTests(TaskRunTestCase):
@@ -986,7 +1097,10 @@ class ExecutionLockTests(TaskRunTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("left RUNNING", result.stdout)
         self.assertIn("Reusing worktree", result.stdout)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
+        # The interrupted run was resumed, not replaced: the same run
+        # finished with the task staged.
+        self.assertEqual(self.run_status("r1"), "COMPLETE")
         subjects = self.git("log", "--format=%s", "actl/t1").stdout.splitlines()
         self.assertEqual(subjects.count("worker: implement task"), 2)
 

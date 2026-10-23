@@ -123,6 +123,20 @@ class PlannerRulesTests(ActlTestCase):
             with self.subTest(command=command):
                 self.assertEqual(self.ruleset.effect("shell", command), "deny")
 
+    def test_actl_run_is_denied(self):
+        commands = [
+            "actl run list",
+            "actl run show r1",
+            "actl run merge r1",
+            "actl run merge 1",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(self.ruleset.effect("shell", command), "deny")
+        # A whitespace variant does not match the deny, but it is never
+        # pre-approved either: the catch-all ask keeps it behind a prompt.
+        self.assertEqual(self.ruleset.effect("shell", "actl  run merge r1"), "ask")
+
     def test_task_management_survives_the_run_deny(self):
         commands = [
             "actl task list",

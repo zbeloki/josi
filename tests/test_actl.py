@@ -654,7 +654,7 @@ class PlanTests(ActlTestCase):
             if rule["action"] == "shell" and rule["effect"] == "allow":
                 self.assertIn(rule["resource"], management)
             if rule["action"] == "shell" and rule["effect"] == "deny":
-                self.assertIn(rule["resource"], ("actl task *", "*>*"))
+                self.assertIn(rule["resource"], ("actl task *", "actl run *", "*>*"))
         # The .env asks must follow the broad read allow, otherwise the
         # last-match-wins rule would silently turn them into plain allows.
         broad_read = rules.index({"action": "read", "resource": "*", "effect": "allow"})
@@ -682,6 +682,10 @@ class PlanTests(ActlTestCase):
         task_deny = {"action": "shell", "resource": "actl task *", "effect": "deny"}
         self.assertIn(task_deny, rules)
         self.assertLess(rules.index(task_deny), rules.index(management_allows[0]))
+        # Integrating a run into the base branch is never the planner's job.
+        run_deny = {"action": "shell", "resource": "actl run *", "effect": "deny"}
+        self.assertIn(run_deny, rules)
+        self.assertLess(rules.index(task_deny), rules.index(run_deny))
         # ...while the rules stay effective: last match wins, so the broad ask
         # must come before the task deny, and the redirect deny (which blocks
         # "actl task ... > file" silently overwriting files) must come after

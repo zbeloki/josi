@@ -51,14 +51,19 @@ Stage 6:
 
 Stage 7:
 
-* An approved task is integrated automatically: the base branch is
-  fast-forwarded to the exact validated and reviewer-approved commit, and only
-  then is the task marked DONE. ``actl task run`` accepts several task ids or
-  ``--all`` and executes them strictly sequentially under one execution lock,
-  in the given order or in deterministic dependency order, re-checking
-  dependencies after every completed task. A task with unfinished
-  dependencies never runs, and a task that is not DONE does not satisfy its
-  dependents.
+* Execution is grouped into runs. ``actl task run`` creates (or resumes) one
+  run branch ``actl/run/rN`` and worktree from the configured base branch and
+  creates every task branch from that run branch, so each task starts from the
+  previous staged task's result. An approved task is fast-forwarded into the
+  run branch and becomes STAGED; the base branch is never touched during
+  execution. ``actl task run`` accepts several task ids or ``--all`` and
+  executes them strictly sequentially under one execution lock, in the given
+  order or in deterministic dependency order. ``actl run merge rN``
+  fast-forwards a completed run into the configured base branch and turns its
+  STAGED tasks DONE; it is idempotent and also detects a manual merge of the
+  run branch. A dependency is satisfied by DONE or by STAGED in the run the
+  dependent is currently executing in; a dependency staged in another run
+  must be integrated first.
 """
 
 from __future__ import annotations
@@ -105,7 +110,9 @@ PLANNER_AGENT_PATH = Path(".opencode") / "agents" / (PLANNER_AGENT_NAME + ".md")
 # .actl/tasks.db. A broad "actl task *" deny comes before those allows (last
 # match wins), and the management allows re-enable only the documented forms;
 # "actl task run" - including whitespace variants such as "actl task  run" -
-# stays denied, so the planner can never launch a worker. The "*>*" deny must
+# stays denied, so the planner can never launch a worker. "actl run *" is
+# denied outright: integrating a run into the base branch is the user's
+# decision, never the planner's. The "*>*" deny must
 # come after the management allows (last match wins): OpenCode reports a
 # redirected statement as a single resource string, so without the deny
 # "actl task ... > src/file" would silently count as an allowed task command
@@ -169,6 +176,9 @@ permissions:
     resource: "actl task delete *"
     effect: allow
   - action: shell
+    resource: "actl run *"
+    effect: deny
+  - action: shell
     resource: "*>*"
     effect: deny
 ---
@@ -187,8 +197,9 @@ actionable plan.
 - Ask clarifying questions before proposing a plan, and never start
   implementing.
 - Do not modify project code.
-- Do not execute implementation tasks. `actl task run` is denied: task
-  execution is the user's decision, not yours.
+- Do not execute implementation tasks or integrate runs. `actl task run` and
+  `actl run` are denied: task execution and run integration are the user's
+  decision, not yours.
 
 ## Managing tasks with actl
 
@@ -236,8 +247,9 @@ pre-approved shell commands; write them with single spaces between the
 command words. Every other shell command asks for
 confirmation, and each command in a compound call is checked separately - run
 one command per shell call instead of chaining them with && or echo
-separators. `actl task run` is denied outright: never execute tasks or launch
-coding workers. Shell redirection is denied outright: never redirect command
+separators. `actl task run` and `actl run` are denied outright: never execute
+tasks, launch coding workers, or integrate a run into the base branch. Shell
+redirection is denied outright: never redirect command
 output to a file, and avoid the `>` character in inline task text (for
 example, write "to" instead of an arrow).
 Everything else - editing files, subagents, web access, and MCP tools - is
@@ -901,10 +913,188 @@ def cmd_task_delete(args) -> int:
     return 0
 
 
-#: Statuses ``actl task run --all`` selects for execution. DONE tasks are
-#: already integrated and NEEDS_HUMAN tasks need a human, so neither is
-#: selected automatically; every other status the single-task lifecycle
-#: accepts stays eligible.
+def cmd_run_list(_args) -> int:
+    """List the project's runs: id, status, branch, and staged tasks."""
+    try:
+        with _run_database() as conn:
+            for run in tasks.list_runs(conn):
+                task_ids = [
+                    "t" + str(task.id) for task in tasks.run_tasks(conn, run.id)
+                ]
+                print(
+                    "r" + str(run.id) + "  " + run.status + "  " + run.branch
+                    + "  " + (", ".join(task_ids) or "(no tasks)")
+                )
+    except (ProjectError, tasks.TaskError, sqlite3.Error) as exc:
+        return _fail(str(exc))
+    return 0
+
+
+def cmd_run_show(args) -> int:
+    """Show one run with its commits and associated tasks."""
+    try:
+        run_id = _parse_run_id(args.id)
+        with _run_database() as conn:
+            run = tasks.get_run(conn, run_id)
+            associated = tasks.run_tasks(conn, run.id)
+    except (ProjectError, tasks.TaskError, sqlite3.Error) as exc:
+        return _fail(str(exc))
+    print("id: r" + str(run.id))
+    print("status: " + run.status)
+    print("branch: " + run.branch)
+    print("base_branch: " + run.base_branch)
+    print("start_commit: " + run.start_commit)
+    print("final_commit: " + (run.final_commit or "(none)"))
+    print("created_at: " + run.created_at)
+    print("updated_at: " + run.updated_at)
+    print("tasks:")
+    if not associated:
+        print("(none)")
+    for task in associated:
+        print("t" + str(task.id) + "  " + task.status + "  " + task.title)
+    return 0
+
+
+def cmd_run_merge(args) -> int:
+    """Integrate a completed run into the configured base branch."""
+    try:
+        run_id = _parse_run_id(args.id)
+        root = _project_root()
+        metadata = load_project_metadata(root)
+        base_branch = _run_base_branch(root, metadata)
+        actl_dir = root / PROJECT_DIR
+    except (ProjectError, tasks.TaskError) as exc:
+        return _fail(str(exc))
+    try:
+        with execution.lock(actl_dir):
+            return _merge_run(root, actl_dir, run_id, base_branch)
+    except (
+        ProjectError, tasks.TaskError, sqlite3.Error,
+        execution.ExecutionError,
+    ) as exc:
+        return _fail(str(exc))
+
+
+@contextmanager
+def _run_database():
+    """Yield a connection to the current project's run database."""
+    root = _project_root()
+    conn = tasks.connect(root / PROJECT_DIR / tasks.DATABASE_NAME)
+    try:
+        yield conn
+    finally:
+        conn.close()
+
+
+def _merge_run(root: Path, actl_dir: Path, run_id: int, base_branch: str) -> int:
+    """Fast-forward a COMPLETE run into the base branch; idempotent.
+
+    Three cases keep the command safe to repeat:
+
+    * the run was not integrated yet: the run branch must still point at the
+      recorded final commit, and only a fast-forward merge into a clean base
+      worktree is attempted;
+    * the recorded final commit is already an ancestor of the base branch
+      (a manual merge, with or without a merge commit, or a repeated
+      command): the Git merge is skipped and only the statuses are finalized;
+    * the fast-forward cannot succeed (the base branch advanced with its own
+      commits): nothing changes, the user integrates the run by hand and
+      reruns the command to finalize the statuses.
+
+    STAGED tasks of the run become DONE only here, never during execution.
+    """
+    run = _load_run(actl_dir, run_id)
+    if run.status == tasks.RUN_INTEGRATED:
+        done = _finish_run_tasks(actl_dir, run)
+        print(
+            "Run r" + str(run.id) + " is already integrated into " + base_branch
+            + (("; marked " + ", ".join("t" + str(i) for i in done) + " DONE")
+               if done else "")
+        )
+        return 0
+    if run.status != tasks.RUN_COMPLETE:
+        raise tasks.TaskError(
+            "cannot integrate run r" + str(run.id) + ": its execution is still"
+            " marked " + run.status + "; run 'actl task run ...' again to"
+            " resume and finish it first"
+        )
+    if not run.final_commit:
+        raise tasks.TaskError(
+            "cannot integrate run r" + str(run.id)
+            + ": no final commit was recorded"
+        )
+    if not execution.branch_exists(root, base_branch):
+        raise tasks.TaskError(
+            "base branch '" + base_branch + "' does not exist in " + str(root)
+            + "; refusing to merge"
+        )
+    current = execution.ref_commit(root, "refs/heads/" + run.branch)
+    if current != run.final_commit:
+        raise tasks.TaskError(
+            "run branch " + run.branch + " moved after the run finished:"
+            " expected " + run.final_commit[:12] + ", found " + current[:12]
+            + "; refusing to merge"
+        )
+    if execution.is_ancestor(
+        root, run.final_commit, "refs/heads/" + base_branch
+    ):
+        print(
+            "Run r" + str(run.id) + " is already integrated into " + base_branch
+            + " (merged by hand); finalizing the statuses."
+        )
+    else:
+        _event("Fast-forward merging run r" + str(run.id) + "...")
+        try:
+            execution.integrate_commit(
+                root, actl_dir, base_branch, run.branch, run.final_commit,
+            )
+        except execution.ExecutionError as exc:
+            print("")
+            print("Run r" + str(run.id) + " cannot be integrated automatically:")
+            print("  " + str(exc))
+            print("")
+            print("Integrate the run branch by hand and commit the result, then")
+            print("run 'actl run merge r" + str(run.id) + "' again to finalize"
+                  " its status:")
+            print(
+                "    git checkout " + base_branch + " && git merge " + run.branch
+            )
+            _fail(
+                "run r" + str(run.id) + " could not be fast-forwarded into "
+                + base_branch + " (manual Git integration required)"
+            )
+            return 1
+        print(
+            "Fast-forwarded run r" + str(run.id) + " into " + base_branch + "."
+        )
+    done = _finish_run_tasks(actl_dir, run)
+    _set_run_status(actl_dir, run.id, tasks.RUN_INTEGRATED)
+    print(
+        "Run r" + str(run.id) + " integrated into " + base_branch
+        + ("; " + ", ".join("t" + str(i) for i in done) + " \u2192 DONE"
+           if done else "")
+    )
+    return 0
+
+
+def _finish_run_tasks(actl_dir: Path, run) -> list:
+    """Mark every STAGED task of ``run`` DONE; return the task ids."""
+    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    try:
+        done = []
+        for task in tasks.run_tasks(conn, run.id):
+            if task.status == tasks.STATUS_STAGED:
+                tasks.set_task_status(conn, task.id, tasks.STATUS_DONE)
+                done.append(task.id)
+        return done
+    finally:
+        conn.close()
+
+
+#: Statuses ``actl task run --all`` selects for execution. STAGED tasks are
+#: already in a run branch, DONE tasks are already integrated, and NEEDS_HUMAN
+#: tasks need a human, so none is selected automatically; every other status
+#: the single-task lifecycle accepts stays eligible.
 _RUNNABLE_STATUSES = (
     tasks.STATUS_PENDING, tasks.STATUS_RUNNING, tasks.STATUS_IMPLEMENTED,
     tasks.STATUS_FAILED, tasks.STATUS_NEEDS_CHANGES, tasks.STATUS_APPROVED,
@@ -912,7 +1102,7 @@ _RUNNABLE_STATUSES = (
 
 
 def cmd_task_run(args) -> int:
-    """Execute tasks: worker, validation, review, integration, and DONE."""
+    """Execute tasks inside a run: worker, validation, review, and staging."""
     try:
         if args.all_tasks:
             if args.ids:
@@ -949,16 +1139,32 @@ def cmd_task_run(args) -> int:
         return _fail(str(exc))
     try:
         with execution.lock(actl_dir) as lock_fd:
+            # An interrupted execution leaves its run RUNNING; the batch
+            # resumes that run instead of opening a second one, so staged
+            # tasks stay in the same run and keep satisfying their
+            # dependents (only one run executes at a time).
+            run = _running_run(actl_dir)
+            if run is None:
+                # Only one unfinished, unmerged run may exist: a completed
+                # run that still holds staged tasks must be integrated before
+                # a new run starts (a run stopped before staging anything
+                # does not block). Dependency problems in the requested tasks
+                # are reported first, with the exact command that fixes them.
+                blocker = _staged_unmerged_run(actl_dir)
+                if blocker is not None:
+                    return _fail(
+                        _new_run_refusal(actl_dir, blocker, requested)
+                    )
             if requested is None:
                 return _run_all(
                     binary, root, actl_dir, lock_fd, metadata, base_branch,
                     reviewer_model, escalation_worker_model,
-                    validation_commands,
+                    validation_commands, run,
                 )
             return _run_explicit(
                 binary, root, actl_dir, lock_fd, requested, metadata,
                 base_branch, reviewer_model, escalation_worker_model,
-                validation_commands,
+                validation_commands, run,
             )
     except (
         ProjectError, tasks.TaskError, sqlite3.Error,
@@ -984,7 +1190,9 @@ def _preflight_tasks(actl_dir: Path, requested) -> None:
         for task in tasks.list_tasks(conn):
             if task.status in _RUNNABLE_STATUSES:
                 continue
-            if task.status in (tasks.STATUS_DONE, tasks.STATUS_NEEDS_HUMAN):
+            if task.status in (
+                tasks.STATUS_DONE, tasks.STATUS_NEEDS_HUMAN, tasks.STATUS_STAGED,
+            ):
                 continue
             raise tasks.TaskError(
                 "cannot run --all: task t" + str(task.id)
@@ -996,49 +1204,65 @@ def _preflight_tasks(actl_dir: Path, requested) -> None:
 
 def _run_explicit(
     binary, root, actl_dir, lock_fd, requested, metadata, base_branch,
-    reviewer_model, escalation_worker_model, validation_commands,
+    reviewer_model, escalation_worker_model, validation_commands, run,
 ) -> int:
     """Execute an explicit task list strictly in the order it was given.
 
     Dependencies are checked for each task when its turn comes, so a task may
-    depend on an earlier task of the same list: that one has become DONE by
-    then. The list is never reordered and execution stops at the first task
-    that cannot complete.
+    depend on an earlier task of the same list: that one has become STAGED in
+    the same run by then. The list is never reordered and execution stops at
+    the first task that cannot complete; the run keeps the staged tasks.
     """
     batch = len(requested) > 1
     completed = []
     for task_id in requested:
-        code, detail = _execute_task(
+        code, detail, run = _execute_task(
             binary, root, actl_dir, task_id, metadata, lock_fd, base_branch,
-            reviewer_model, escalation_worker_model, validation_commands,
+            reviewer_model, escalation_worker_model, validation_commands, run,
         )
         if code != 0:
             if batch:
                 _print_summary(completed, stopped=(task_id, detail))
+            _finish_run(actl_dir, root, run)
             return code
         completed.append(task_id)
     if batch:
         _print_summary(completed)
+    _finish_run(actl_dir, root, run)
     return 0
+
+
+def _dependency_satisfied(dep_id, state, run) -> bool:
+    """Whether a dependency unlocks its dependent in the current run.
+
+    DONE always satisfies. STAGED satisfies only when it belongs to the run
+    the dependent is currently executing in: work staged in another run is
+    not part of this run branch and must first be marked DONE by
+    ``actl run merge``.
+    """
+    status, dep_run = state.get(dep_id, ("missing", None))
+    if status == tasks.STATUS_DONE:
+        return True
+    return status == tasks.STATUS_STAGED and run is not None and dep_run == run.id
 
 
 def _run_all(
     binary, root, actl_dir, lock_fd, metadata, base_branch,
-    reviewer_model, escalation_worker_model, validation_commands,
+    reviewer_model, escalation_worker_model, validation_commands, run,
 ) -> int:
     """Execute every eligible task in dependency order, one at a time.
 
     Selection is deterministic: at every step the eligible task with the
-    smallest id whose dependencies are all DONE runs first, and the task list
-    is re-read after each task so a finished task immediately unlocks its
-    dependents. A task whose dependencies stay unfinished (for example a
-    dependency that needs a human) can never run; when no task is ready the
-    batch reports what blocks progress and stops.
+    smallest id whose dependencies are satisfied runs first, and the task
+    list is re-read after each task so a staged task immediately unlocks its
+    dependents in the same run. A task whose dependencies stay unfinished
+    can never run; when no task is ready the batch reports what blocks
+    progress and stops.
     """
     completed = []
     while True:
         all_tasks = _list_tasks(actl_dir)
-        status = {task.id: task.status for task in all_tasks}
+        state = {task.id: (task.status, task.run_id) for task in all_tasks}
         candidates = [
             task for task in all_tasks if task.status in _RUNNABLE_STATUSES
         ]
@@ -1048,34 +1272,53 @@ def _run_all(
             (
                 task for task in candidates
                 if all(
-                    status.get(dep) == tasks.STATUS_DONE
+                    _dependency_satisfied(dep, state, run)
                     for dep in task.depends_on
                 )
             ),
             None,
         )
         if ready is None:
-            blocked = [
-                "t" + str(task.id) + " waits for "
-                + ", ".join(
-                    "t" + str(dep) + " (" + status.get(dep, "missing") + ")"
-                    for dep in task.depends_on
-                    if status.get(dep) != tasks.STATUS_DONE
+            blocked = []
+            staged = None
+            for task in candidates:
+                unfinished = [
+                    dep for dep in task.depends_on
+                    if not _dependency_satisfied(dep, state, run)
+                ]
+                if not unfinished:
+                    continue
+                blocked.append(
+                    "t" + str(task.id) + " waits for "
+                    + ", ".join(
+                        "t" + str(dep) + " ("
+                        + state.get(dep, ("missing", None))[0] + ")"
+                        for dep in unfinished
+                    )
                 )
-                for task in candidates
-            ]
+                if staged is None:
+                    for dep in unfinished:
+                        status, dep_run = state.get(dep, ("missing", None))
+                        if status == tasks.STATUS_STAGED:
+                            staged = _dependency_staged_message(
+                                task.id, dep, dep_run
+                            )
             _print_summary(completed, blocked=blocked)
+            _finish_run(actl_dir, root, run)
+            if staged is not None:
+                return _fail(staged)
             return _fail(
                 "progress is blocked: " + "; ".join(blocked)
                 + "; resolve the unfinished dependencies and run 'actl task"
                 " run --all' again"
             )
-        code, detail = _execute_task(
+        code, detail, run = _execute_task(
             binary, root, actl_dir, ready.id, metadata, lock_fd, base_branch,
-            reviewer_model, escalation_worker_model, validation_commands,
+            reviewer_model, escalation_worker_model, validation_commands, run,
         )
         if code != 0:
             _print_summary(completed, stopped=(ready.id, detail))
+            _finish_run(actl_dir, root, run)
             return code
         completed.append(ready.id)
     skipped = [
@@ -1083,7 +1326,48 @@ def _run_all(
         if task.status == tasks.STATUS_NEEDS_HUMAN
     ]
     _print_summary(completed, needs_human=skipped)
+    _finish_run(actl_dir, root, run)
     return 0
+
+
+def _finish_run(actl_dir: Path, root: Path, run) -> None:
+    """Record the run's final commit and mark it COMPLETE.
+
+    Called whenever a batch stops (successfully or at a failed task), so the
+    run branch is frozen at a known commit that ``actl run merge`` verifies.
+    Interruptions and crashes never reach this point: the run stays RUNNING
+    and the next ``actl task run`` resumes it.
+    """
+    if run is None:
+        return
+    try:
+        final = execution.ref_commit(root, "refs/heads/" + run.branch)
+    except execution.ExecutionError as exc:
+        _event(
+            "Warning: cannot record the final commit of run r" + str(run.id)
+            + " (" + str(exc) + ")"
+        )
+        return
+    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    try:
+        tasks.complete_run(conn, run.id, final)
+        staged = [
+            task.id for task in tasks.run_tasks(conn, run.id)
+            if task.status == tasks.STATUS_STAGED
+        ]
+    finally:
+        conn.close()
+    if staged:
+        detail = (
+            str(len(staged)) + " staged task"
+            + ("s" if len(staged) != 1 else "")
+        )
+    else:
+        detail = "no staged tasks"
+    _event(
+        "Run r" + str(run.id) + " finished with " + detail
+        + "; integrate it with 'actl run merge r" + str(run.id) + "'"
+    )
 
 
 def _print_summary(
@@ -1112,9 +1396,15 @@ def _print_summary(
 
 def _execute_task(
     binary, root, actl_dir, task_id, metadata, lock_fd, base_branch,
-    reviewer_model, escalation_worker_model, validation_commands,
+    reviewer_model, escalation_worker_model, validation_commands, run,
 ) -> tuple:
     """Run one task while the execution lock is held.
+
+    Every task executes inside a run: the batch's current run is reused when
+    one is running (an interrupted execution) and a new run is created lazily
+    before the first task that actually executes. The task branch is created
+    from the run branch, and an approval is fast-forwarded into the run
+    branch and marked STAGED - never into the configured base branch.
 
     A task gets up to three completed worker attempts in the same branch and
     worktree: the first two with the project's worker model and the third
@@ -1131,11 +1421,11 @@ def _execute_task(
     and reviews the committed implementation again instead of spending
     another worker attempt.
 
-    An APPROVED task skips the worker, validation, and review and attempts
-    only the integration of its approved commit. Returns ``(exit code,
-    short reason)``: ``(0, "")`` exactly when the task was successfully
-    integrated and marked DONE; the short reason describes the stop for a
-    multi-task summary, while the full error is printed here or in the
+    An APPROVED task skips the worker, validation, and review and only
+    attempts to stage its approved commit. Returns ``(exit code, short
+    reason, run)``: ``(0, "")`` exactly when the task was successfully staged
+    (or was already staged in this run); the short reason describes the stop
+    for a multi-task summary, while the full error is printed here or in the
     helper that returned it.
 
     The terminal shows only actl's own timestamped events; transcripts and
@@ -1143,14 +1433,46 @@ def _execute_task(
     """
     try:
         task = _load_task(actl_dir, task_id)
-        _require_runnable(task, actl_dir)
     except tasks.TaskError as exc:
         _fail(str(exc))
-        return 1, str(exc)
+        return 1, str(exc), run
+
+    if task.status == tasks.STATUS_STAGED:
+        if run is not None and task.run_id == run.id:
+            _event(
+                "Task t" + str(task.id) + " is already STAGED in run r"
+                + str(run.id)
+            )
+            return 0, "", run
+        _fail(_staged_block_message(task))
+        return 1, "already staged", run
+
+    try:
+        _require_runnable(task, actl_dir, run)
+    except tasks.TaskError as exc:
+        _fail(str(exc))
+        return 1, str(exc), run
+
+    if run is None:
+        try:
+            run = _create_run(actl_dir, root, base_branch)
+        except (execution.ExecutionError, tasks.TaskError, sqlite3.Error) as exc:
+            _fail("cannot start a run: " + str(exc))
+            return 1, "cannot start a run", None
+    try:
+        worktree = execution.ensure_run_worktree(root, actl_dir, run)
+    except execution.ExecutionError as exc:
+        _fail("cannot prepare run r" + str(run.id) + ": " + str(exc))
+        return 1, "cannot prepare the run", run
+    if worktree.created:
+        _event(
+            "Created run r" + str(run.id) + " (branch " + run.branch
+            + ", worktree " + str(worktree.path) + ")"
+        )
 
     if task.status == tasks.STATUS_APPROVED:
         # The implementation was validated and approved by an earlier run
-        # (or an earlier actl version): integrate the exact approved commit
+        # (or an earlier actl version): stage the exact approved commit
         # without rerunning the worker, validation, or review. The repair
         # budget is irrelevant here.
         print("task t" + str(task.id) + ": " + task.title)
@@ -1158,15 +1480,15 @@ def _execute_task(
             approved = _approved_commit(actl_dir, task)
         except tasks.TaskError as exc:
             _fail(str(exc))
-            return 1, str(exc)
-        return _complete_task(actl_dir, root, task, approved, base_branch)
+            return 1, str(exc), run
+        return _complete_task(actl_dir, root, task, approved, run)
 
     try:
         attempts, feedback = _attempt_baseline(actl_dir, task)
     except execution.ExecutionError as exc:
         # A corrupt or unreadable attempt record is an infrastructure
         # failure: fail the task instead of silently resetting its budget.
-        return _verification_failed(actl_dir, task.id, str(exc))
+        return _verification_failed(actl_dir, task.id, str(exc), run)
 
     print("task t" + str(task.id) + ": " + task.title)
     # Validate and review the existing committed implementation first when
@@ -1197,17 +1519,17 @@ def _execute_task(
 
     if review_first:
         verification = _validate_and_review(
-            binary, root, actl_dir, task, base_branch, reviewer_model,
+            binary, root, actl_dir, task, run.branch, reviewer_model,
             validation_commands, lock_fd, attempt=max(attempts, 1),
             announce_worktree=True,
         )
         if verification.outcome == "approved":
             return _complete_task(
-                actl_dir, root, task, verification.commit, base_branch,
+                actl_dir, root, task, verification.commit, run,
             )
         if verification.outcome == "failed":
             return _verification_failed(
-                actl_dir, task.id, verification.reason,
+                actl_dir, task.id, verification.reason, run,
                 log_hint=verification.log_hint,
             )
         # The existing implementation spends one worker attempt: it was
@@ -1216,7 +1538,7 @@ def _execute_task(
         feedback = verification.feedback
         execution.record_attempt_state(actl_dir, task.id, attempts, feedback)
         if attempts >= execution.MAX_WORKER_ATTEMPTS:
-            return _needs_human(actl_dir, task, verification, attempts)
+            return _needs_human(actl_dir, task, verification, attempts, run)
         _set_task_status(actl_dir, task.id, tasks.STATUS_RUNNING)
 
     while attempts < execution.MAX_WORKER_ATTEMPTS:
@@ -1227,7 +1549,7 @@ def _execute_task(
             + str(execution.MAX_WORKER_ATTEMPTS) + " (" + model + ")"
         )
         status, reason, log_path = _run_worker_attempt(
-            binary, root, actl_dir, task, lock_fd, base_branch,
+            binary, root, actl_dir, task, lock_fd, run.branch,
             attempt=attempt, model=model, feedback=feedback,
             retry=not (attempt == 1 and task.status == tasks.STATUS_PENDING),
             announce_worktree=attempt == 1,
@@ -1240,7 +1562,7 @@ def _execute_task(
                 + " (log: " + str(log_path) + ")"
             )
             _fail(message)
-            return 1, "worker failed"
+            return 1, "worker failed", run
         attempts = attempt
         # The attempt counts as used only now that it completed; an
         # interrupted attempt is retried under the same number and does not
@@ -1252,27 +1574,27 @@ def _execute_task(
         _event("Task status: IMPLEMENTED")
 
         verification = _validate_and_review(
-            binary, root, actl_dir, task, base_branch, reviewer_model,
+            binary, root, actl_dir, task, run.branch, reviewer_model,
             validation_commands, lock_fd, attempt=attempt,
         )
         if verification.outcome == "approved":
             return _complete_task(
-                actl_dir, root, task, verification.commit, base_branch,
+                actl_dir, root, task, verification.commit, run,
             )
         if verification.outcome == "failed":
             return _verification_failed(
-                actl_dir, task.id, verification.reason,
+                actl_dir, task.id, verification.reason, run,
                 log_hint=verification.log_hint,
             )
         feedback = verification.feedback
         execution.record_attempt_state(actl_dir, task.id, attempts, feedback)
         if attempts >= execution.MAX_WORKER_ATTEMPTS:
-            return _needs_human(actl_dir, task, verification, attempts)
+            return _needs_human(actl_dir, task, verification, attempts, run)
         _set_task_status(actl_dir, task.id, tasks.STATUS_RUNNING)
 
     # The budget was already exhausted by an earlier attempt (for example a
     # reviewer execution error after the third worker attempt).
-    return _needs_human(actl_dir, task, None, attempts)
+    return _needs_human(actl_dir, task, None, attempts, run)
 
 
 def _run_worker_attempt(
@@ -1724,7 +2046,9 @@ def _log_review_failure(log, reason: str) -> None:
     log.flush()
 
 
-def _verification_failed(actl_dir, task_id, reason, log_hint=None) -> tuple:
+def _verification_failed(
+    actl_dir, task_id, reason, run, log_hint=None,
+) -> tuple:
     """Mark a task FAILED after validation, review, or state loading failed."""
     _set_task_status(actl_dir, task_id, tasks.STATUS_FAILED)
     print("")
@@ -1733,7 +2057,7 @@ def _verification_failed(actl_dir, task_id, reason, log_hint=None) -> tuple:
     if log_hint is not None:
         message += " (log: " + str(log_hint) + ")"
     _fail(message)
-    return 1, "verification failed"
+    return 1, "verification failed", run
 
 
 def _record_review(actl_dir: Path, task_id: int, commit: str, verdict) -> None:
@@ -1860,11 +2184,11 @@ def _file_tail(path, limit: int = 4000) -> str:
 def _approved_commit(actl_dir: Path, task) -> str:
     """Return the commit the task's stored approval refers to, or raise.
 
-    The approved commit comes from the recorded reviewer verdict, so
-    integration merges exactly the commit that was validated and approved -
-    never whatever the task branch happens to point at now. A task marked
-    APPROVED without a recorded approval is an inconsistent state and is
-    reported instead of merged.
+    The approved commit comes from the recorded reviewer verdict, so staging
+    merges exactly the commit that was validated and approved - never
+    whatever the task branch happens to point at now. A task marked APPROVED
+    without a recorded approval is an inconsistent state and is reported
+    instead of staged.
     """
     conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
     try:
@@ -1884,36 +2208,54 @@ def _approved_commit(actl_dir: Path, task) -> str:
     return stored["commit_sha"]
 
 
-def _complete_task(actl_dir, root, task, commit, base_branch) -> tuple:
-    """Persist APPROVED, fast-forward the base branch, then mark the task DONE.
+def _complete_task(actl_dir, root, task, commit, run) -> tuple:
+    """Persist APPROVED, fast-forward into the run branch, then mark STAGED.
 
-    The approval is recorded before Git is touched: when integration is
-    impossible (a dirty base worktree, a non-fast-forward merge, a moved task
-    branch) the task keeps its APPROVED state and an explicit rerun attempts
-    the integration again without rerunning the worker, validation, or
-    review. DONE is recorded only after the merge succeeded, so a failure
-    between the two Git/SQLite steps leaves the exact approved commit ready
-    for a safe repeat.
+    The approval is recorded before Git is touched: when staging is
+    impossible (a dirty run worktree, a non-fast-forward merge, a moved task
+    branch) the task keeps its APPROVED state and an explicit rerun stages
+    the same approved commit again without rerunning the worker, validation,
+    or review. STAGED is recorded only after the merge succeeded, so a
+    failure between the two Git/SQLite steps leaves the exact approved commit
+    ready for a safe repeat.
+
+    The base branch is never touched here: only ``actl run merge`` integrates
+    a run branch into the configured base branch.
     """
     _set_task_status(actl_dir, task.id, tasks.STATUS_APPROVED)
-    _event("Fast-forward merging...")
+    _event("Fast-forward merging into run r" + str(run.id) + "...")
     try:
         execution.integrate_commit(
-            root, actl_dir, base_branch, execution.branch_name(task.id),
+            root, actl_dir, run.branch, execution.branch_name(task.id),
             commit,
         )
     except execution.ExecutionError as exc:
         print("")
-        print("Task t" + str(task.id) + " \u2192 APPROVED (not merged)")
-        _fail("task t" + str(task.id) + " integration failed: " + str(exc))
-        return 1, "integration failed"
-    _set_task_status(actl_dir, task.id, tasks.STATUS_DONE)
+        print("Task t" + str(task.id) + " \u2192 APPROVED (not staged)")
+        _fail(
+            "task t" + str(task.id) + " staging failed: " + str(exc)
+            + " (the task keeps its APPROVED state)"
+        )
+        return 1, "staging failed", run
+    try:
+        _stage_task(actl_dir, task.id, run.id)
+    except (tasks.TaskError, sqlite3.Error) as exc:
+        # The commit is already in the run branch; a rerun detects that and
+        # records STAGED without rerunning the worker, validation, or review.
+        print("")
+        print("Task t" + str(task.id) + " \u2192 APPROVED (not staged)")
+        _fail(
+            "task t" + str(task.id) + " was merged into run r" + str(run.id)
+            + " but could not be marked STAGED (" + str(exc)
+            + "); run the task again to record it"
+        )
+        return 1, "staging status failed", run
     print("")
-    print("Task t" + str(task.id) + " \u2192 DONE")
-    return 0, ""
+    print("Task t" + str(task.id) + " \u2192 STAGED (run r" + str(run.id) + ")")
+    return 0, "", run
 
 
-def _needs_human(actl_dir, task, verification, attempts) -> tuple:
+def _needs_human(actl_dir, task, verification, attempts, run) -> tuple:
     """Mark the task NEEDS_HUMAN after its three attempts are exhausted."""
     _set_task_status(actl_dir, task.id, tasks.STATUS_NEEDS_HUMAN)
     print("")
@@ -1947,7 +2289,7 @@ def _needs_human(actl_dir, task, verification, attempts) -> tuple:
         " fresh three-attempt budget)"
     )
     _fail(message)
-    return 1, "needs human intervention"
+    return 1, "needs human intervention", run
 
 
 def _finding_summary(findings) -> str:
@@ -2010,36 +2352,149 @@ def _evaluate_run(worktree, exit_code: int, base_branch: str):
     return tasks.STATUS_IMPLEMENTED, ""
 
 
-def _require_runnable(task, actl_dir: Path) -> None:
+def _dependency_staged_message(task_id: int, dep_id: int, run_id) -> str:
+    """The actionable refusal for a dependency staged in another run.
+
+    The message names the run and the exact command that marks the
+    dependency DONE; the same command also finalizes the statuses after a
+    manual merge, so it is the one instruction the user needs.
+    """
+    run = "r" + str(run_id) if run_id is not None else "another run"
+    return (
+        "Cannot execute task t" + str(task_id) + ".\n"
+        "\n"
+        "Dependency t" + str(dep_id) + " is STAGED in run " + run
+        + " and must be\n"
+        "marked DONE before this task can execute.\n"
+        "\n"
+        "Run:\n"
+        "    actl run merge " + run + "\n"
+        "\n"
+        "If you already merged " + run + " manually, execute the\n"
+        "same command to finalize its status."
+    )
+
+
+def _staged_block_message(task) -> str:
+    """The actionable refusal for a task that is already staged."""
+    run = "r" + str(task.run_id) if task.run_id is not None else "another run"
+    return (
+        "Cannot execute task t" + str(task.id) + ".\n"
+        "\n"
+        "Task t" + str(task.id) + " is STAGED in run " + run
+        + " and must be\n"
+        "marked DONE before it can execute.\n"
+        "\n"
+        "Run:\n"
+        "    actl run merge " + run + "\n"
+        "\n"
+        "If you already merged " + run + " manually, execute the\n"
+        "same command to finalize its status."
+    )
+
+
+def _staged_run_message(run) -> str:
+    """The actionable refusal for starting a second, unmerged run."""
+    name = "r" + str(run.id)
+    return (
+        "Cannot start a new run: run " + name + " still holds staged\n"
+        "tasks and must be integrated first.\n"
+        "\n"
+        "Run:\n"
+        "    actl run merge " + name + "\n"
+        "\n"
+        "If you already merged " + name + " manually, execute the\n"
+        "same command to finalize its status."
+    )
+
+
+def _staged_unmerged_run(actl_dir: Path):
+    """Return the oldest non-integrated run that still holds STAGED tasks."""
+    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    try:
+        for run in tasks.list_runs(conn):
+            if run.status == tasks.RUN_INTEGRATED:
+                continue
+            staged = any(
+                task.status == tasks.STATUS_STAGED
+                for task in tasks.run_tasks(conn, run.id)
+            )
+            if staged:
+                return run
+        return None
+    finally:
+        conn.close()
+
+
+def _new_run_refusal(actl_dir: Path, blocker, requested) -> str:
+    """Explain what blocks a new run, task by task first.
+
+    The requested tasks (or every eligible task for ``--all``) are inspected
+    before falling back to the generic run refusal, so a task whose own
+    dependency is staged in another run gets the exact, actionable message
+    that names the dependency and the run to merge.
+    """
+    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    try:
+        if requested is not None:
+            candidates = [tasks.get_task(conn, task_id) for task_id in requested]
+        else:
+            candidates = [
+                task for task in tasks.list_tasks(conn)
+                if task.status in _RUNNABLE_STATUSES
+            ]
+        for task in candidates:
+            if task.status == tasks.STATUS_STAGED:
+                return _staged_block_message(task)
+            for dep, status, dep_run in tasks.unfinished_dependencies(
+                conn, task.id, None
+            ):
+                if status == tasks.STATUS_STAGED:
+                    return _dependency_staged_message(task.id, dep, dep_run)
+        return _staged_run_message(blocker)
+    finally:
+        conn.close()
+
+
+def _require_runnable(task, actl_dir: Path, run) -> None:
     """Refuse tasks that may not be executed.
 
-    A task is eligible only when every dependency is DONE: APPROVED is not
-    enough, because DONE means the approved commit was actually integrated
-    into the base branch. An IMPLEMENTED task proceeds straight to validation
-    and review without rerunning the worker; an APPROVED task proceeds
-    straight to integration of its approved commit. A NEEDS_CHANGES task from
-    Stage 5 continues from its remaining attempts. A NEEDS_HUMAN task refuses
-    to run while its exhausted attempt record exists: another automatic cycle
-    would silently restart the budget, so the human must intervene (removing
-    ``.actl/attempts/tN`` deliberately grants a fresh one). A DONE task
-    already finished successfully and is never executed again.
+    A task is eligible only when every dependency is satisfied: DONE (its
+    approved work reached the base branch through an integrated run) or
+    STAGED in the run ``task`` is currently executing in (the approved work
+    is part of the same run branch). An APPROVED dependency is not enough.
+    An IMPLEMENTED task proceeds straight to validation and review without
+    rerunning the worker; an APPROVED task proceeds straight to staging of
+    its approved commit. A NEEDS_CHANGES task from Stage 5 continues from its
+    remaining attempts. A NEEDS_HUMAN task refuses to run while its exhausted
+    attempt record exists: another automatic cycle would silently restart the
+    budget, so the human must intervene (removing ``.actl/attempts/tN``
+    deliberately grants a fresh one). A DONE task already finished
+    successfully and is never executed again.
     """
     if task.depends_on:
-        unfinished = _unfinished_dependencies(actl_dir, task)
+        unfinished = _unfinished_dependencies(actl_dir, task, run)
         if unfinished:
+            for dep, status, dep_run in unfinished:
+                if status == tasks.STATUS_STAGED:
+                    raise tasks.TaskError(
+                        _dependency_staged_message(task.id, dep, dep_run)
+                    )
             detail = ", ".join(
                 "t" + str(dep) + " (" + status + ")"
-                for dep, status in unfinished
+                for dep, status, _ in unfinished
             )
             raise tasks.TaskError(
                 "cannot run task t" + str(task.id) + ": it depends on "
                 + detail + "; a task can run only when all its dependencies"
-                " are DONE"
+                " are DONE or STAGED in the current run"
             )
     if task.status == tasks.STATUS_DONE:
         raise tasks.TaskError(
             "cannot run task t" + str(task.id) + ": it is already DONE"
         )
+    if task.status == tasks.STATUS_STAGED:
+        raise tasks.TaskError(_staged_block_message(task))
     if task.status == tasks.STATUS_NEEDS_HUMAN:
         if execution.attempt_state(actl_dir, task.id) is None:
             return
@@ -2061,11 +2516,57 @@ def _require_runnable(task, actl_dir: Path) -> None:
         )
 
 
-def _unfinished_dependencies(actl_dir: Path, task):
-    """Return the ``(id, status)`` pairs of non-DONE dependencies."""
+def _unfinished_dependencies(actl_dir: Path, task, run):
+    """Return the ``(id, status, run_id)`` triples of unsatisfied dependencies."""
     conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
     try:
-        return tasks.unfinished_dependencies(conn, task.id)
+        return tasks.unfinished_dependencies(
+            conn, task.id, run.id if run is not None else None
+        )
+    finally:
+        conn.close()
+
+
+def _running_run(actl_dir: Path):
+    """Return the project's RUNNING run, or None."""
+    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    try:
+        return tasks.running_run(conn)
+    finally:
+        conn.close()
+
+
+def _create_run(actl_dir: Path, root: Path, base_branch: str):
+    """Create a new RUNNING run starting at the current base branch commit."""
+    execution.require_base(root, base_branch)
+    start = execution.ref_commit(root, "refs/heads/" + base_branch)
+    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    try:
+        return tasks.create_run(conn, base_branch, start)
+    finally:
+        conn.close()
+
+
+def _load_run(actl_dir: Path, run_id: int):
+    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    try:
+        return tasks.get_run(conn, run_id)
+    finally:
+        conn.close()
+
+
+def _stage_task(actl_dir: Path, task_id: int, run_id: int) -> None:
+    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    try:
+        tasks.stage_task(conn, task_id, run_id)
+    finally:
+        conn.close()
+
+
+def _set_run_status(actl_dir: Path, run_id: int, status: str) -> None:
+    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    try:
+        tasks.set_run_status(conn, run_id, status)
     finally:
         conn.close()
 
@@ -2118,6 +2619,7 @@ def _read_description_file(path_text: str) -> str:
 
 
 _TASK_ID_RE = re.compile(r"[tT]?([0-9]+)")
+_RUN_ID_RE = re.compile(r"[rR]?([0-9]+)")
 
 
 def _parse_task_id(value: str) -> int:
@@ -2130,6 +2632,18 @@ def _parse_task_id(value: str) -> int:
     if task_id == 0:
         raise tasks.TaskError("invalid task id " + repr(value) + " (ids start at t1)")
     return task_id
+
+
+def _parse_run_id(value: str) -> int:
+    match = _RUN_ID_RE.fullmatch(value.strip())
+    if match is None:
+        raise tasks.TaskError(
+            "invalid run id " + repr(value) + " (expected rN or N, e.g. r1)"
+        )
+    run_id = int(match.group(1))
+    if run_id == 0:
+        raise tasks.TaskError("invalid run id " + repr(value) + " (ids start at r1)")
+    return run_id
 
 
 def _parse_dependencies(values) -> list:
@@ -2247,7 +2761,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = task_sub.add_parser(
         "run",
-        help="execute tasks: worker, validation, review, and integration",
+        help="execute tasks: worker, validation, review, and staging",
     )
     run.add_argument(
         "ids", nargs="*", metavar="ID",
@@ -2257,6 +2771,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--all", action="store_true", dest="all_tasks",
         help="run every eligible task in dependency order",
     )
+
+    run_parser = subparsers.add_parser(
+        "run", help="inspect runs and integrate them into the base branch"
+    )
+    run_sub = run_parser.add_subparsers(dest="run_command", required=True)
+
+    run_sub.add_parser("list", help="list runs")
+
+    run_show = run_sub.add_parser("show", help="show one run")
+    run_show.add_argument("id", help="run id (rN or N)")
+
+    run_merge = run_sub.add_parser(
+        "merge",
+        help="fast-forward a completed run into the configured base branch",
+    )
+    run_merge.add_argument("id", help="run id (rN or N)")
     return parser
 
 
@@ -2275,12 +2805,19 @@ def main(argv=None) -> int:
         return cmd_init(args)
     if args.command == "plan":
         return cmd_plan(args)
+    if args.command == "task":
+        handlers = {
+            "create": cmd_task_create,
+            "list": cmd_task_list,
+            "show": cmd_task_show,
+            "update": cmd_task_update,
+            "delete": cmd_task_delete,
+            "run": cmd_task_run,
+        }
+        return handlers[args.task_command](args)
     handlers = {
-        "create": cmd_task_create,
-        "list": cmd_task_list,
-        "show": cmd_task_show,
-        "update": cmd_task_update,
-        "delete": cmd_task_delete,
-        "run": cmd_task_run,
+        "list": cmd_run_list,
+        "show": cmd_run_show,
+        "merge": cmd_run_merge,
     }
-    return handlers[args.task_command](args)
+    return handlers[args.run_command](args)

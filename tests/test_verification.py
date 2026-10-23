@@ -80,6 +80,14 @@ class VerificationTestCase(TaskRunTestCase):
         finally:
             conn.close()
 
+    def interrupt_run(self, run_id=1):
+        """Leave the run RUNNING, as an interrupted execution would."""
+        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        try:
+            tasks.set_run_status(conn, run_id, tasks.RUN_RUNNING)
+        finally:
+            conn.close()
+
     # -- call helpers -----------------------------------------------------
 
     def reviewer_prompt(self):
@@ -132,7 +140,7 @@ class ValidationTests(VerificationTestCase):
         self.make_task("Add the feature")
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
         self.assertIn("Validation started (2 commands)", result.stdout)
         self.assertIn("Validation passed", result.stdout)
         self.assertIn("validation log: ", result.stdout)
@@ -237,7 +245,7 @@ class ValidationTests(VerificationTestCase):
         )
         self.assertEqual(self.validation_logs(), [])
         self.assertIn("Automated validation was skipped", self.reviewer_prompt())
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
 
     def test_empty_validation_command_list_skips_validation(self):
         self.set_validation()
@@ -274,10 +282,10 @@ class ReviewTests(VerificationTestCase):
         self.make_task("Add the feature")
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
         self.assertIn("Reviewer started (model reviewer/model)", result.stdout)
         self.assertIn("Review approved (no findings)", result.stdout)
-        self.assertIn("Task t1 \u2192 DONE", result.stdout)
+        self.assertIn("Task t1 \u2192 STAGED (run r1)", result.stdout)
         self.assertIn("review log: ", result.stdout)
 
         call = self.reviewer_calls()[-1]
@@ -311,7 +319,7 @@ class ReviewTests(VerificationTestCase):
         self.make_task()
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
         self.assertIn("Review approved (2 minor findings)", result.stdout)
         self.assertIn(
             "Malformed configuration files may produce an unclear error.",
@@ -329,7 +337,7 @@ class ReviewTests(VerificationTestCase):
         self.make_task()
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
         self.assertIn("Review approved (1 suggestion finding)", result.stdout)
 
     def test_reviewer_rejects_with_major_findings(self):
@@ -439,7 +447,7 @@ class ReviewTests(VerificationTestCase):
         self.make_task()
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
 
     def test_unknown_decision_is_refused(self):
         self.env["ACTL_FAKE_REVIEW_JSON"] = self.review_json("maybe", [])
@@ -505,10 +513,12 @@ class ReviewTests(VerificationTestCase):
     def test_reviewer_evaluates_the_cumulative_task_diff(self):
         self.make_task("Add the feature")
         self.assertEqual(self.run_task("t1").returncode, 0)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
 
-        # Simulate a Stage 4 task left at IMPLEMENTED, then a human fix.
+        # An interrupted execution left the task at IMPLEMENTED; a human fix
+        # is committed on its branch before the run is resumed.
         self.set_task_status("IMPLEMENTED")
+        self.interrupt_run()
         worktree = self.worktree()
         (worktree / "second.txt").write_text("second change\n", encoding="utf-8")
         self.commit("second change", cwd=worktree)
@@ -575,7 +585,7 @@ class ReviewTests(VerificationTestCase):
         self.make_task()
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
         self.assertFalse((self.worktree() / "reviewer-scratch.txt").exists())
         self.assertFalse(Path(self.reviewer_calls()[-1]["cwd"]).exists())
 
@@ -661,7 +671,7 @@ class PolicyTests(VerificationTestCase):
         self.make_task()
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
         self.assertIn("1 minor, 1 suggestion", result.stdout)
 
     def test_critical_and_major_findings_block_approval(self):
@@ -718,19 +728,19 @@ class Stage5IntegrationTests(VerificationTestCase):
     def test_implemented_task_is_validated_and_reviewed_without_the_worker(self):
         self.make_task("Add the feature")
         self.set_validation("echo check")
-        # The dirty base worktree blocks the integration, so the first run
-        # ends APPROVED with its implementation still unmerged.
-        self.dirty_base()
-        self.assertNotEqual(self.run_task("t1").returncode, 0)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(self.task_status(), "STAGED")
         self.assertEqual(len(self.worker_calls()), 1)
-        self.clean_base()
 
-        # Simulate a Stage 4 task left at IMPLEMENTED.
+        # An interrupted execution left the task at IMPLEMENTED before it was
+        # staged: the run is resumed and the committed implementation is
+        # validated and reviewed again without rerunning the worker.
         self.set_task_status("IMPLEMENTED")
+        self.rewind_run_to_base()
+        self.interrupt_run()
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
         self.assertEqual(len(self.worker_calls()), 1, "the worker must not rerun")
         self.assertEqual(len(self.reviewer_calls()), 2)
         self.assertIn("Reusing worktree", result.stdout)
@@ -739,20 +749,20 @@ class Stage5IntegrationTests(VerificationTestCase):
     def test_implemented_task_is_validated_and_reviewed_without_a_worker_model(self):
         self.make_task("Add the feature")
         self.set_validation("echo check")
-        self.dirty_base()
-        self.assertNotEqual(self.run_task("t1").returncode, 0)
-        self.assertEqual(self.task_status(), "APPROVED")
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(self.task_status(), "STAGED")
         self.assertEqual(len(self.worker_calls()), 1)
-        self.clean_base()
 
-        # Simulate a Stage 4 task left at IMPLEMENTED in a project that never
-        # configured a worker model: the reviewer model alone is enough to
-        # validate and review it.
+        # An interrupted execution left the task at IMPLEMENTED before it was
+        # staged, in a project that never configured a worker model: the
+        # reviewer model alone is enough to validate and review it.
         self.set_task_status("IMPLEMENTED")
+        self.rewind_run_to_base()
+        self.interrupt_run()
         self.remove_worker_model()
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
         self.assertEqual(len(self.worker_calls()), 1, "the worker must not rerun")
         self.assertEqual(len(self.reviewer_calls()), 2)
         self.assertIn("Validation passed", result.stdout)
@@ -817,6 +827,8 @@ class Stage5IntegrationTests(VerificationTestCase):
     def test_done_task_is_not_run_again(self):
         self.make_task()
         self.assertEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(self.integrate().returncode, 0)
+        self.assertEqual(self.task_status(), "DONE")
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("already DONE", result.stderr)
@@ -847,13 +859,14 @@ class Stage5IntegrationTests(VerificationTestCase):
         self.assertEqual(len(self.worker_calls()), 3, "no automatic restart")
         self.assertEqual(len(self.reviewer_calls()), 3)
 
-    def test_approval_merges_and_moves_the_base_branch(self):
+    def test_staging_leaves_the_base_branch_untouched(self):
         self.make_task()
         self.assertEqual(self.run_task("t1").returncode, 0)
-        self.assertEqual(self.task_status(), "DONE")
-        # The base branch fast-forwards to the approved commit; it is never
-        # reset or rewritten and the base checkout stays clean.
-        self.assertEqual(self.rev("main"), self.rev("actl/t1"))
+        self.assertEqual(self.task_status(), "STAGED")
+        # Execution stages the approved commit into the run branch only;
+        # the base branch moves when the run is integrated explicitly.
+        self.assertEqual(self.rev("main"), self.base_sha)
+        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t1"))
         self.assertEqual(
             self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip(), "main"
         )
@@ -863,6 +876,16 @@ class Stage5IntegrationTests(VerificationTestCase):
         stored = self.latest_review()
         self.assertEqual(stored["commit_sha"], self.rev("actl/t1"))
         self.assertEqual(stored["commit_sha"], self.rev("HEAD", cwd=self.worktree()))
+
+        self.assertEqual(self.integrate().returncode, 0)
+        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.rev("main"), self.rev("actl/t1"))
+        self.assertEqual(
+            self.git("rev-parse", "--abbrev-ref", "HEAD").stdout.strip(), "main"
+        )
+        self.assertEqual(
+            self.git("status", "--porcelain").stdout, "", "main stays clean"
+        )
 
     def test_reviewer_model_is_stored_and_validated(self):
         metadata = self.metadata()
@@ -886,12 +909,13 @@ class Stage5IntegrationTests(VerificationTestCase):
     def test_dirty_worktree_is_refused_before_validation(self):
         self.make_task()
         self.assertEqual(self.run_task("t1").returncode, 0)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
         reviews = len(self.reviewer_calls())
 
-        # A Stage 4 task left at IMPLEMENTED with an uncommitted tracked
+        # An interrupted task at IMPLEMENTED with an uncommitted tracked
         # change must not be validated or reviewed.
         self.set_task_status("IMPLEMENTED")
+        self.interrupt_run()
         (self.worktree() / "worker-output.txt").write_text(
             "uncommitted\n", encoding="utf-8"
         )
@@ -917,12 +941,13 @@ class Stage5IntegrationTests(VerificationTestCase):
     def test_a_deleted_task_branch_is_never_reviewed_empty(self):
         self.make_task()
         self.assertEqual(self.run_task("t1").returncode, 0)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
         reviews = len(self.reviewer_calls())
 
-        # A Stage 4 task whose branch is gone: re-creating it from the base
+        # A task whose branch is gone: re-creating it from the run branch
         # must not turn an empty implementation into a reviewed task.
         self.set_task_status("IMPLEMENTED")
+        self.interrupt_run()
         self.git("worktree", "remove", "--force", str(self.worktree()))
         self.git("branch", "-D", "actl/t1")
         result = self.run_task("t1")
@@ -936,13 +961,15 @@ class Stage5IntegrationTests(VerificationTestCase):
     def test_review_uses_the_recorded_branch_base(self):
         self.make_task("Add the feature")
         self.assertEqual(self.run_task("t1").returncode, 0)
-        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.task_status(), "STAGED")
         first_commit = self.rev("actl/t1")
 
-        # A Stage 4 task left at IMPLEMENTED; the project's base branch is
-        # reconfigured after the first task commit. The review diff must
-        # still start at the commit the branch was created from.
+        # An interrupted execution left the task at IMPLEMENTED; the
+        # project's base branch is reconfigured after the first task commit.
+        # The review diff must still start at the commit the branch was
+        # created from.
         self.set_task_status("IMPLEMENTED")
+        self.interrupt_run()
         self.git("branch", "develop", first_commit)
         (self.worktree() / "second.txt").write_text(
             "second change\n", encoding="utf-8"

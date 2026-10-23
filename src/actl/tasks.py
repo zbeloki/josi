@@ -1,12 +1,18 @@
 """SQLite-backed task storage for actl.
 
 Stage 2 keeps the project's tasks in a small SQLite database at
-``.actl/tasks.db``. The schema has three tables: ``tasks``, ``dependencies``,
-and ``reviews``. There is no BLOCKED status - whether a task is blocked is
-derived from its dependencies when needed. A task's status is PENDING,
-RUNNING, IMPLEMENTED, FAILED, APPROVED, NEEDS_CHANGES, NEEDS_HUMAN, or DONE
-(Stage 7, recorded only after the approved commit was integrated into the
-base branch); only ``actl task run`` moves a task between them.
+``.actl/tasks.db``. The schema has four tables: ``tasks``, ``dependencies``,
+``reviews``, and ``runs``. There is no BLOCKED status - whether a task is
+blocked is derived from its dependencies when needed. A task's status is
+PENDING, RUNNING, IMPLEMENTED, FAILED, APPROVED, NEEDS_CHANGES, NEEDS_HUMAN,
+STAGED, or DONE; only ``actl task run`` moves a task between them.
+
+Stage 7 groups executions into runs: a run row records the run branch, its
+status (RUNNING while executing, COMPLETE once execution stopped, INTEGRATED
+after ``actl run merge``), the base branch it started from, and its start and
+final commits. A task that was approved and fast-forwarded into its run branch
+is STAGED and keeps the id of that run in ``tasks.run_id``; ``actl run merge``
+turns its STAGED tasks DONE once the run branch is part of the base branch.
 
 Reviewer verdicts are stored in ``reviews`` (one row per completed review,
 newest last) so later stages can read the findings that belong to a task's
@@ -37,11 +43,18 @@ STATUS_FAILED = "FAILED"
 STATUS_APPROVED = "APPROVED"
 STATUS_NEEDS_CHANGES = "NEEDS_CHANGES"
 STATUS_NEEDS_HUMAN = "NEEDS_HUMAN"
+STATUS_STAGED = "STAGED"
 STATUS_DONE = "DONE"
 STATUSES = (
     STATUS_PENDING, STATUS_RUNNING, STATUS_IMPLEMENTED, STATUS_FAILED,
-    STATUS_APPROVED, STATUS_NEEDS_CHANGES, STATUS_NEEDS_HUMAN, STATUS_DONE,
+    STATUS_APPROVED, STATUS_NEEDS_CHANGES, STATUS_NEEDS_HUMAN, STATUS_STAGED,
+    STATUS_DONE,
 )
+RUN_RUNNING = "RUNNING"
+RUN_COMPLETE = "COMPLETE"
+RUN_INTEGRATED = "INTEGRATED"
+RUN_STATUSES = (RUN_RUNNING, RUN_COMPLETE, RUN_INTEGRATED)
+RUN_BRANCH_PREFIX = "actl/run/"
 REVIEW_APPROVED = "approved"
 REVIEW_CHANGES_REQUESTED = "changes_requested"
 REVIEW_DECISIONS = (REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED)
@@ -51,11 +64,23 @@ REVIEW_DECISIONS = (REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED)
 # schema. ON DELETE RESTRICT is a safety net; delete_task() refuses deletions
 # with dependents and names them in the error message.
 SCHEMA = """
+CREATE TABLE IF NOT EXISTS runs (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    branch TEXT NOT NULL,
+    base_branch TEXT NOT NULL,
+    status TEXT NOT NULL,
+    start_commit TEXT NOT NULL,
+    final_commit TEXT,
+    created_at TEXT NOT NULL,
+    updated_at TEXT NOT NULL
+);
+
 CREATE TABLE IF NOT EXISTS tasks (
     id INTEGER PRIMARY KEY AUTOINCREMENT,
     title TEXT NOT NULL,
     description TEXT NOT NULL DEFAULT '',
     status TEXT NOT NULL DEFAULT 'PENDING',
+    run_id INTEGER REFERENCES runs(id),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -84,7 +109,12 @@ class TaskError(Exception):
 
 @dataclass(frozen=True)
 class Task:
-    """A stored task plus the ids it depends on (sorted ascending)."""
+    """A stored task plus the ids it depends on (sorted ascending).
+
+    ``run_id`` is the run a STAGED task is staged in; it stays recorded after
+    ``actl run merge`` turns the task DONE so the association between a run
+    and its tasks survives integration.
+    """
 
     id: int
     title: str
@@ -93,13 +123,36 @@ class Task:
     created_at: str
     updated_at: str
     depends_on: tuple
+    run_id: int = None
+
+
+@dataclass(frozen=True)
+class Run:
+    """A run: its branch, lifecycle status, and recorded commits.
+
+    ``status`` is RUNNING while the run executes (an interrupted execution
+    stays RUNNING until it is resumed), COMPLETE once execution stopped and
+    the final commit was recorded, and INTEGRATED after ``actl run merge``
+    fast-forwarded the run branch into the configured base branch.
+    """
+
+    id: int
+    branch: str
+    base_branch: str
+    status: str
+    start_commit: str
+    final_commit: object
+    created_at: str
+    updated_at: str
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
     """Open ``db_path``, creating the schema when needed.
 
     Raises :class:`TaskError` when the file cannot be opened or is not a
-    usable SQLite database; a damaged file is never overwritten.
+    usable SQLite database; a damaged file is never overwritten. Existing
+    databases from earlier stages gain the ``runs`` table and the
+    ``tasks.run_id`` column without touching their data.
     """
     try:
         conn = sqlite3.connect(str(db_path))
@@ -111,12 +164,24 @@ def connect(db_path: Path) -> sqlite3.Connection:
         conn.row_factory = sqlite3.Row
         conn.execute("PRAGMA foreign_keys = ON")
         conn.executescript(SCHEMA)
+        _migrate(conn)
     except sqlite3.Error as exc:
         conn.close()
         raise TaskError(
             "cannot open task database " + str(db_path) + " (" + str(exc) + ")"
         )
     return conn
+
+
+def _migrate(conn) -> None:
+    """Add ``tasks.run_id`` to databases created before Stage 7."""
+    columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
+    }
+    if "run_id" not in columns:
+        conn.execute(
+            "ALTER TABLE tasks ADD COLUMN run_id INTEGER REFERENCES runs(id)"
+        )
 
 
 def create_task(conn, title, description, depends_on=()) -> Task:
@@ -252,25 +317,144 @@ def latest_review(conn, task_id: int):
     }
 
 
-def unfinished_dependencies(conn, task_id: int) -> list:
-    """Return the ``(id, status)`` pairs of dependencies that are not DONE.
+def unfinished_dependencies(conn, task_id: int, run_id=None) -> list:
+    """Return the ``(id, status, run_id)`` triples of unsatisfied dependencies.
 
-    A dependency is satisfied only by ``DONE``: an ``APPROVED`` dependency is
-    not yet integrated, so it does not unlock its dependents.
+    A dependency is satisfied by ``DONE`` (its approved work reached the base
+    branch through an integrated run) or by ``STAGED`` in the run the
+    dependent is currently executing in: the dependency's approved commit is
+    already in that same run branch. A dependency STAGED in any other run is
+    not satisfied - it must first be marked DONE through ``actl run merge``.
     """
     return [
-        (row["depends_on_id"], row["status"])
+        (row["depends_on_id"], row["status"], row["run_id"])
         for row in conn.execute(
             "SELECT dependencies.depends_on_id AS depends_on_id,"
-            " COALESCE(tasks.status, 'missing') AS status"
+            " COALESCE(tasks.status, 'missing') AS status,"
+            " tasks.run_id AS run_id"
             " FROM dependencies LEFT JOIN tasks"
             " ON tasks.id = dependencies.depends_on_id"
             " WHERE dependencies.task_id = ?"
             " AND COALESCE(tasks.status, '') <> ?"
+            " AND NOT (tasks.status = ? AND tasks.run_id IS ?)"
             " ORDER BY dependencies.depends_on_id",
-            (task_id, STATUS_DONE),
+            (task_id, STATUS_DONE, STATUS_STAGED, _run_key(run_id)),
         )
     ]
+
+
+def _run_key(run_id):
+    """Return a value SQLite can compare with ``IS`` against ``run_id``.
+
+    ``run_id`` is None while a batch has not created its run yet; -1 can
+    never be a real run id (they start at 1), so it never matches a row.
+    """
+    return run_id if run_id is not None else -1
+
+
+def create_run(conn, base_branch: str, start_commit: str) -> Run:
+    """Insert a new RUNNING run and return it.
+
+    The branch name embeds the autoincrement id, so the row is inserted
+    first and its branch recorded in the same transaction.
+    """
+    now = _utc_now()
+    with conn:
+        cursor = conn.execute(
+            "INSERT INTO runs (branch, base_branch, status, start_commit,"
+            " created_at, updated_at) VALUES ('', ?, ?, ?, ?, ?)",
+            (base_branch, RUN_RUNNING, start_commit, now, now),
+        )
+        run_id = cursor.lastrowid
+        branch = RUN_BRANCH_PREFIX + "r" + str(run_id)
+        conn.execute(
+            "UPDATE runs SET branch = ? WHERE id = ?", (branch, run_id)
+        )
+    return get_run(conn, run_id)
+
+
+def list_runs(conn) -> list:
+    """Return every run, ordered by id."""
+    return [
+        _to_run(row)
+        for row in conn.execute("SELECT * FROM runs ORDER BY id")
+    ]
+
+
+def get_run(conn, run_id: int) -> Run:
+    """Return one run or raise :class:`TaskError` when it does not exist."""
+    row = conn.execute("SELECT * FROM runs WHERE id = ?", (run_id,)).fetchone()
+    if row is None:
+        raise TaskError("run r" + str(run_id) + " does not exist")
+    return _to_run(row)
+
+
+def running_run(conn):
+    """Return the newest RUNNING run, or None.
+
+    At most one run executes at a time, so a RUNNING run means the project's
+    last execution was interrupted before it finished; the next
+    ``actl task run`` resumes it instead of creating a new one.
+    """
+    row = conn.execute(
+        "SELECT * FROM runs WHERE status = ? ORDER BY id DESC LIMIT 1",
+        (RUN_RUNNING,),
+    ).fetchone()
+    return _to_run(row) if row is not None else None
+
+
+def complete_run(conn, run_id: int, final_commit: str) -> Run:
+    """Record the run's final commit and mark it COMPLETE.
+
+    COMPLETE means execution stopped: the run branch is frozen at the
+    recorded commit and ``actl run merge`` may fast-forward it into the base
+    branch (a run stopped by a task failure is completed too, so its staged
+    work can be integrated explicitly).
+    """
+    with conn:
+        cursor = conn.execute(
+            "UPDATE runs SET status = ?, final_commit = ?, updated_at = ?"
+            " WHERE id = ?",
+            (RUN_COMPLETE, final_commit, _utc_now(), run_id),
+        )
+        if cursor.rowcount == 0:
+            raise TaskError("run r" + str(run_id) + " does not exist")
+    return get_run(conn, run_id)
+
+
+def set_run_status(conn, run_id: int, status: str) -> Run:
+    """Set the run's status and return the run."""
+    if status not in RUN_STATUSES:
+        raise TaskError("invalid run status " + repr(status))
+    with conn:
+        cursor = conn.execute(
+            "UPDATE runs SET status = ?, updated_at = ? WHERE id = ?",
+            (status, _utc_now(), run_id),
+        )
+        if cursor.rowcount == 0:
+            raise TaskError("run r" + str(run_id) + " does not exist")
+    return get_run(conn, run_id)
+
+
+def run_tasks(conn, run_id: int) -> list:
+    """Return the tasks associated with ``run_id``, ordered by id."""
+    rows = conn.execute(
+        "SELECT * FROM tasks WHERE run_id = ? ORDER BY id", (run_id,)
+    ).fetchall()
+    return [_to_task(row, _dependencies(conn, row["id"])) for row in rows]
+
+
+def stage_task(conn, task_id: int, run_id: int) -> Task:
+    """Mark the task STAGED in ``run_id`` and return it."""
+    with conn:
+        cursor = conn.execute(
+            "UPDATE tasks SET status = ?, run_id = ?, updated_at = ?"
+            " WHERE id = ?",
+            (STATUS_STAGED, run_id, _utc_now(), task_id),
+        )
+        if cursor.rowcount == 0:
+            raise TaskError("task t" + str(task_id) + " does not exist")
+    return get_task(conn, task_id)
 
 
 def delete_task(conn, task_id: int) -> None:
@@ -382,6 +566,20 @@ def _to_task(row, depends_on) -> Task:
         created_at=row["created_at"],
         updated_at=row["updated_at"],
         depends_on=tuple(depends_on),
+        run_id=row["run_id"],
+    )
+
+
+def _to_run(row) -> Run:
+    return Run(
+        id=row["id"],
+        branch=row["branch"],
+        base_branch=row["base_branch"],
+        status=row["status"],
+        start_commit=row["start_commit"],
+        final_commit=row["final_commit"],
+        created_at=row["created_at"],
+        updated_at=row["updated_at"],
     )
 
 

@@ -150,9 +150,11 @@ One run goes through these steps:
 3. The batch creates one run before its first task executes: branch
    `actl/run/r1` and worktree `.actl/run-worktrees/r1`, starting at the
    current commit of the project's configured `base_branch`. An interrupted
-   execution that left its run `RUNNING` is resumed instead, so staged tasks
-   stay in the same run. Only one run executes at a time, and the same run
-   serves every task of the batch.
+   or stopped execution that left its run `RUNNING` is resumed instead, so
+   staged tasks stay in the same run. Only one run executes at a time, the
+   same run serves every task of the batch, and the run records the exact
+   commit its branch is expected to point at: the start commit, advanced
+   only by successfully staged, reviewer-approved tasks.
 4. Each task gets a dedicated branch (`actl/t1`) and worktree
    (`.actl/worktrees/t1`) created from the **run branch**, never directly
    from the base branch, so a task starts from the previous staged task's
@@ -176,11 +178,16 @@ One run goes through these steps:
    rejection with critical or major findings starts the next worker attempt
    in the same branch and worktree, with the failure as feedback; when all
    three attempts are used the task ends `NEEDS_HUMAN`.
-9. Only after the run is integrated into the base branch with
-   `actl run merge` is a staged task marked `DONE`. DONE means the task's
-   approved commit is part of the configured base branch; it is never
-   recorded while the task is merely staged, and a task that is already DONE
-   is not executed again.
+9. When the batch ends and every task selected for the run is staged (or
+   already DONE), and the run branch still points at the expected commit, the
+   run is marked `COMPLETE` with that verified commit as its final commit. A
+   batch stopped by a failed task, a blocked `--all`, or a crash leaves the
+   run `RUNNING` and resumable, and is never reported as finished.
+10. Only after the run is integrated into the base branch with
+    `actl run merge` is a staged task marked `DONE`. DONE means the task's
+    approved commit is part of the configured base branch; it is never
+    recorded while the task is merely staged, and a task that is already DONE
+    is not executed again.
 
 `actl task run t1` after an earlier approval does not repeat any of the
 expensive work either: when the task is already `APPROVED`, actl skips the
@@ -224,9 +231,12 @@ merges only the exact commit the reviewer approved:
 branch and transitions its `STAGED` tasks to `DONE`. The command is
 idempotent and detects a manual integration:
 
-- The run must be `COMPLETE` (execution stopped - a failed batch is complete
-  too, so its staged work can be integrated explicitly) and its branch must
-  still point at the recorded final commit.
+- The run must be `COMPLETE`: every task selected for it was staged (or was
+  already `DONE`) and the run branch pointed at the expected commit when the
+  run finished. A failed batch stays `RUNNING`; resume it with
+  `actl task run ...` instead of integrating a partial plan. The recorded
+  final commit is the verified expected commit, never whatever the branch
+  happened to hold when execution stopped.
 - If the recorded final commit is already an ancestor of the base branch -
   the user merged the run by hand, with or without a merge commit, or the
   command is repeated - the Git merge is skipped and only the statuses are
@@ -289,18 +299,19 @@ Any task that fails to complete - a worker or reviewer infrastructure
 failure, an exhausted repair budget, human intervention being required, a
 refused or failed staging, or an unexpected state - stops the batch
 immediately. The run branch, task worktrees, logs, and the already staged
-work are preserved; the run is marked `COMPLETE` with the preserved tasks
-still `STAGED`, the failing task is reported, and the command exits
-non-zero. actl never automatically integrates a partially completed run:
-either rerun the remaining work, or integrate the staged tasks explicitly
-with `actl run merge r1`.
+work are preserved; the run stays `RUNNING`, the failing task is reported,
+and the command exits non-zero. `actl task run ...` resumes that same run,
+so the remaining selected tasks continue from the staged work and the whole
+plan finishes in isolation. `actl run merge` refuses an unfinished run: no
+partial plan is ever integrated automatically or by accident.
 
-Only one unfinished, unmerged run may exist. A completed run that still holds
-`STAGED` tasks must be integrated with `actl run merge` before a new run can
-start, even when its staged tasks have no unfinished dependents; a run that
-stopped before staging anything (a worker or reviewer infrastructure failure)
-does not block a retry. When a task depends on a task that is `STAGED` in
-another run, actl refuses with the exact command that fixes it:
+Only one unfinished, unmerged run may exist. A stopped or interrupted run
+stays `RUNNING` and the next `actl task run ...` resumes it, so a failed
+batch never opens a second run and its staged tasks keep satisfying their
+dependents. A `COMPLETE` run awaiting integration does block a new run until
+`actl run merge` integrates it, even when its staged tasks have no unfinished
+dependents. When a task depends on a task that is `STAGED` in another run,
+actl refuses with the exact command that fixes it:
 
 ```text
 Cannot execute task t5.
@@ -342,8 +353,11 @@ PENDING → RUNNING → IMPLEMENTED → APPROVED → STAGED → DONE
 - `STAGED` means the task's approved commit is part of its run branch. It is
   recorded only after the staging fast-forward succeeded, satisfies the
   task's dependents that execute in the same run, and is preserved when a
-  batch stops at a failed task. A STAGED task is not executed again; it must
-  be integrated with `actl run merge` to become `DONE`.
+  batch stops at a failed task. Staging also advances the run's recorded
+  expected commit, the only tip the run accepts; a commit made by hand in the
+  run worktree is refused, never recorded and never integrated. A STAGED task
+  is not executed again; it must be integrated with `actl run merge` to
+  become `DONE`.
 - `DONE` means the containing run was integrated into the configured base
   branch. It is recorded only by `actl run merge`, after the run branch was
   fast-forwarded (or found already merged) into the base branch; it is never
@@ -785,7 +799,8 @@ actl reports an error instead of resuming the wrong session.
 │                   # escalation_worker_model, validation.commands,
 │                   # base_branch, created_at
 ├── planner.json    # active planner session id, created_at
-├── tasks.db        # SQLite database (tasks, dependencies, reviews, runs)
+├── tasks.db        # SQLite database (tasks, dependencies, reviews,
+│                   # runs, run selections)
 ├── execution.lock  # project-wide execution lock (fcntl.flock)
 ├── base/           # branch-creation commit per task: t1, t2, ...
 ├── attempts/       # used worker attempts + next-attempt feedback: t1, t2, ...
@@ -846,14 +861,17 @@ STAGED dependencies satisfied inside the same run and blocking from another
 run (including the exact actionable message); fast-forward integration and
 the `STAGED -> DONE` transitions; detection of a manual merge, plain or with
 a merge commit; a repeated `actl run merge` being safe; a non-fast-forward
-that requires manual Git integration and then finalizes the statuses; a dirty
-base worktree and a run branch that moved after completion; a failed batch
-preserving its staged work, worktrees, logs, and run; an ignored local file
-the merge must never overwrite; branch squash options that cannot fake a
-successful integration; already approved, staged, and DONE tasks; explicit
-task lists; `--all` in dependency order; deterministic id order for
-independent tasks; stopping at the first failure or at a task that needs a
-human; `actl run list` and `actl run show`; and one execution lock per batch.
+that requires manual Git integration and then finalizes the statuses; a
+manual merge detected after the run branch was cleaned up; a dirty base
+worktree and a run branch that moved after completion; a failed batch
+preserving its staged work, worktrees, logs, and open run and continuing in
+the same run when resumed; a commit made by hand in the run worktree being
+refused and never recorded or integrated; an ignored local file the merge
+must never overwrite; branch squash options that cannot fake a successful
+integration; already approved, staged, and DONE tasks; explicit task lists;
+`--all` in dependency order; deterministic id order for independent tasks;
+stopping at the first failure or at a task that needs a human;
+`actl run list` and `actl run show`; and one execution lock per batch.
 
 ## Limitations
 
@@ -880,8 +898,8 @@ human; `actl run list` and `actl run show`; and one execution lock per batch.
   continues. There is no automatic rebasing, no conflict resolution, no pull
   requests or GitHub/GitLab integration, no automatic crash recovery, and no
   parallel or background runs: only one run executes at a time, an
-  interrupted run is resumed by the next `actl task run`, and a completed
-  run stays unintegrated until the user runs `actl run merge`.
+  interrupted or stopped run is resumed by the next `actl task run`, and a
+  completed run stays unintegrated until the user runs `actl run merge`.
 - `IMPLEMENTED` only means that the worker exited successfully, left the
   worktree clean, and left committed changes on the task branch relative to
   the run branch. `APPROVED` additionally means the configured validation
@@ -960,8 +978,15 @@ human; `actl run list` and `actl run show`; and one execution lock per batch.
   `git log`/`git diff` on the run branch; the base branch only moves when
   the user runs `actl run merge`. actl never pushes, so a wrong merge can
   still be corrected locally.
-- A completed run stays unmerged until `actl run merge` runs, and while it
-  still holds `STAGED` tasks no new run can start; a run that stopped before
-  staging anything does not block a retry. Because every new run starts from
-  the current base branch, integrate a finished run before starting work
-  that builds on it.
+- A stopped or interrupted run stays `RUNNING` and is resumed by the next
+  `actl task run`, so a failed batch continues in the same run and never
+  opens a second one. A run is `COMPLETE` only when every selected task is
+  staged (or already DONE); only then can `actl run merge` integrate it.
+  Because every new run starts from the current base branch, integrate a
+  finished run before starting work that builds on it.
+- The run branch tip is verified against the run's recorded expected commit
+  before resumption, staging, and completion, so a commit made by hand in
+  the run worktree is refused and can never be recorded as the final commit
+  or merged into the base branch. actl never resets the branch to recover;
+  the user restores or removes it explicitly. Runs created before the
+  expected commit existed (no recorded value) are not verified.

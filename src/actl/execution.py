@@ -7,9 +7,12 @@
   OpenCode processes, so the lock stays held if actl crashes while a worker
   or reviewer is still running.
 * Each run gets one branch (``actl/run/rN``) and worktree
-  (``.actl/run-worktrees/rN``), created from the configured base branch the
-  first time a task of the run starts and reused while the run is active
-  (see ``ensure_run_worktree``).
+  (``.actl/run-worktrees/rN``), created at the run's recorded start commit
+  the first time a task of the run starts and reused while the run is active
+  (see ``ensure_run_worktree``). The branch is verified against the run's
+  expected commit (see ``require_expected_run_tip``) before any task
+  continues, so a commit made by hand in the run worktree is refused instead
+  of trusted.
 * Each task gets one branch (``actl/tN``) and worktree
   (``.actl/worktrees/tN``), created from the run branch - never directly from
   the base branch - the first time the task runs and reused by later explicit
@@ -168,16 +171,40 @@ def ensure_worktree(
     return Worktree(branch=branch, path=path, created=True)
 
 
+def require_expected_run_tip(root: Path, run) -> None:
+    """Refuse to continue when the run branch moved unexpectedly.
+
+    A run branch may only ever point at the commit the run itself recorded:
+    the start commit, advanced by successful staging of reviewer-approved
+    tasks. Any other commit - for example one a human made in the run
+    worktree - is refused, and the branch is never reset or rewritten. Runs
+    created before the expected commit existed (no recorded value) are not
+    checked.
+    """
+    expected = getattr(run, "expected_commit", None)
+    if expected is None:
+        return
+    actual = ref_commit(root, "refs/heads/" + run.branch)
+    if actual != expected:
+        raise ExecutionError(
+            "run branch " + run.branch + " moved unexpectedly: expected "
+            + expected[:12] + ", found " + actual[:12]
+            + "; refusing to continue without explicit intervention"
+        )
+
+
 def ensure_run_worktree(root: Path, actl_dir: Path, run) -> Worktree:
     """Create or reuse the run's branch and worktree.
 
-    The run branch is created from the run's recorded base branch the first
+    The run branch is created at the run's recorded start commit the first
     time a task of the run starts, and its worktree lives under
     ``.actl/run-worktrees/rN``. An interrupted run reuses both as they are -
-    never resetting, cleaning, or checking out anything - and a run whose
-    worktree directory was removed re-attaches the existing branch. The base
-    branch is validated first, so a run fails before any worktree work when
-    the base disappeared while the run was waiting.
+    never resetting, cleaning, or checking out anything - after verifying
+    that the branch still points at the commit the run recorded. A run whose
+    worktree directory was removed re-attaches the existing branch, and a
+    branch that already staged tasks is never silently recreated from the
+    start commit. The base branch is validated first, so a run fails before
+    any worktree work when the base disappeared while the run was waiting.
     """
     require_base(root, run.base_branch)
     branch = run.branch
@@ -191,6 +218,7 @@ def ensure_run_worktree(root: Path, actl_dir: Path, run) -> Worktree:
                 "run branch " + branch + " no longer exists; the run cannot"
                 " continue without it (restore the branch or intervene by hand)"
             )
+        require_expected_run_tip(root, run)
         actual = registered[key]
         if actual != "refs/heads/" + branch:
             raise ExecutionError(
@@ -210,11 +238,18 @@ def ensure_run_worktree(root: Path, actl_dir: Path, run) -> Worktree:
             " this repository"
         )
     if branch_exists(root, branch):
+        require_expected_run_tip(root, run)
         _git(root, "worktree", "add", str(path), branch)
         return Worktree(branch=branch, path=path, created=True)
+    expected = getattr(run, "expected_commit", None)
+    if expected is not None and expected != run.start_commit:
+        raise ExecutionError(
+            "run branch " + branch + " is missing although the run already"
+            " staged tasks; refusing to recreate it from the start commit"
+            " (restore the branch or intervene by hand)"
+        )
     _git(
-        root, "worktree", "add", "-b", branch, str(path),
-        "refs/heads/" + run.base_branch,
+        root, "worktree", "add", "-b", branch, str(path), run.start_commit,
     )
     return Worktree(branch=branch, path=path, created=True)
 

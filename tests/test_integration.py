@@ -18,6 +18,7 @@ import json
 import shutil
 import subprocess
 import sys
+import time
 import unittest
 from pathlib import Path
 
@@ -177,31 +178,41 @@ class RunBranchTests(IntegrationTestCase):
         )
         self.assertEqual(self.git("status", "--porcelain").stdout, "")
 
-    def test_failed_batch_preserves_staged_work_and_the_run(self):
+    def test_failed_batch_preserves_staged_work_and_stays_resumable(self):
         self.env["ACTL_FAKE_RUN_SEQUENCE"] = json.dumps(
             [{"behavior": "commit"}, {"behavior": "commit", "exit": 1}]
         )
         self.env["ACTL_FAKE_RUN_COUNT_FILE"] = str(self.base / "worker-count")
         t1 = self.create("First")
-        t2 = self.create("Second")
+        t2 = self.create("Second", "--depends-on", t1)
         result = self.run_task(t1, t2)
         self.assertNotEqual(result.returncode, 0)
 
         # The batch stopped at t2 but t1's approved work is preserved in the
-        # run branch; the base branch and the run statuses are untouched.
+        # run branch; the base branch is untouched and the run stays open and
+        # resumable - a partial plan is never integrated.
         self.assertEqual(self.task_status(t1), "STAGED")
         self.assertEqual(self.task_status(t2), "FAILED")
         self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t1"))
         self.assertEqual(self.rev("main"), self.base_sha)
-        self.assertEqual(self.run_status(), "COMPLETE")
+        self.assertEqual(self.run_status("r1"), "RUNNING")
         self.assertTrue(self.worktree("t2").is_dir(), "worktree preserved")
         self.assertTrue(self.log_paths("t2"), "logs preserved")
+        refused = self.integrate()
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("still marked RUNNING", refused.stderr)
+        self.assertEqual(self.rev("main"), self.base_sha)
 
-        # The staged work can be integrated explicitly; the failed task
-        # stays behind.
+        # Fixing the failure resumes the same run: the dependency is
+        # satisfied within it and both tasks end staged before integration.
+        result = self.run_task(t2)
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(t1), "STAGED")
+        self.assertEqual(self.task_status(t2), "STAGED")
+        self.assertEqual(self.run_status("r1"), "COMPLETE")
         self.assertEqual(self.integrate().returncode, 0)
         self.assertEqual(self.task_status(t1), "DONE")
-        self.assertEqual(self.task_status(t2), "FAILED")
+        self.assertEqual(self.task_status(t2), "DONE")
 
     def test_unmerged_run_with_staged_tasks_blocks_a_new_run(self):
         # Only one unfinished, unmerged run may exist: a completed run that
@@ -236,21 +247,113 @@ class RunBranchTests(IntegrationTestCase):
         self.assertEqual(self.run_status("r2"), "COMPLETE")
         self.assertEqual(len(self.worker_calls()), workers + 1)
 
-    def test_run_without_staged_tasks_does_not_block_a_new_run(self):
-        # A run stopped before staging anything leaves nothing to integrate;
-        # a retry starts its own run from the unchanged base branch.
+    def test_run_stopped_before_staging_is_resumed_by_a_retry(self):
+        # A run stopped before staging anything also stays open: the retry
+        # resumes the same run instead of starting a second one.
         self.create("First")
         self.env["ACTL_FAKE_RUN_EXIT"] = "1"
         self.assertNotEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(self.task_status(), "FAILED")
-        self.assertEqual(self.run_status("r1"), "COMPLETE")
+        self.assertEqual(self.run_status("r1"), "RUNNING")
 
         self.env["ACTL_FAKE_RUN_EXIT"] = "0"
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "STAGED")
-        self.assertEqual(self.run_status("r2"), "COMPLETE")
+        self.assertEqual(self.run_status("r1"), "COMPLETE")
         self.assertEqual(self.rev("main"), self.base_sha)
+        listing = self.run_actl("run", "list")
+        self.assertEqual(len(listing.stdout.strip().splitlines()), 1)
+
+    def test_run_branch_movement_refuses_resumption(self):
+        # The run records the only commit its branch may point at: a commit
+        # made by hand in the run worktree is refused instead of trusted.
+        self.create("First")
+        self.create("Second", "--depends-on", "t1")
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        try:
+            tasks.set_run_status(conn, 1, tasks.RUN_RUNNING)
+        finally:
+            conn.close()
+        run_worktree = self.run_worktree()
+        (run_worktree / "human.txt").write_text("human\n", encoding="utf-8")
+        self.commit("human change on the run branch", cwd=run_worktree)
+        human = self.rev("actl/run/r1")
+
+        result = self.run_task("t2")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("moved unexpectedly", result.stderr)
+        self.assertEqual(self.task_status("t2"), "PENDING")
+        self.assertNotIn("t2", self.worker_cwds())
+        self.assertEqual(self.rev("actl/run/r1"), human, "never reset")
+        self.assertEqual(self.rev("main"), self.base_sha)
+        self.assertEqual(self.run_status("r1"), "RUNNING")
+        refused = self.integrate()
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("still marked RUNNING", refused.stderr)
+        self.assertFalse((self.repo / "human.txt").exists())
+
+    def test_unreviewed_run_branch_commit_is_never_integrated(self):
+        # Regression: a commit made by hand on the run branch while a task
+        # executes must never become the recorded final commit or reach the
+        # base branch.
+        release = self.base / "worker.release"
+        self.env["ACTL_FAKE_RUN_SEQUENCE"] = json.dumps(
+            [{"behavior": "commit"},
+             {"behavior": "commit", "wait_for": str(release)}]
+        )
+        count = self.base / "worker-count"
+        self.env["ACTL_FAKE_RUN_COUNT_FILE"] = str(count)
+        t1 = self.create("First")
+        t2 = self.create("Second", "--depends-on", t1)
+
+        parent = subprocess.Popen(
+            [sys.executable, "-m", "actl", "task", "run", t1, t2],
+            cwd=str(self.repo), env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if (
+                    count.exists()
+                    and count.read_text(encoding="utf-8").strip() == "2"
+                ):
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("the second worker never started")
+            self.assertEqual(self.task_status(t1), "STAGED")
+            (self.run_worktree() / "not-reviewed.txt").write_text(
+                "human experiment\n", encoding="utf-8"
+            )
+            self.commit(
+                "unreviewed change on the run branch",
+                cwd=self.run_worktree(),
+            )
+            human = self.rev("actl/run/r1")
+        finally:
+            release.write_text("go", encoding="utf-8")
+            try:
+                out, err = parent.communicate(timeout=30)
+            except subprocess.TimeoutExpired:
+                parent.kill()
+                out, err = parent.communicate()
+
+        self.assertNotEqual(parent.returncode, 0)
+        self.assertIn("staging failed", err)
+        self.assertEqual(self.task_status(t1), "STAGED")
+        self.assertEqual(self.task_status(t2), "APPROVED")
+        self.assertEqual(self.rev("actl/run/r1"), human)
+        self.assertEqual(self.rev("main"), self.base_sha)
+        self.assertEqual(self.run_status("r1"), "RUNNING")
+        self.assertNotEqual(self.latest_review(2)["commit_sha"], human)
+
+        refused = self.integrate()
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("still marked RUNNING", refused.stderr)
+        self.assertFalse((self.repo / "not-reviewed.txt").exists())
 
 
 class RunMergeTests(IntegrationTestCase):
@@ -297,6 +400,22 @@ class RunMergeTests(IntegrationTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("already integrated", result.stdout)
         self.assertIn("merged by hand", result.stdout)
+        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.run_status(), "INTEGRATED")
+
+    def test_run_merge_detects_a_manual_merge_after_branch_cleanup(self):
+        # A user who merged the run by hand would reasonably remove the run
+        # worktree and branch afterwards; the finalization must still work
+        # from the recorded, verified final commit.
+        self.create("Add the feature")
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        self.git("merge", "--ff-only", "actl/run/r1")
+        self.git("worktree", "remove", str(self.run_worktree()))
+        self.git("branch", "-d", "actl/run/r1")
+
+        result = self.integrate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already integrated", result.stdout)
         self.assertEqual(self.task_status(), "DONE")
         self.assertEqual(self.run_status(), "INTEGRATED")
 
@@ -538,6 +657,38 @@ class RunMergeTests(IntegrationTestCase):
         self.assertEqual(len(self.worker_calls()), workers)
         self.assertEqual(len(self.reviewer_calls()), reviewers)
 
+    def test_interrupted_staging_is_recorded_on_resume(self):
+        # A crash between the staging fast-forward and the STAGED record
+        # leaves the run branch exactly at the task's approved commit. The
+        # retry recognizes that verified commit, records STAGED, and reruns
+        # no agent; the expected tip moves with the record.
+        self.create("Add the feature")
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        workers = len(self.worker_calls())
+        reviewers = len(self.reviewer_calls())
+        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        try:
+            tasks.set_task_status(conn, 1, tasks.STATUS_APPROVED)
+            conn.execute(
+                "UPDATE runs SET expected_commit = ?, status = ? WHERE id = 1",
+                (self.base_sha, tasks.RUN_RUNNING),
+            )
+            conn.commit()
+        finally:
+            conn.close()
+        approved = self.rev("actl/t1")
+        self.assertEqual(self.rev("actl/run/r1"), approved)
+
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("recording STAGED", result.stdout)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(self.run_status("r1"), "COMPLETE")
+        self.assertEqual(len(self.worker_calls()), workers)
+        self.assertEqual(len(self.reviewer_calls()), reviewers)
+        self.assertEqual(self.integrate().returncode, 0)
+        self.assertEqual(self.task_status(), "DONE")
+
     def test_interrupted_run_after_staging_is_resumed_and_finished(self):
         # A crash between staging t1 and finishing the run leaves the run
         # RUNNING; the next run continues it, notices the task is already
@@ -656,7 +807,12 @@ class DependencySchedulingTests(IntegrationTestCase):
         self.assertNotIn("t2", self.worker_cwds(), "t2 must not run")
         self.assertIn("stopped at t1", result.stdout)
         self.assertIn("Summary:", result.stdout)
-        self.assertEqual(self.run_status(), "COMPLETE")
+        # The stopped batch leaves its run open and resumable; a partly
+        # finished plan is never eligible for integration.
+        self.assertEqual(self.run_status(), "RUNNING")
+        refused = self.integrate()
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("still marked RUNNING", refused.stderr)
 
     def test_all_runs_in_dependency_order(self):
         t1 = self.create("First")
@@ -707,6 +863,9 @@ class DependencySchedulingTests(IntegrationTestCase):
         )
         self.assertIn("blocked", result.stdout)
         self.assertIn("progress is blocked", result.stderr)
+        # The blocked batch resumes the still-open run instead of opening a
+        # second one.
+        self.assertEqual(self.run_status("r1"), "RUNNING")
 
     def test_all_reports_the_actionable_message_for_a_staged_dependency(self):
         t1 = self.create("First")
@@ -734,6 +893,12 @@ class DependencySchedulingTests(IntegrationTestCase):
         self.assertIn("Summary: completed: none", result.stdout)
         self.assertIn("needs human intervention: t1", result.stdout)
         self.assertEqual(len(self.worker_calls()), workers, "no retry")
+        # The run stays open: its selected task is not staged, so it is
+        # never reported as finished or integrated.
+        self.assertEqual(self.run_status("r1"), "RUNNING")
+        self.assertIn("still open", result.stdout)
+        refused = self.integrate()
+        self.assertNotEqual(refused.returncode, 0)
 
     def test_all_with_nothing_to_run_succeeds_without_a_run(self):
         result = self.run_task("--all")

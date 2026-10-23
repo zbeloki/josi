@@ -8,11 +8,16 @@ PENDING, RUNNING, IMPLEMENTED, FAILED, APPROVED, NEEDS_CHANGES, NEEDS_HUMAN,
 STAGED, or DONE; only ``actl task run`` moves a task between them.
 
 Stage 7 groups executions into runs: a run row records the run branch, its
-status (RUNNING while executing, COMPLETE once execution stopped, INTEGRATED
-after ``actl run merge``), the base branch it started from, and its start and
-final commits. A task that was approved and fast-forwarded into its run branch
-is STAGED and keeps the id of that run in ``tasks.run_id``; ``actl run merge``
-turns its STAGED tasks DONE once the run branch is part of the base branch.
+status (RUNNING while executing, COMPLETE once every selected task was staged,
+INTEGRATED after ``actl run merge``), the base branch it started from, its
+start and expected commits, and its final commit. The expected commit is the
+commit the run branch is allowed to point at: the start commit, advanced only
+by successfully staged, reviewer-approved tasks. A task that was approved and
+fast-forwarded into its run branch is STAGED and keeps the id of that run in
+``tasks.run_id``; ``actl run merge`` turns its STAGED tasks DONE once the run
+branch is part of the base branch. The ``run_selection`` table records which
+tasks each run is responsible for, so a failed batch stays resumable in the
+same run and a run is only COMPLETE when its whole selection is staged.
 
 Reviewer verdicts are stored in ``reviews`` (one row per completed review,
 newest last) so later stages can read the findings that belong to a task's
@@ -70,6 +75,7 @@ CREATE TABLE IF NOT EXISTS runs (
     base_branch TEXT NOT NULL,
     status TEXT NOT NULL,
     start_commit TEXT NOT NULL,
+    expected_commit TEXT,
     final_commit TEXT,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
@@ -83,6 +89,12 @@ CREATE TABLE IF NOT EXISTS tasks (
     run_id INTEGER REFERENCES runs(id),
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS run_selection (
+    run_id INTEGER NOT NULL REFERENCES runs(id) ON DELETE CASCADE,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE CASCADE,
+    PRIMARY KEY (run_id, task_id)
 );
 
 CREATE TABLE IF NOT EXISTS dependencies (
@@ -130,10 +142,17 @@ class Task:
 class Run:
     """A run: its branch, lifecycle status, and recorded commits.
 
-    ``status`` is RUNNING while the run executes (an interrupted execution
-    stays RUNNING until it is resumed), COMPLETE once execution stopped and
-    the final commit was recorded, and INTEGRATED after ``actl run merge``
-    fast-forwarded the run branch into the configured base branch.
+    ``status`` is RUNNING while the run executes (an interrupted or stopped
+    execution stays RUNNING until it is resumed), COMPLETE once every
+    selected task was staged and the final commit was recorded, and
+    INTEGRATED after ``actl run merge`` fast-forwarded the run branch into
+    the configured base branch.
+
+    ``expected_commit`` is the only commit the run branch may point at: the
+    start commit, advanced atomically by every successful staging. A run
+    branch found anywhere else is refused instead of trusted, and the
+    recorded final commit is always this verified value - never whatever the
+    branch happens to point at when execution stops.
     """
 
     id: int
@@ -142,6 +161,7 @@ class Run:
     status: str
     start_commit: str
     final_commit: object
+    expected_commit: object
     created_at: str
     updated_at: str
 
@@ -174,13 +194,35 @@ def connect(db_path: Path) -> sqlite3.Connection:
 
 
 def _migrate(conn) -> None:
-    """Add ``tasks.run_id`` to databases created before Stage 7."""
+    """Bring databases from earlier stages up to the current schema.
+
+    The data changes run in one transaction: a connection handed back to a
+    caller must never carry an implicit transaction that would make its own
+    ``BEGIN IMMEDIATE`` fail.
+    """
     columns = {
         row["name"] for row in conn.execute("PRAGMA table_info(tasks)")
     }
-    if "run_id" not in columns:
+    run_columns = {
+        row["name"] for row in conn.execute("PRAGMA table_info(runs)")
+    }
+    with conn:
+        if "run_id" not in columns:
+            conn.execute(
+                "ALTER TABLE tasks ADD COLUMN run_id INTEGER REFERENCES runs(id)"
+            )
+        if "expected_commit" not in run_columns:
+            conn.execute("ALTER TABLE runs ADD COLUMN expected_commit TEXT")
+            conn.execute(
+                "UPDATE runs SET expected_commit = final_commit"
+                " WHERE final_commit IS NOT NULL"
+            )
+        # Runs without recorded selection rows (created before this table
+        # existed) adopt their staged tasks, so completion checks and ``run
+        # show`` see them.
         conn.execute(
-            "ALTER TABLE tasks ADD COLUMN run_id INTEGER REFERENCES runs(id)"
+            "INSERT OR IGNORE INTO run_selection (run_id, task_id)"
+            " SELECT run_id, id FROM tasks WHERE run_id IS NOT NULL"
         )
 
 
@@ -352,25 +394,55 @@ def _run_key(run_id):
     return run_id if run_id is not None else -1
 
 
-def create_run(conn, base_branch: str, start_commit: str) -> Run:
+def create_run(conn, base_branch: str, start_commit: str, task_ids=()) -> Run:
     """Insert a new RUNNING run and return it.
 
     The branch name embeds the autoincrement id, so the row is inserted
-    first and its branch recorded in the same transaction.
+    first and its branch recorded in the same transaction. ``task_ids`` is
+    the run's selection: the tasks it is responsible for finishing before it
+    may be marked COMPLETE. The expected commit starts at ``start_commit``
+    and only staging advances it to an approved commit.
     """
     now = _utc_now()
     with conn:
         cursor = conn.execute(
             "INSERT INTO runs (branch, base_branch, status, start_commit,"
-            " created_at, updated_at) VALUES ('', ?, ?, ?, ?, ?)",
-            (base_branch, RUN_RUNNING, start_commit, now, now),
+            " expected_commit, created_at, updated_at)"
+            " VALUES ('', ?, ?, ?, ?, ?, ?)",
+            (base_branch, RUN_RUNNING, start_commit, start_commit, now, now),
         )
         run_id = cursor.lastrowid
         branch = RUN_BRANCH_PREFIX + "r" + str(run_id)
         conn.execute(
             "UPDATE runs SET branch = ? WHERE id = ?", (branch, run_id)
         )
+        _insert_selection(conn, run_id, task_ids)
     return get_run(conn, run_id)
+
+
+def select_run_tasks(conn, run_id: int, task_ids) -> None:
+    """Associate ``task_ids`` with ``run_id`` as part of its selection."""
+    get_run(conn, run_id)
+    with conn:
+        _insert_selection(conn, run_id, task_ids)
+
+
+def _insert_selection(conn, run_id: int, task_ids) -> None:
+    conn.executemany(
+        "INSERT OR IGNORE INTO run_selection (run_id, task_id) VALUES (?, ?)",
+        [(run_id, int(task_id)) for task_id in task_ids],
+    )
+
+
+def selected_tasks(conn, run_id: int) -> list:
+    """Return the run's selected tasks, ordered by id."""
+    rows = conn.execute(
+        "SELECT tasks.* FROM run_selection"
+        " JOIN tasks ON tasks.id = run_selection.task_id"
+        " WHERE run_selection.run_id = ? ORDER BY tasks.id",
+        (run_id,),
+    ).fetchall()
+    return [_to_task(row, _dependencies(conn, row["id"])) for row in rows]
 
 
 def list_runs(conn) -> list:
@@ -444,16 +516,28 @@ def run_tasks(conn, run_id: int) -> list:
     return [_to_task(row, _dependencies(conn, row["id"])) for row in rows]
 
 
-def stage_task(conn, task_id: int, run_id: int) -> Task:
-    """Mark the task STAGED in ``run_id`` and return it."""
+def stage_task(conn, task_id: int, run_id: int, commit: str) -> Task:
+    """Mark the task STAGED in ``run_id``, advancing its expected commit.
+
+    The status change and the expected run tip move in one transaction: the
+    run branch may only ever point at an approved commit that was staged
+    successfully, never at whatever the branch holds when execution stops.
+    """
+    now = _utc_now()
     with conn:
         cursor = conn.execute(
             "UPDATE tasks SET status = ?, run_id = ?, updated_at = ?"
             " WHERE id = ?",
-            (STATUS_STAGED, run_id, _utc_now(), task_id),
+            (STATUS_STAGED, run_id, now, task_id),
         )
         if cursor.rowcount == 0:
             raise TaskError("task t" + str(task_id) + " does not exist")
+        cursor = conn.execute(
+            "UPDATE runs SET expected_commit = ?, updated_at = ? WHERE id = ?",
+            (commit, now, run_id),
+        )
+        if cursor.rowcount == 0:
+            raise TaskError("run r" + str(run_id) + " does not exist")
     return get_task(conn, task_id)
 
 
@@ -578,6 +662,7 @@ def _to_run(row) -> Run:
         status=row["status"],
         start_commit=row["start_commit"],
         final_commit=row["final_commit"],
+        expected_commit=row["expected_commit"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )

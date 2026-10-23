@@ -16,6 +16,7 @@ import fcntl
 import json
 import os
 import shutil
+import sqlite3
 import subprocess
 import sys
 import time
@@ -108,9 +109,19 @@ class TaskRunTestCase(ActlTestCase):
         """Reset a run branch to its start commit, as if staging never ran.
 
         Only tests use this to simulate an execution that was interrupted
-        before a task was staged into the run.
+        before a task was staged into the run; the recorded expected commit
+        is reset with it, exactly as if the staging transaction never ran.
         """
         self.git("reset", "--hard", self.base_sha, cwd=self.run_worktree(run_id))
+        conn = sqlite3.connect(str(self.repo / ".actl" / "tasks.db"))
+        try:
+            conn.execute(
+                "UPDATE runs SET expected_commit = ? WHERE id = ?",
+                (self.base_sha, int(run_id.lstrip("r"))),
+            )
+            conn.commit()
+        finally:
+            conn.close()
 
     def log_paths(self, task_id="t1"):
         return [
@@ -703,8 +714,8 @@ class RunFailureTests(TaskRunTestCase):
         self.assertEqual(len(self.worker_calls()), 1)
 
         # The base disappears between attempts: the retry must fail before
-        # launching another worker, not after the run. The first run is
-        # COMPLETE, so the retry would create its own run from the base.
+        # launching another worker, not after the run. The failed batch left
+        # its run open, so the retry resumes it and validates the base first.
         self.git("checkout", "-b", "feature")
         self.git("branch", "-D", "main")
         self.env["ACTL_FAKE_RUN_EXIT"] = "0"
@@ -714,7 +725,7 @@ class RunFailureTests(TaskRunTestCase):
         self.assertEqual(len(self.worker_calls()), 1, "no worker may be launched")
         self.assertEqual(self.rev("actl/t1"), before)
         self.assertEqual(self.task_status(), "FAILED")
-        self.assertEqual(self.run_status("r1"), "COMPLETE")
+        self.assertEqual(self.run_status("r1"), "RUNNING")
 
     def test_invalid_base_branch_in_metadata_is_rejected(self):
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))

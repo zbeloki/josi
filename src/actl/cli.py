@@ -58,12 +58,17 @@ Stage 7:
   run branch and becomes STAGED; the base branch is never touched during
   execution. ``actl task run`` accepts several task ids or ``--all`` and
   executes them strictly sequentially under one execution lock, in the given
-  order or in deterministic dependency order. ``actl run merge rN``
-  fast-forwards a completed run into the configured base branch and turns its
-  STAGED tasks DONE; it is idempotent and also detects a manual merge of the
-  run branch. A dependency is satisfied by DONE or by STAGED in the run the
-  dependent is currently executing in; a dependency staged in another run
-  must be integrated first.
+  order or in deterministic dependency order. A batch that stops - a failed
+  task, a blocked ``--all``, or a crash - leaves its run RUNNING and
+  resumable; the run is marked COMPLETE only when every selected task is
+  staged (or already DONE). The run records the exact commit its branch is
+  expected to point at and never records or merges any other commit, so a
+  change made by hand in the run worktree is refused instead of trusted.
+  ``actl run merge rN`` fast-forwards a completed run into the configured
+  base branch and turns its STAGED tasks DONE; it is idempotent and also
+  detects a manual merge of the run. A dependency is satisfied by DONE or by
+  STAGED in the run the dependent is currently executing in; a dependency
+  staged in another run must be integrated first.
 """
 
 from __future__ import annotations
@@ -919,7 +924,8 @@ def cmd_run_list(_args) -> int:
         with _run_database() as conn:
             for run in tasks.list_runs(conn):
                 task_ids = [
-                    "t" + str(task.id) for task in tasks.run_tasks(conn, run.id)
+                    "t" + str(task.id)
+                    for task in tasks.selected_tasks(conn, run.id)
                 ]
                 print(
                     "r" + str(run.id) + "  " + run.status + "  " + run.branch
@@ -931,12 +937,12 @@ def cmd_run_list(_args) -> int:
 
 
 def cmd_run_show(args) -> int:
-    """Show one run with its commits and associated tasks."""
+    """Show one run with its commits and selected tasks."""
     try:
         run_id = _parse_run_id(args.id)
         with _run_database() as conn:
             run = tasks.get_run(conn, run_id)
-            associated = tasks.run_tasks(conn, run.id)
+            associated = tasks.selected_tasks(conn, run.id)
     except (ProjectError, tasks.TaskError, sqlite3.Error) as exc:
         return _fail(str(exc))
     print("id: r" + str(run.id))
@@ -1015,8 +1021,8 @@ def _merge_run(root: Path, actl_dir: Path, run_id: int, base_branch: str) -> int
     if run.status != tasks.RUN_COMPLETE:
         raise tasks.TaskError(
             "cannot integrate run r" + str(run.id) + ": its execution is still"
-            " marked " + run.status + "; run 'actl task run ...' again to"
-            " resume and finish it first"
+            " marked " + run.status + " and not every selected task is staged;"
+            " resume it with 'actl task run ...' and finish it first"
         )
     if not run.final_commit:
         raise tasks.TaskError(
@@ -1028,21 +1034,31 @@ def _merge_run(root: Path, actl_dir: Path, run_id: int, base_branch: str) -> int
             "base branch '" + base_branch + "' does not exist in " + str(root)
             + "; refusing to merge"
         )
-    current = execution.ref_commit(root, "refs/heads/" + run.branch)
-    if current != run.final_commit:
-        raise tasks.TaskError(
-            "run branch " + run.branch + " moved after the run finished:"
-            " expected " + run.final_commit[:12] + ", found " + current[:12]
-            + "; refusing to merge"
-        )
     if execution.is_ancestor(
         root, run.final_commit, "refs/heads/" + base_branch
     ):
+        # The recorded final commit is already part of the base branch (a
+        # manual merge, plain or with a merge commit, or a repeated command).
+        # The run branch is not needed to finalize the statuses, so a cleaned
+        # up branch must not block the user.
         print(
             "Run r" + str(run.id) + " is already integrated into " + base_branch
             + " (merged by hand); finalizing the statuses."
         )
     else:
+        if not execution.branch_exists(root, run.branch):
+            raise tasks.TaskError(
+                "run branch " + run.branch + " does not exist and the"
+                " recorded final commit " + run.final_commit[:12]
+                + " is not part of " + base_branch + "; refusing to merge"
+            )
+        current = execution.ref_commit(root, "refs/heads/" + run.branch)
+        if current != run.final_commit:
+            raise tasks.TaskError(
+                "run branch " + run.branch + " moved after the run finished:"
+                " expected " + run.final_commit[:12] + ", found " + current[:12]
+                + "; refusing to merge"
+            )
         _event("Fast-forward merging run r" + str(run.id) + "...")
         try:
             execution.integrate_commit(
@@ -1214,22 +1230,25 @@ def _run_explicit(
     the first task that cannot complete; the run keeps the staged tasks.
     """
     batch = len(requested) > 1
+    selection = list(requested)
+    if run is not None:
+        _select_run_tasks(actl_dir, run.id, selection)
     completed = []
     for task_id in requested:
         code, detail, run = _execute_task(
             binary, root, actl_dir, task_id, metadata, lock_fd, base_branch,
             reviewer_model, escalation_worker_model, validation_commands, run,
+            selection,
         )
         if code != 0:
             if batch:
                 _print_summary(completed, stopped=(task_id, detail))
-            _finish_run(actl_dir, root, run)
+            _leave_run_open(run)
             return code
         completed.append(task_id)
     if batch:
         _print_summary(completed)
-    _finish_run(actl_dir, root, run)
-    return 0
+    return _finish_run(actl_dir, root, run)
 
 
 def _dependency_satisfied(dep_id, state, run) -> bool:
@@ -1260,6 +1279,12 @@ def _run_all(
     progress and stops.
     """
     completed = []
+    selection = [
+        task.id for task in _list_tasks(actl_dir)
+        if task.status in _RUNNABLE_STATUSES
+    ]
+    if run is not None and selection:
+        _select_run_tasks(actl_dir, run.id, selection)
     while True:
         all_tasks = _list_tasks(actl_dir)
         state = {task.id: (task.status, task.run_id) for task in all_tasks}
@@ -1304,7 +1329,7 @@ def _run_all(
                                 task.id, dep, dep_run
                             )
             _print_summary(completed, blocked=blocked)
-            _finish_run(actl_dir, root, run)
+            _leave_run_open(run)
             if staged is not None:
                 return _fail(staged)
             return _fail(
@@ -1315,10 +1340,11 @@ def _run_all(
         code, detail, run = _execute_task(
             binary, root, actl_dir, ready.id, metadata, lock_fd, base_branch,
             reviewer_model, escalation_worker_model, validation_commands, run,
+            selection,
         )
         if code != 0:
             _print_summary(completed, stopped=(ready.id, detail))
-            _finish_run(actl_dir, root, run)
+            _leave_run_open(run)
             return code
         completed.append(ready.id)
     skipped = [
@@ -1326,35 +1352,96 @@ def _run_all(
         if task.status == tasks.STATUS_NEEDS_HUMAN
     ]
     _print_summary(completed, needs_human=skipped)
-    _finish_run(actl_dir, root, run)
-    return 0
+    return _finish_run(actl_dir, root, run)
 
 
-def _finish_run(actl_dir: Path, root: Path, run) -> None:
-    """Record the run's final commit and mark it COMPLETE.
+def _recover_staged_task(actl_dir: Path, root: Path, task, run):
+    """Record a staging that crashed between the merge and the status update.
 
-    Called whenever a batch stops (successfully or at a failed task), so the
-    run branch is frozen at a known commit that ``actl run merge`` verifies.
-    Interruptions and crashes never reach this point: the run stays RUNNING
-    and the next ``actl task run`` resumes it.
+    The only run-branch tip that may differ from the expected commit is the
+    task's own recorded approved commit, reached as a fast-forward from the
+    expected commit: that is actl's own unrecorded staging. Every other tip
+    is left to the usual verification, which refuses it. Returns the
+    refreshed run when the staging was recovered, or None.
     """
+    try:
+        approved = _approved_commit(actl_dir, task)
+    except tasks.TaskError:
+        return None
+    expected = run.expected_commit
+    if expected is None or approved == expected:
+        return None
+    try:
+        actual = execution.ref_commit(root, "refs/heads/" + run.branch)
+        if actual != approved:
+            return None
+        if not execution.is_ancestor(root, expected, approved):
+            return None
+    except execution.ExecutionError:
+        return None
+    _stage_task(actl_dir, task.id, run.id, approved)
+    _event(
+        "Task t" + str(task.id) + " was already fast-forwarded into run r"
+        + str(run.id) + "; recording STAGED"
+    )
+    return _load_run(actl_dir, run.id)
+
+
+def _leave_run_open(run) -> None:
+    """Report that a stopped batch left its run open for an explicit resume."""
     if run is None:
         return
+    _event(
+        "Run r" + str(run.id) + " is still open; re-run 'actl task run'"
+        " to resume and finish it"
+    )
+
+
+def _finish_run(actl_dir: Path, root: Path, run) -> int:
+    """Complete the batch's run, or leave it open for an explicit resume.
+
+    A run is marked COMPLETE only when every selected task is STAGED (or
+    already DONE) and the run branch still points at the expected commit the
+    run itself recorded. The recorded final commit is that verified value -
+    never whatever the branch happens to point at when execution stops - and
+    the run is never marked as integrated here. A batch stopped by a failed
+    task, a blocked batch, and a batch whose selection is not finished all
+    leave the run RUNNING, so the next ``actl task run`` resumes it.
+
+    Returns the exit code of the batch: 0 normally, 1 when the run branch
+    moved unexpectedly (the run is left RUNNING for human intervention).
+    """
+    if run is None:
+        return 0
     try:
-        final = execution.ref_commit(root, "refs/heads/" + run.branch)
+        execution.require_expected_run_tip(root, run)
     except execution.ExecutionError as exc:
-        _event(
-            "Warning: cannot record the final commit of run r" + str(run.id)
-            + " (" + str(exc) + ")"
-        )
-        return
+        _fail("cannot finish run r" + str(run.id) + ": " + str(exc))
+        return 1
     conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
     try:
-        tasks.complete_run(conn, run.id, final)
+        pending = [
+            task.id for task in tasks.selected_tasks(conn, run.id)
+            if task.status not in (tasks.STATUS_STAGED, tasks.STATUS_DONE)
+        ]
+        if pending:
+            _event(
+                "Run r" + str(run.id) + " is still open: selected task"
+                + ("s" if len(pending) != 1 else "") + " not staged: "
+                + ", ".join("t" + str(i) for i in pending)
+                + "; re-run 'actl task run' to continue it"
+            )
+            return 0
         staged = [
             task.id for task in tasks.run_tasks(conn, run.id)
             if task.status == tasks.STATUS_STAGED
         ]
+        final = run.expected_commit
+        if final is None:
+            # A run created before the expected commit existed has no
+            # recorded tip; only such legacy runs fall back to the branch.
+            final = execution.ref_commit(root, "refs/heads/" + run.branch)
+        tasks.complete_run(conn, run.id, final)
     finally:
         conn.close()
     if staged:
@@ -1368,6 +1455,7 @@ def _finish_run(actl_dir: Path, root: Path, run) -> None:
         "Run r" + str(run.id) + " finished with " + detail
         + "; integrate it with 'actl run merge r" + str(run.id) + "'"
     )
+    return 0
 
 
 def _print_summary(
@@ -1397,6 +1485,7 @@ def _print_summary(
 def _execute_task(
     binary, root, actl_dir, task_id, metadata, lock_fd, base_branch,
     reviewer_model, escalation_worker_model, validation_commands, run,
+    selection,
 ) -> tuple:
     """Run one task while the execution lock is held.
 
@@ -1455,10 +1544,24 @@ def _execute_task(
 
     if run is None:
         try:
-            run = _create_run(actl_dir, root, base_branch)
+            run = _create_run(actl_dir, root, base_branch, selection)
         except (execution.ExecutionError, tasks.TaskError, sqlite3.Error) as exc:
             _fail("cannot start a run: " + str(exc))
             return 1, "cannot start a run", None
+    if task.status == tasks.STATUS_APPROVED:
+        # A crash between the staging merge and the STAGED record leaves the
+        # run branch exactly at this task's approved commit: recognize and
+        # record that staging before the usual tip verification refuses it.
+        try:
+            recovered = _recover_staged_task(actl_dir, root, task, run)
+        except (tasks.TaskError, sqlite3.Error) as exc:
+            _fail(
+                "cannot check the staging of task t" + str(task.id)
+                + ": " + str(exc)
+            )
+            return 1, "staging check failed", run
+        if recovered is not None:
+            return 0, "", recovered
     try:
         worktree = execution.ensure_run_worktree(root, actl_dir, run)
     except execution.ExecutionError as exc:
@@ -2223,6 +2326,16 @@ def _complete_task(actl_dir, root, task, commit, run) -> tuple:
     a run branch into the configured base branch.
     """
     _set_task_status(actl_dir, task.id, tasks.STATUS_APPROVED)
+    try:
+        execution.require_expected_run_tip(root, run)
+    except execution.ExecutionError as exc:
+        print("")
+        print("Task t" + str(task.id) + " \u2192 APPROVED (not staged)")
+        _fail(
+            "task t" + str(task.id) + " staging failed: " + str(exc)
+            + " (the task keeps its APPROVED state)"
+        )
+        return 1, "staging failed", run
     _event("Fast-forward merging into run r" + str(run.id) + "...")
     try:
         execution.integrate_commit(
@@ -2238,7 +2351,8 @@ def _complete_task(actl_dir, root, task, commit, run) -> tuple:
         )
         return 1, "staging failed", run
     try:
-        _stage_task(actl_dir, task.id, run.id)
+        _stage_task(actl_dir, task.id, run.id, commit)
+        run = _load_run(actl_dir, run.id)
     except (tasks.TaskError, sqlite3.Error) as exc:
         # The commit is already in the run branch; a rerun detects that and
         # records STAGED without rerunning the worker, validation, or review.
@@ -2536,13 +2650,28 @@ def _running_run(actl_dir: Path):
         conn.close()
 
 
-def _create_run(actl_dir: Path, root: Path, base_branch: str):
-    """Create a new RUNNING run starting at the current base branch commit."""
+def _create_run(actl_dir: Path, root: Path, base_branch: str, task_ids):
+    """Create a new RUNNING run starting at the current base branch commit.
+
+    ``task_ids`` is the selection the run is responsible for: it may only be
+    marked COMPLETE once every selected task is staged (or already DONE).
+    """
     execution.require_base(root, base_branch)
     start = execution.ref_commit(root, "refs/heads/" + base_branch)
     conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
     try:
-        return tasks.create_run(conn, base_branch, start)
+        return tasks.create_run(conn, base_branch, start, task_ids)
+    finally:
+        conn.close()
+
+
+def _select_run_tasks(actl_dir: Path, run_id: int, task_ids) -> None:
+    """Add this batch's tasks to the run's selection."""
+    if not task_ids:
+        return
+    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    try:
+        tasks.select_run_tasks(conn, run_id, task_ids)
     finally:
         conn.close()
 
@@ -2555,10 +2684,10 @@ def _load_run(actl_dir: Path, run_id: int):
         conn.close()
 
 
-def _stage_task(actl_dir: Path, task_id: int, run_id: int) -> None:
+def _stage_task(actl_dir: Path, task_id: int, run_id: int, commit: str) -> None:
     conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
     try:
-        tasks.stage_task(conn, task_id, run_id)
+        tasks.stage_task(conn, task_id, run_id, commit)
     finally:
         conn.close()
 

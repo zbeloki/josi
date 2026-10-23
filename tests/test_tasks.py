@@ -605,6 +605,9 @@ class TaskProjectTests(ActlTestCase):
             columns = {
                 row[1] for row in conn.execute("PRAGMA table_info(tasks)")
             }
+            run_columns = {
+                row[1] for row in conn.execute("PRAGMA table_info(runs)")
+            }
             tables = {
                 row[0]
                 for row in conn.execute(
@@ -615,6 +618,8 @@ class TaskProjectTests(ActlTestCase):
             conn.close()
         self.assertIn("run_id", columns)
         self.assertIn("runs", tables)
+        self.assertIn("run_selection", tables)
+        self.assertIn("expected_commit", run_columns)
 
 
 if __name__ == "__main__":

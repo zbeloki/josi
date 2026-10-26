@@ -1,11 +1,12 @@
 """SQLite-backed task storage for actl.
 
 Stage 2 keeps the project's tasks in a small SQLite database at
-``.actl/tasks.db``. The schema has four tables: ``tasks``, ``dependencies``,
-``reviews``, and ``runs``. There is no BLOCKED status - whether a task is
-blocked is derived from its dependencies when needed. A task's status is
-PENDING, RUNNING, IMPLEMENTED, FAILED, APPROVED, NEEDS_CHANGES, NEEDS_HUMAN,
-STAGED, or DONE; only ``actl task run`` moves a task between them.
+``.actl/tasks.db``. The schema has five tables: ``tasks``, ``dependencies``,
+``reviews``, ``runs``, and ``usage``. There is no BLOCKED status - whether a
+task is blocked is derived from its dependencies when needed. A task's status
+is PENDING, RUNNING, IMPLEMENTED, FAILED, APPROVED, NEEDS_CHANGES,
+NEEDS_HUMAN, STAGED, or DONE; only ``actl task run`` moves a task between
+them.
 
 Stage 7 groups executions into runs: a run row records the run branch, its
 status (RUNNING while executing, COMPLETE once every selected task was staged,
@@ -23,6 +24,13 @@ Reviewer verdicts are stored in ``reviews`` (one row per completed review,
 newest last) so later stages can read the findings that belong to a task's
 current implementation.
 
+Per-invocation model usage is stored in ``usage`` (one row per worker
+attempt, review turn, or review-format retry), carrying the task and run it
+belongs to, the invocation stage, the model, the token counts, and whatever
+cost data OpenCode or the model pricing made available. A missing token or
+cost value is stored as SQL NULL, never as zero, so a task's totals can be
+summed while incomplete or unavailable amounts stay visible.
+
 The module is deliberately small: repository functions over a connection
 opened by the caller. Every write runs inside a ``with conn:`` transaction,
 so a failed command never leaves a half-written task behind, and foreign
@@ -39,6 +47,8 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
+
+from .usage import USAGE_AVAILABLE, USAGE_UNAVAILABLE
 
 DATABASE_NAME = "tasks.db"
 STATUS_PENDING = "PENDING"
@@ -112,6 +122,28 @@ CREATE TABLE IF NOT EXISTS reviews (
     findings TEXT NOT NULL,
     created_at TEXT NOT NULL
 );
+
+CREATE TABLE IF NOT EXISTS usage (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    task_id INTEGER NOT NULL REFERENCES tasks(id) ON DELETE RESTRICT,
+    run_id INTEGER REFERENCES runs(id),
+    stage TEXT NOT NULL,
+    attempt INTEGER,
+    model TEXT,
+    session_id TEXT,
+    input_tokens INTEGER,
+    output_tokens INTEGER,
+    reasoning_tokens INTEGER,
+    cache_read_tokens INTEGER,
+    cache_write_tokens INTEGER,
+    cost_total REAL,
+    cost_input REAL,
+    cost_output REAL,
+    cost_source TEXT,
+    usage_status TEXT NOT NULL,
+    cost_complete INTEGER NOT NULL DEFAULT 0,
+    created_at TEXT NOT NULL
+);
 """
 
 
@@ -164,6 +196,37 @@ class Run:
     expected_commit: object
     created_at: str
     updated_at: str
+
+
+@dataclass(frozen=True)
+class UsageRecord:
+    """One invocation's recorded usage, with its task/run attribution.
+
+    Token and cost fields are ``None`` when the amount was unavailable; the
+    value is never silently stored as zero. ``usage_status`` is
+    ``"available"`` or ``"unavailable"`` and ``cost_complete`` says whether
+    total, input, and output costs are all known.
+    """
+
+    id: int
+    task_id: int
+    run_id: object
+    stage: str
+    attempt: object
+    model: object
+    session_id: object
+    input_tokens: object
+    output_tokens: object
+    reasoning_tokens: object
+    cache_read_tokens: object
+    cache_write_tokens: object
+    cost_total: object
+    cost_input: object
+    cost_output: object
+    cost_source: object
+    usage_status: str
+    cost_complete: bool
+    created_at: str
 
 
 def connect(db_path: Path) -> sqlite3.Connection:
@@ -356,6 +419,91 @@ def latest_review(conn, task_id: int):
         "decision": row["decision"],
         "findings": json.loads(row["findings"]),
         "created_at": row["created_at"],
+    }
+
+
+def record_usage(
+    conn, task_id: int, run_id, stage: str, attempt, model, session_id, usage,
+) -> None:
+    """Store one invocation's usage with its task and run attribution.
+
+    ``usage`` is an :class:`actl.usage.Usage`: its ``None`` fields are stored
+    as NULL so an unavailable amount is never confused with a zero one.
+    """
+    with conn:
+        if not _task_exists(conn, task_id):
+            raise TaskError("task t" + str(task_id) + " does not exist")
+        conn.execute(
+            "INSERT INTO usage (task_id, run_id, stage, attempt, model,"
+            " session_id, input_tokens, output_tokens, reasoning_tokens,"
+            " cache_read_tokens, cache_write_tokens, cost_total, cost_input,"
+            " cost_output, cost_source, usage_status, cost_complete, created_at)"
+            " VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)",
+            (
+                task_id,
+                run_id,
+                stage,
+                attempt,
+                model,
+                session_id,
+                usage.input_tokens,
+                usage.output_tokens,
+                usage.reasoning_tokens,
+                usage.cache_read_tokens,
+                usage.cache_write_tokens,
+                usage.cost_total,
+                usage.cost_input,
+                usage.cost_output,
+                usage.cost_source,
+                USAGE_AVAILABLE if usage.available else USAGE_UNAVAILABLE,
+                1 if usage.cost_complete else 0,
+                _utc_now(),
+            ),
+        )
+
+
+def task_usage(conn, task_id: int) -> list:
+    """Return every usage record for ``task_id``, oldest first."""
+    rows = conn.execute(
+        "SELECT * FROM usage WHERE task_id = ? ORDER BY id", (task_id,)
+    ).fetchall()
+    return [_to_usage(row) for row in rows]
+
+
+def run_usage(conn, run_id: int) -> list:
+    """Return every usage record attributed to ``run_id``, oldest first."""
+    rows = conn.execute(
+        "SELECT * FROM usage WHERE run_id = ? ORDER BY id", (run_id,)
+    ).fetchall()
+    return [_to_usage(row) for row in rows]
+
+
+def usage_totals(records) -> dict:
+    """Sum usage records into total, input, and output costs.
+
+    A ``None`` total means no record carried that amount at all; it is never
+    reported as a confirmed zero. ``complete`` is False when there are no
+    records at all or when any record is missing usage or any of the three
+    costs, so callers can flag an incomplete total instead of presenting it
+    as exact.
+    """
+    total = input_cost = output_cost = None
+    complete = bool(records)
+    for record in records:
+        if record.usage_status != "available" or not record.cost_complete:
+            complete = False
+        if record.cost_total is not None:
+            total = (total or 0.0) + record.cost_total
+        if record.cost_input is not None:
+            input_cost = (input_cost or 0.0) + record.cost_input
+        if record.cost_output is not None:
+            output_cost = (output_cost or 0.0) + record.cost_output
+    return {
+        "count": len(records),
+        "total": total,
+        "input": input_cost,
+        "output": output_cost,
+        "complete": complete,
     }
 
 
@@ -567,6 +715,7 @@ def delete_task(conn, task_id: int) -> None:
             )
         conn.execute("DELETE FROM dependencies WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM reviews WHERE task_id = ?", (task_id,))
+        conn.execute("DELETE FROM usage WHERE task_id = ?", (task_id,))
         conn.execute("DELETE FROM tasks WHERE id = ?", (task_id,))
 
 
@@ -665,6 +814,30 @@ def _to_run(row) -> Run:
         expected_commit=row["expected_commit"],
         created_at=row["created_at"],
         updated_at=row["updated_at"],
+    )
+
+
+def _to_usage(row) -> UsageRecord:
+    return UsageRecord(
+        id=row["id"],
+        task_id=row["task_id"],
+        run_id=row["run_id"],
+        stage=row["stage"],
+        attempt=row["attempt"],
+        model=row["model"],
+        session_id=row["session_id"],
+        input_tokens=row["input_tokens"],
+        output_tokens=row["output_tokens"],
+        reasoning_tokens=row["reasoning_tokens"],
+        cache_read_tokens=row["cache_read_tokens"],
+        cache_write_tokens=row["cache_write_tokens"],
+        cost_total=row["cost_total"],
+        cost_input=row["cost_input"],
+        cost_output=row["cost_output"],
+        cost_source=row["cost_source"],
+        usage_status=row["usage_status"],
+        cost_complete=bool(row["cost_complete"]),
+        created_at=row["created_at"],
     )
 
 

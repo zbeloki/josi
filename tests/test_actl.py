@@ -84,6 +84,17 @@ Behaviour is controlled through environment variables:
                               ``commit`` (replace a tracked file and commit),
                               ``dirty`` (modify a tracked file), or
                               ``untracked`` (write a scratch file)
+* ``ACTL_FAKE_SESSION_USAGE`` - JSON object with the cumulative ``cost`` and
+                              ``tokens`` reported by every session lookup
+* ``ACTL_FAKE_SESSION_USAGE_SEQUENCE`` - JSON list of per-lookup cumulative
+                              usage objects selected with
+                              ``ACTL_FAKE_SESSION_USAGE_COUNT_FILE``; entries
+                              past the end fall back to
+                              ``ACTL_FAKE_SESSION_USAGE``
+* ``ACTL_FAKE_SESSION_USAGE_COUNT_FILE`` - file counting session lookups; used
+                              with ``ACTL_FAKE_SESSION_USAGE_SEQUENCE``
+* ``ACTL_FAKE_MODEL_LIST`` - JSON list of model objects returned by
+                              ``GET /api/model`` (pricing metadata)
 """
 
 import json
@@ -140,6 +151,18 @@ def _sequence_item(name, index):
     if not isinstance(items, list) or index >= len(items):
         return None
     return items[index]
+
+
+def _session_usage():
+    """Return the cumulative usage reported by one session lookup, or None."""
+    index = _next_index(os.environ.get("ACTL_FAKE_SESSION_USAGE_COUNT_FILE"))
+    item = _sequence_item("ACTL_FAKE_SESSION_USAGE_SEQUENCE", index)
+    if item is not None:
+        return item if isinstance(item, dict) else json.loads(item)
+    raw = os.environ.get("ACTL_FAKE_SESSION_USAGE")
+    if not raw:
+        return None
+    return json.loads(raw)
 
 
 def _review_message():
@@ -337,9 +360,18 @@ def main():
             session_id = path.rsplit("/", 1)[-1]
             directory = os.environ.get("ACTL_FAKE_GET_DIR") or os.getcwd()
             agent = os.environ.get("ACTL_FAKE_GET_AGENT", "actl-planner")
-            print(json.dumps({"data": {"id": session_id,
-                                       "agent": agent,
-                                       "location": {"directory": directory}}}))
+            data = {"id": session_id,
+                    "agent": agent,
+                    "location": {"directory": directory}}
+            session_usage = _session_usage()
+            if session_usage is not None:
+                data.update(session_usage)
+            print(json.dumps({"data": data}))
+            return 0
+
+        if method == "GET" and path == "/api/model":
+            raw = os.environ.get("ACTL_FAKE_MODEL_LIST", "[]")
+            print(json.dumps({"data": json.loads(raw)}))
             return 0
 
     if argv and argv[0] == "run":

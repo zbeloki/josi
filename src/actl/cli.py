@@ -85,7 +85,9 @@ from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 
-from . import __version__, execution, opencode, review, tasks, validation
+from . import (
+    __version__, execution, opencode, review, tasks, usage, validation,
+)
 
 PROJECT_DIR = ".actl"
 PROJECT_METADATA = "project.json"
@@ -1660,7 +1662,7 @@ def _execute_task(
         verification = _validate_and_review(
             binary, root, actl_dir, task, run.branch, reviewer_model,
             validation_commands, lock_fd, attempt=max(attempts, 1),
-            announce_worktree=True,
+            announce_worktree=True, run_id=run.id,
         )
         if verification.outcome == "approved":
             return _complete_task(
@@ -1691,7 +1693,7 @@ def _execute_task(
             binary, root, actl_dir, task, lock_fd, run.branch,
             attempt=attempt, model=model, feedback=feedback,
             retry=not (attempt == 1 and task.status == tasks.STATUS_PENDING),
-            announce_worktree=attempt == 1,
+            announce_worktree=attempt == 1, run_id=run.id,
         )
         if status != tasks.STATUS_IMPLEMENTED:
             _set_task_status(actl_dir, task.id, status)
@@ -1714,7 +1716,7 @@ def _execute_task(
 
         verification = _validate_and_review(
             binary, root, actl_dir, task, run.branch, reviewer_model,
-            validation_commands, lock_fd, attempt=attempt,
+            validation_commands, lock_fd, attempt=attempt, run_id=run.id,
         )
         if verification.outcome == "approved":
             return _complete_task(
@@ -1738,7 +1740,7 @@ def _execute_task(
 
 def _run_worker_attempt(
     binary, root, actl_dir, task, lock_fd, base_branch, attempt, model,
-    feedback, retry, announce_worktree,
+    feedback, retry, announce_worktree, run_id,
 ):
     """Run one worker attempt in the task worktree.
 
@@ -1746,6 +1748,9 @@ def _run_worker_attempt(
     reason when the worker left a clean, committed implementation;
     ``FAILED`` with a reason for a worker or OpenCode execution error. The
     attempt continues on the existing branch and never resets it.
+
+    After the turn, the attempt's model usage is captured into its own log
+    and stored with the task and run it belongs to.
     """
     log_path, log = execution.open_run_log(actl_dir, task.id)
     with log:
@@ -1762,6 +1767,8 @@ def _run_worker_attempt(
         status = tasks.STATUS_FAILED
         reason = ""
         exit_code = None
+        worktree = None
+        session = None
         try:
             if announce_worktree:
                 _event("Preparing worktree")
@@ -1809,6 +1816,12 @@ def _run_worker_attempt(
         except (execution.ExecutionError, opencode.OpenCodeError, OSError) as exc:
             reason = str(exc)
 
+        if session is not None and worktree is not None:
+            _capture_usage(
+                binary, worktree.path, session.id, model, task, run_id,
+                usage.STAGE_WORKER, attempt, log, actl_dir,
+            )
+
         log.write("---\n")
         log.write("finished_at: " + _utc_now() + "\n")
         if exit_code is not None:
@@ -1817,6 +1830,80 @@ def _run_worker_attempt(
         if reason:
             log.write("reason: " + reason + "\n")
     return status, reason, log_path
+
+
+# OpenCode's model list carries the pricing metadata actl derives costs
+# from. It is project-wide and does not change during one actl process, so it
+# is fetched at most once per process instead of once per invocation.
+_MODEL_LIST_CACHE = {}
+
+
+def _pricing_for(binary, directory, model):
+    """Return ``model``'s pricing from OpenCode, or None when unavailable.
+
+    A missing or unreadable model list is not fatal: the cost is then simply
+    left to OpenCode's own reported value, or marked unavailable.
+    """
+    models = _MODEL_LIST_CACHE.get(binary)
+    if models is None:
+        try:
+            models = opencode.model_list(binary, directory)
+        except (opencode.OpenCodeError, OSError):
+            models = []
+        _MODEL_LIST_CACHE[binary] = models
+    return usage.pricing_from_models(model, models)
+
+
+def _record_usage(
+    actl_dir, task_id, run_id, stage, attempt, model, session_id, record,
+):
+    """Persist one invocation's usage in the project database."""
+    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    try:
+        tasks.record_usage(
+            conn, task_id, run_id, stage, attempt, model, session_id, record,
+        )
+    finally:
+        conn.close()
+
+
+def _capture_usage(
+    binary, directory, session_id, model, task, run_id, stage, attempt, log,
+    actl_dir, previous=None,
+):
+    """Capture, log, and persist one invocation's model usage.
+
+    The session's cumulative usage is read back from OpenCode and, for a
+    session reused across turns (the reviewer's format retry), the previous
+    cumulative value is subtracted so each turn is recorded on its own. The
+    token counts go into the invocation's log only - never the terminal - and
+    the record is stored with its task and run attribution. Reading usage is
+    best-effort: a failure is logged as unavailable and never interrupts the
+    task. Returns the cumulative usage for the next turn of this session.
+    """
+    try:
+        current = usage.parse_session(
+            opencode.session_usage(binary, directory, session_id)
+        )
+    except (opencode.OpenCodeError, OSError) as exc:
+        current = usage.unavailable()
+        log.write("usage_error: " + str(exc) + "\n")
+    record = usage.derive(
+        usage.subtract(current, previous),
+        _pricing_for(binary, directory, model),
+    )
+    for line in usage.format_lines(record):
+        log.write(line + "\n")
+    log.flush()
+    try:
+        _record_usage(
+            actl_dir, task.id, run_id, stage, attempt, model, session_id,
+            record,
+        )
+    except (tasks.TaskError, sqlite3.Error) as exc:
+        log.write("usage_record_error: " + str(exc) + "\n")
+        log.flush()
+    return current
 
 
 @dataclass(frozen=True)
@@ -1834,7 +1921,7 @@ class _Verification:
 
 def _validate_and_review(
     binary, root, actl_dir, task, base_branch, reviewer_model,
-    validation_commands, lock_fd, attempt, announce_worktree=False,
+    validation_commands, lock_fd, attempt, announce_worktree=False, run_id=None,
 ) -> _Verification:
     """Validate and review one implemented commit.
 
@@ -1950,7 +2037,7 @@ def _validate_and_review(
             verdict = _run_reviewer(
                 binary, root, actl_dir, task, worktree, commit, base_branch,
                 reviewer_model, validation_result, lock_fd, review_log,
-                attempt,
+                attempt, run_id=run_id,
             )
         finally:
             review_log.close()
@@ -1998,7 +2085,7 @@ def _validate_and_review(
 
 def _run_reviewer(
     binary, root, actl_dir, task, worktree, commit, base_branch,
-    reviewer_model, validation_result, lock_fd, log, attempt=None,
+    reviewer_model, validation_result, lock_fd, log, attempt=None, run_id=None,
 ) -> review.Verdict:
     """Run the reviewer in a temporary worktree at ``commit``.
 
@@ -2006,7 +2093,8 @@ def _run_reviewer(
     been validated; malformed output raises :class:`review.ReviewError`. The
     reviewer always evaluates the complete cumulative task diff, never just
     the latest repair commit. A format failure gets one correction turn in
-    the same session without consuming a worker attempt.
+    the same session without consuming a worker attempt. Each reviewer turn
+    records its own usage, so a format retry is attributed separately.
     """
     base_commit = execution.branch_base(actl_dir, task.id)
     if base_commit is None:
@@ -2041,6 +2129,7 @@ def _run_reviewer(
             agent=opencode.REVIEWER_AGENT,
         )
         log.write("session: " + session.id + "\n")
+        previous = None
         for format_attempt in range(2):
             # Flush before the child writes through the inherited descriptor.
             # Parse only this turn, never a verdict from an earlier turn if
@@ -2059,6 +2148,14 @@ def _run_reviewer(
             log.write("---\nfinished_at: " + _utc_now() + "\n")
             log.write("exit_code: " + str(exit_code) + "\n")
             log.flush()
+            # The session is reused for the one format retry, so the previous
+            # cumulative usage is subtracted to attribute each turn its own.
+            previous = _capture_usage(
+                binary, review_path, session.id, reviewer_model, task, run_id,
+                usage.STAGE_REVIEW if format_attempt == 0
+                else usage.STAGE_REVIEW_FORMAT_RETRY,
+                attempt, log, actl_dir, previous=previous,
+            )
             if exit_code != 0:
                 _log_review_failure(
                     log, "the reviewer exited with status " + str(exit_code)

@@ -345,6 +345,40 @@ def get_session(binary: str, project_root: Path, session_id: str) -> Session:
     return session
 
 
+def session_usage(binary: str, directory: Path, session_id: str, env=None) -> dict:
+    """Return the raw session metadata used to capture one invocation's usage.
+
+    ``GET /api/session/<id>`` reports the session's cumulative ``cost`` and
+    ``tokens``; the caller turns the cumulative totals into per-invocation
+    usage. A response without a usable ``data`` object raises
+    :class:`OpenCodeError`.
+    """
+    payload = _api(
+        binary, directory, "GET", "/api/session/" + session_id, env=env
+    )
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, dict):
+        raise OpenCodeError(
+            "unexpected OpenCode response while reading the usage of session "
+            + repr(session_id)
+        )
+    return data
+
+
+def model_list(binary: str, directory: Path, env=None) -> list:
+    """Return the models OpenCode knows about, with their pricing metadata.
+
+    ``GET /api/model`` reports every available model; actl reads the cost of
+    the model it launched to derive input/output costs when OpenCode did not
+    report a cost itself.
+    """
+    payload = _api(binary, directory, "GET", "/api/model", env=env)
+    data = payload.get("data") if isinstance(payload, dict) else None
+    if not isinstance(data, list):
+        raise OpenCodeError("unexpected OpenCode response while listing models")
+    return data
+
+
 def switch_agent(binary: str, project_root: Path, session_id: str, agent: str) -> None:
     """Select the agent used by subsequent turns of an existing session."""
     _api(

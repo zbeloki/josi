@@ -541,7 +541,11 @@ with a header (task, attempt, model, branch, commit) and ends with the result
 (exit codes, status, verdict, failure reason), and an earlier attempt's logs
 are never overwritten. The logs are written continuously while the stage
 runs, and each path is printed when the stage starts as well as in the final
-summary; use `tail -f` to watch a run.
+summary; use `tail -f` to watch a run. Each worker, reviewer, and
+review-format-retry invocation also records its token counts and available
+cost in that invocation's log, never on the terminal, and stores them in
+`.actl/tasks.db` with their task and run attribution so a task's usage
+accumulates across attempts and CLI invocations.
 
 Only one execution may run per project. The lock is an exclusive, nonblocking
 `fcntl.flock` on `.actl/execution.lock`, and the locked file descriptor is
@@ -865,7 +869,7 @@ these processes also receives actl's launch-time configuration through
 │                   # base_branch, created_at
 ├── planner.json    # active planner session id, created_at
 ├── tasks.db        # SQLite database (tasks, dependencies, reviews,
-│                   # runs, run selections)
+│                   # runs, run selections, per-invocation usage)
 ├── execution.lock  # project-wide execution lock (fcntl.flock)
 ├── base/           # branch-creation commit per task: t1, t2, ...
 ├── attempts/       # used worker attempts + next-attempt feedback: t1, t2, ...

@@ -97,8 +97,14 @@ def _log(argv):
     path = os.environ.get("ACTL_FAKE_LOG")
     if not path:
         return
+    env = {
+        key: value for key, value in os.environ.items()
+        if key.startswith("OPENCODE_")
+    }
     with open(path, "a", encoding="utf-8") as handle:
-        handle.write(json.dumps({"argv": argv, "cwd": os.getcwd()}) + "\\n")
+        handle.write(
+            json.dumps({"argv": argv, "cwd": os.getcwd(), "env": env}) + "\\n"
+        )
 
 
 def _next_index(path):

@@ -461,6 +461,38 @@ execution lock, creating a worktree, or changing the task, instead of
 silently skipping the independent review. An `IMPLEMENTED` task is validated
 and reviewed without launching the worker again.
 
+### OpenRouter provider routing
+
+Every OpenCode process actl launches - the planner TUI, the worker, the
+reviewer, and the escalation worker, including the launches that run from the
+task and review worktrees - receives a launch-time OpenCode configuration
+through the `OPENCODE_CONFIG_CONTENT` environment variable. actl defaults
+OpenRouter requests to provider-level price sorting:
+
+```json
+{
+  "provider": {
+    "openrouter": {
+      "body": {"provider": {"sort": "price"}}
+    }
+  }
+}
+```
+
+The setting lives on the `openrouter` provider rather than on a model, so it
+applies to every OpenRouter model actl is configured to use, whichever model
+is selected: actl never lists models or picks a provider, so adding models or
+switching the worker, reviewer, or escalation model does not change it. This
+is only a default. actl reads the project's own OpenCode configuration - the
+file named by `OPENCODE_CONFIG`, plus `opencode.json(c)` and
+`.opencode/opencode.json(c)` discovered from the filesystem root down to the
+launch directory - and layers its default *below* that configuration. A
+project or model-level setting, including a different
+`provider.openrouter.body.provider.sort`, therefore takes precedence, and
+unrelated OpenCode or OpenRouter configuration is preserved. A missing,
+unreadable, or malformed config file is ignored rather than failing the
+launch.
+
 The base branch is project-level configuration too:
 
 ```sh
@@ -801,7 +833,9 @@ Sessions are created explicitly (instead of letting the TUI create them
 lazily) so actl captures the real session ID. Before resuming, actl asks
 OpenCode for the session and compares its `location.directory` with the
 project root; if the session is missing, unreadable, or belongs elsewhere,
-actl reports an error instead of resuming the wrong session.
+actl reports an error instead of resuming the wrong session. Every one of
+these processes also receives actl's launch-time configuration through
+`OPENCODE_CONFIG_CONTENT` (see "OpenRouter provider routing" above).
 
 ## Project files
 
@@ -883,7 +917,12 @@ must never overwrite; branch squash options that cannot fake a successful
 integration; already approved, staged, and DONE tasks; explicit task lists;
 `--all` in dependency order; deterministic id order for independent tasks;
 stopping at the first failure or at a task that needs a human;
-`actl run list` and `actl run show`; and one execution lock per batch.
+`actl run list` and `actl run show`; and one execution lock per batch. A
+dedicated launch-configuration suite (`test_launch_config`) checks that the
+OpenRouter price-sort default is present on every launch path - the planner
+TUI, the worker, and the reviewer, including the worktree launches - that it
+is provider-level and independent of the selected model, and that existing
+project and model-level configuration overrides it and survives.
 
 ## Limitations
 

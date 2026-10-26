@@ -33,6 +33,13 @@ USAGE_UNAVAILABLE = "unavailable"
 COST_REPORTED = "reported"
 COST_DERIVED = "derived"
 
+# Accumulated-cost states shown by ``actl task show`` and ``actl run show``.
+# ``unavailable`` means no usage was recorded at all, ``incomplete`` means
+# some amount is missing, and ``complete`` means every amount is known.
+TOTALS_COMPLETE = "complete"
+TOTALS_INCOMPLETE = "incomplete"
+TOTALS_UNAVAILABLE = "unavailable"
+
 _MILLION = 1_000_000.0
 
 
@@ -227,6 +234,38 @@ def format_lines(usage: Usage) -> list:
         )
     lines.append("usage_status: " + USAGE_AVAILABLE)
     return lines
+
+
+def format_totals(totals) -> list:
+    """Return the cost summary lines for accumulated usage totals.
+
+    ``totals`` is the mapping returned by :func:`actl.tasks.usage_totals`.
+    Only costs are shown here; per-invocation token counts stay in the logs.
+    A total that no record carried is spelled ``unavailable``, and a total
+    known only in part is flagged ``incomplete``, so a missing amount is
+    never presented as a confirmed zero.
+    """
+    return [
+        "cost_total: " + _cost(totals.get("total")),
+        "cost_input: " + _cost(totals.get("input")),
+        "cost_output: " + _cost(totals.get("output")),
+        "cost_status: " + _totals_status(totals),
+    ]
+
+
+def _totals_status(totals) -> str:
+    """Classify accumulated totals as complete, incomplete, or unavailable.
+
+    ``complete`` means every amount is known. When no amount at all is known -
+    no records, or records whose costs were all unavailable - the status is
+    ``unavailable``; a partially known total is ``incomplete``. A missing
+    amount therefore never reads as a confirmed zero.
+    """
+    if totals.get("complete"):
+        return TOTALS_COMPLETE
+    if all(totals.get(name) is None for name in ("total", "input", "output")):
+        return TOTALS_UNAVAILABLE
+    return TOTALS_INCOMPLETE
 
 
 def _pricing_from_cost(cost) -> Optional[Pricing]:

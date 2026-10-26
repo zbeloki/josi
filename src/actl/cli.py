@@ -918,9 +918,10 @@ def cmd_task_show(args) -> int:
         task_id = _parse_task_id(args.id)
         with _task_database() as conn:
             task = tasks.get_task(conn, task_id)
+            totals = tasks.usage_totals(tasks.task_usage(conn, task_id))
     except (ProjectError, tasks.TaskError, sqlite3.Error) as exc:
         return _fail(str(exc))
-    _print_task(task)
+    _print_task(task, totals)
     return 0
 
 
@@ -975,12 +976,13 @@ def cmd_run_list(_args) -> int:
 
 
 def cmd_run_show(args) -> int:
-    """Show one run with its commits and selected tasks."""
+    """Show one run with its commits, selected tasks, and costs."""
     try:
         run_id = _parse_run_id(args.id)
         with _run_database() as conn:
             run = tasks.get_run(conn, run_id)
             associated = tasks.selected_tasks(conn, run.id)
+            totals = tasks.usage_totals(tasks.run_usage(conn, run.id))
     except (ProjectError, tasks.TaskError, sqlite3.Error) as exc:
         return _fail(str(exc))
     print("id: r" + str(run.id))
@@ -991,6 +993,7 @@ def cmd_run_show(args) -> int:
     print("final_commit: " + (run.final_commit or "(none)"))
     print("created_at: " + run.created_at)
     print("updated_at: " + run.updated_at)
+    _print_costs(totals)
     print("tasks:")
     if not associated:
         print("(none)")
@@ -2934,7 +2937,7 @@ def _parse_dependencies(values) -> list:
     return dependencies
 
 
-def _print_task(task) -> None:
+def _print_task(task, totals=None) -> None:
     print("id: t" + str(task.id))
     print("title: " + task.title)
     print("status: " + task.status)
@@ -2946,6 +2949,14 @@ def _print_task(task) -> None:
     )
     print("description:")
     print(task.description if task.description else "(none)")
+    if totals is not None:
+        _print_costs(totals)
+
+
+def _print_costs(totals) -> None:
+    """Print accumulated cost totals; token counts stay in the logs."""
+    for line in usage.format_totals(totals):
+        print(line)
 
 
 def _event(message: str) -> None:

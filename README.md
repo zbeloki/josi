@@ -545,7 +545,12 @@ summary; use `tail -f` to watch a run. Each worker, reviewer, and
 review-format-retry invocation also records its token counts and available
 cost in that invocation's log, never on the terminal, and stores them in
 `.actl/tasks.db` with their task and run attribution so a task's usage
-accumulates across attempts and CLI invocations.
+accumulates across attempts and CLI invocations. `actl task show` then
+reports the task's accumulated `cost_total`, `cost_input`, and `cost_output`
+across every attempt and retry, while `actl run show` reports only the usage
+attributed to that run; a `cost_status` of `complete`, `incomplete`, or
+`unavailable` makes a partially known or missing amount visible instead of
+presenting it as zero, and per-invocation token counts stay in the logs.
 
 Only one execution may run per project. The lock is an exclusive, nonblocking
 `fcntl.flock` on `.actl/execution.lock`, and the locked file descriptor is

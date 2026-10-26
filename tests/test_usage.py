@@ -73,9 +73,37 @@ class UsageTestCase(VerificationTestCase):
     def usage_totals(self, task_id=1):
         return tasks.usage_totals(self.usage_rows(task_id))
 
+    def run_usage_rows(self, run_id=1):
+        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        try:
+            return tasks.run_usage(conn, run_id)
+        finally:
+            conn.close()
+
     def assert_no_usage_on_terminal(self, result):
         for marker in ("input=", "output=", "cache_read=", "usage_status:"):
             self.assertNotIn(marker, result.stdout, "usage leaked to the terminal")
+
+    def cost_field(self, output, name):
+        """Return the value of one ``cost_*`` line from ``show`` output."""
+        for line in output.splitlines():
+            if line.startswith(name + ": "):
+                return line.split(": ", 1)[1]
+        self.fail(name + " not found in:\n" + output)
+
+    def assert_cost_summary(self, output, records, status):
+        """Assert the shown cost summary matches ``records`` and ``status``."""
+        def expected(field):
+            values = [getattr(row, field) for row in records]
+            values = [value for value in values if value is not None]
+            return "unavailable" if not values else "%.6f" % sum(values)
+
+        self.assertEqual(self.cost_field(output, "cost_total"), expected("cost_total"))
+        self.assertEqual(self.cost_field(output, "cost_input"), expected("cost_input"))
+        self.assertEqual(
+            self.cost_field(output, "cost_output"), expected("cost_output")
+        )
+        self.assertEqual(self.cost_field(output, "cost_status"), status)
 
 
 class UsageCaptureTests(UsageTestCase):
@@ -278,6 +306,174 @@ class UsagePersistenceTests(UsageTestCase):
             self.assertEqual(tasks.run_usage(conn, 99), [])
         finally:
             conn.close()
+
+
+class UsageSummaryTests(UsageTestCase):
+    """``actl task show`` and ``actl run show`` display accumulated costs."""
+
+    def test_task_show_accumulates_across_retries(self):
+        self.set_pricing()
+        self.env["ACTL_FAKE_REVIEW_SEQUENCE"] = json.dumps([
+            {"decision": "changes_requested", "findings": [{
+                "severity": "major", "description": "Broken.",
+                "scenario": "s", "impact": "i", "location": "f.py",
+            }]},
+            {"decision": "approved", "findings": []},
+        ])
+        self.env["ACTL_FAKE_REVIEW_COUNT_FILE"] = str(self.base / "review-count")
+        self.set_session_sequence([
+            {"cost": 0.01, "tokens": token_counts(1000, output=100)},
+            {"cost": 0.02, "tokens": token_counts(2000, output=200)},
+            {"cost": 0.03, "tokens": token_counts(3000, output=300)},
+            {"cost": 0.04, "tokens": token_counts(4000, output=400)},
+        ])
+        self.make_task()
+        self.assertEqual(self.run_task("t1").returncode, 0)
+
+        records = self.usage_rows()
+        self.assertEqual([row.stage for row in records], [
+            "worker", "review", "worker", "review",
+        ])
+        shown = self.run_actl("task", "show", "t1")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assert_cost_summary(shown.stdout, records, "complete")
+        # The task totals are the sum of every attempt, and no per-invocation
+        # token count leaks into the summary.
+        self.assertAlmostEqual(
+            float(self.cost_field(shown.stdout, "cost_total")), 0.10
+        )
+        self.assert_no_usage_on_terminal(shown)
+
+    def test_task_show_accumulates_across_cli_invocations(self):
+        self.set_pricing()
+        self.set_session_usage(0.01, token_counts(1000))
+        self.env["ACTL_FAKE_RUN_EXIT"] = "1"
+        self.make_task()
+        self.assertNotEqual(self.run_task("t1").returncode, 0)
+        del self.env["ACTL_FAKE_RUN_EXIT"]
+        self.set_session_usage(0.02, token_counts(2000))
+        self.assertEqual(self.run_task("t1").returncode, 0)
+
+        records = self.usage_rows()
+        self.assertEqual(len(records), 3, "both invocations keep their usage")
+        shown = self.run_actl("task", "show", "t1")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assert_cost_summary(shown.stdout, records, "complete")
+        self.assertAlmostEqual(
+            float(self.cost_field(shown.stdout, "cost_total")), 0.05
+        )
+        self.assert_no_usage_on_terminal(shown)
+
+    def test_run_show_includes_only_its_own_usage(self):
+        self.set_pricing()
+        self.set_session_usage(0.01, token_counts(1000))
+        self.make_task()
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(self.integrate("r1").returncode, 0)
+        created = self.run_actl("task", "create", "--title", "Second")
+        self.assertEqual(created.returncode, 0, created.stderr)
+        self.set_session_usage(0.07, token_counts(3000))
+        second_run = self.run_task("t2")
+        self.assertEqual(second_run.returncode, 0, second_run.stderr)
+
+        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        try:
+            first_rows = tasks.run_usage(conn, 1)
+            second_rows = tasks.run_usage(conn, 2)
+        finally:
+            conn.close()
+        self.assertTrue(first_rows, "the first run has usage")
+        self.assertTrue(second_rows, "the second run has usage")
+        self.assertEqual(
+            {row.task_id for row in first_rows}, {1},
+            "the first run only carries its own task's usage",
+        )
+        self.assertEqual({row.task_id for row in second_rows}, {2})
+
+        first = self.run_actl("run", "show", "r1")
+        self.assertEqual(first.returncode, 0, first.stderr)
+        self.assert_cost_summary(first.stdout, first_rows, "complete")
+        self.assertAlmostEqual(
+            float(self.cost_field(first.stdout, "cost_total")), 0.02
+        )
+        second = self.run_actl("run", "show", "r2")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assert_cost_summary(second.stdout, second_rows, "complete")
+        self.assertAlmostEqual(
+            float(self.cost_field(second.stdout, "cost_total")), 0.14
+        )
+
+    def test_show_with_no_recorded_usage_is_not_a_confirmed_zero(self):
+        self.make_task()
+        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        try:
+            tasks.create_run(conn, "main", self.base_sha, [1])
+        finally:
+            conn.close()
+
+        shown = self.run_actl("task", "show", "t1")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertEqual(
+            self.cost_field(shown.stdout, "cost_status"), "unavailable"
+        )
+        self.assertEqual(
+            self.cost_field(shown.stdout, "cost_total"), "unavailable"
+        )
+        self.assertNotIn("0.000000", shown.stdout)
+
+        run_show = self.run_actl("run", "show", "r1")
+        self.assertEqual(run_show.returncode, 0, run_show.stderr)
+        self.assertEqual(
+            self.cost_field(run_show.stdout, "cost_status"), "unavailable"
+        )
+        self.assertEqual(
+            self.cost_field(run_show.stdout, "cost_total"), "unavailable"
+        )
+        self.assertNotIn("0.000000", run_show.stdout)
+
+    def test_show_reports_unavailable_amounts_as_unavailable(self):
+        # No session usage and no pricing: the invocations are recorded with
+        # unavailable amounts rather than a confirmed zero.
+        self.make_task()
+        self.assertEqual(self.run_task("t1").returncode, 0)
+
+        records = self.usage_rows()
+        shown = self.run_actl("task", "show", "t1")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assert_cost_summary(shown.stdout, records, "unavailable")
+        self.assertNotIn("0.000000", shown.stdout)
+
+        run_show = self.run_actl("run", "show", "r1")
+        self.assertEqual(run_show.returncode, 0, run_show.stderr)
+        self.assert_cost_summary(run_show.stdout, self.run_usage_rows(), "unavailable")
+        self.assertNotIn("0.000000", run_show.stdout)
+
+    def test_show_reports_partially_known_costs_as_incomplete(self):
+        # A reported total without pricing keeps the total but leaves the
+        # input/output split unknown, so the summary is marked incomplete.
+        self.set_session_usage(0.02, token_counts(500, output=50))
+        self.make_task()
+        self.assertEqual(self.run_task("t1").returncode, 0)
+
+        shown = self.run_actl("task", "show", "t1")
+        self.assertEqual(shown.returncode, 0, shown.stderr)
+        self.assertEqual(
+            self.cost_field(shown.stdout, "cost_total"), "0.040000"
+        )
+        self.assertEqual(
+            self.cost_field(shown.stdout, "cost_input"), "unavailable"
+        )
+        self.assertEqual(
+            self.cost_field(shown.stdout, "cost_output"), "unavailable"
+        )
+        self.assertEqual(
+            self.cost_field(shown.stdout, "cost_status"), "incomplete"
+        )
+
+        run_show = self.run_actl("run", "show", "r1")
+        self.assertEqual(
+            self.cost_field(run_show.stdout, "cost_status"), "incomplete"
+        )
 
 
 if __name__ == "__main__":

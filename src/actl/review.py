@@ -9,8 +9,9 @@ The reviewer must end its turn with exactly one complete JSON object.
 Parsing is strict: prose around the verdict, several objects, truncated
 JSON, unknown decisions or severities, approvals that carry blocking
 findings, and change requests without a blocking finding are all rejected,
-so none of them can ever be mistaken for an approval. There is no
-output-repair loop.
+so none of them can ever be mistaken for an approval. The orchestration
+layer may request one formatting-only correction in the same session;
+the corrected message must pass the same strict parser.
 """
 
 from __future__ import annotations
@@ -40,54 +41,43 @@ POLICY_FILE = "REVIEW_POLICY.md"
 BUILTIN_POLICY = """\
 Review priorities, in order:
 1. Does the implementation satisfy the task requirements?
-2. Does it introduce significant correctness problems?
-3. Does it create credible security, safety, or data-loss risks?
+2. Does it work correctly under normal operating conditions?
+3. Does it handle common failures reasonably?
+4. Does it introduce significant security, correctness, or data-loss risks?
 
-Focus on the changes introduced by this task and use the rest of the
-repository only as context. Do not perform an exhaustive audit of unrelated
-project code.
+Focus on changes introduced by the task. Do not audit unrelated code.
 
 Severity levels:
-- CRITICAL: a credible serious security vulnerability; significant risk of
-  data loss or corruption; another severe safety or correctness problem.
-- MAJOR: core task requirements are not satisfied; important functionality
-  breaks under realistic conditions; a significant correctness or security
-  issue.
-- MINOR: an unusual edge case with limited impact; a recoverable robustness
-  problem; a small nonessential defect.
-- SUGGESTION: an optional improvement, a refactoring opportunity, or a style
-  and maintainability recommendation.
+- CRITICAL: Serious security vulnerability, significant data-loss risk, or severe correctness failure.
+- MAJOR: Unmet core requirement, broken important functionality, or significant defect under realistic operating conditions.
+- MINOR: Uncommon edge case, limited-impact defect, or nonessential robustness issue.
+- SUGGESTION: Optional improvement, refactoring, or style preference.
 
 Approval rules:
-- Reject (changes_requested) only when there is at least one CRITICAL or
-  MAJOR finding. A failed required validation command or an unmet acceptance
-  criterion is blocking.
-- Approve when there are no findings, only MINOR findings, or only
-  SUGGESTIONS.
-- Minor findings and suggestions must never block approval.
+- Reject only for CRITICAL or MAJOR findings, failed required validations, or unmet mandatory acceptance criteria.
+- Approve when only MINOR findings or SUGGESTIONS remain.
+- Approval means sufficiently reliable, not perfect.
 
-Every CRITICAL or MAJOR finding must include a concrete failure scenario, its
-realistic impact, why it is significant enough to block approval, and the
-relevant files or code. Consider both likelihood and impact; a credible
-severe vulnerability can be blocking even if its triggering conditions are
-uncommon.
+Blocking findings must include a concrete failure scenario, realistic impact, and relevant code location. Evaluate both likelihood and severity. Reproducibility alone does not justify MAJOR severity.
 
-Do not request changes for:
-- coding style preferences;
-- speculative improvements;
-- extremely unlikely edge cases with limited impact;
-- nonessential robustness enhancements;
-- features outside the task requirements;
-- previously accepted project limitations;
-- unrelated pre-existing problems, unless this task introduces or materially
-  worsens them.
+Review principles:
+- Prioritize normal usage, expected concurrency, and common errors.
+- Do not block on extremely unlikely edge cases with limited impact.
+- Do not require protection against arbitrary combinations of exceptional events.
+- Respect third-party dependency boundaries; avoid invasive workarounds for obscure library behavior.
+- Consider proportionality: fixes should not introduce excessive complexity relative to the risk.
+- Do not request unrelated changes, speculative improvements, or unnecessary defensive programming.
+- Apply consistent severity standards across iterations. Do not progressively escalate into increasingly obscure scenarios.
 
-Approval means the task is sufficiently correct and safe, not that the
-implementation is perfect."""
+**The goal is working, maintainable software, not theoretical perfection. Approve when the implementation is good enough for its intended use.**"""
 
 
 class ReviewError(Exception):
     """Raised when reviewer output or review configuration is unusable."""
+
+
+class ReviewFormatError(ReviewError):
+    """The final message is not one JSON object and may be reformatted once."""
 
 
 @dataclass(frozen=True)
@@ -188,7 +178,10 @@ def build_prompt(task, base_commit, commit, diff, validation_summary, policy) ->
         "Review policy:\n" + policy + "\n"
         "\n"
         "When you finish, reply with exactly one JSON object and nothing"
-        " else, using one of these forms:\n"
+        " else. Your final message is parsed by a machine: do not include"
+        " a test summary, explanation, introductory prose, or Markdown"
+        " before or after the JSON. Put explanations inside the findings."
+        " Use one of these forms:\n"
         '{"decision": "approved", "findings": []}\n'
         '{"decision": "approved", "findings": [{"severity": "minor",'
         ' "description": "..."}]}\n'
@@ -199,6 +192,20 @@ def build_prompt(task, base_commit, commit, diff, validation_summary, policy) ->
         " location. Use changes_requested only when at least one finding is"
         " critical or major; otherwise approve and list the remaining"
         " findings as minor or suggestion."
+    )
+
+
+def format_retry_prompt() -> str:
+    """Ask the same reviewer to fix formatting, not reconsider its review."""
+    return (
+        "Your final message was rejected because it was not one complete"
+        " JSON object. Re-emit the verdict from your review as exactly one"
+        " JSON object with decision and findings, and nothing else.\n"
+        "Preserve the decision and every finding, including severity,"
+        " description, scenario, impact, and location. Do not change the"
+        " review decision, omit or downgrade findings, or redo the review."
+        " Do not use tools or modify files. Do not include a test summary,"
+        " introductory prose, Markdown fences, or any text outside the JSON."
     )
 
 
@@ -319,7 +326,9 @@ def _verdict_object(text: str):
     try:
         payload = json.loads(stripped)
     except ValueError:
-        raise ReviewError("the reviewer output is not one complete JSON verdict")
+        raise ReviewFormatError(
+            "the reviewer output is not one complete JSON verdict"
+        )
     if not isinstance(payload, dict):
-        raise ReviewError("the reviewer verdict is not a JSON object")
+        raise ReviewFormatError("the reviewer verdict is not a JSON object")
     return payload

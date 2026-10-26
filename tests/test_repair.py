@@ -17,6 +17,7 @@ import subprocess
 import sys
 import time
 import unittest
+from pathlib import Path
 
 from test_verification import VerificationTestCase
 
@@ -328,6 +329,114 @@ class ValidationRepairTests(RepairTestCase):
 class InfrastructureRetryTests(RepairTestCase):
     """Reviewer infrastructure failures never spend an implementation attempt."""
 
+    def test_prose_before_a_verdict_is_reformatted_without_losing_findings(self):
+        verdict = self.major(
+            "Response cleanup remains cancellable.",
+            scenario="Cancel stream.aclose() while response cleanup suspends.",
+            impact="The upstream connection remains open.",
+            location="src/rag/providers/llm_providers.py:189-209",
+        )
+        self.set_reviewer(
+            "All 35 provider tests pass. Cleanup still has a cancellation gap.\n\n"
+            + json.dumps(verdict),
+            verdict,
+            self.approved(),
+        )
+        self.set_validation("echo check")
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(len(self.worker_calls()), 2)
+        self.assertEqual(len(self.reviewer_calls()), 3)
+        self.assertEqual(len(self.validation_logs()), 2)
+        self.assertEqual(self.attempt_record()["attempts"], 2)
+
+        original, correction, _ = self.reviewer_calls()
+        self.assertEqual(original["cwd"], correction["cwd"])
+        self.assertEqual(
+            original["argv"][original["argv"].index("--session") + 1],
+            correction["argv"][correction["argv"].index("--session") + 1],
+        )
+        prompt = correction["argv"][-1]
+        self.assertIn("Preserve the decision and every finding", prompt)
+        self.assertIn("Do not use tools", prompt)
+        self.assertIn("exactly one JSON object", prompt)
+        self.assertIn("Reviewer output format invalid; retrying once", result.stdout)
+
+        # Only the implementation rejection triggers a worker repair, and
+        # every part of the blocking finding survives in the worker feedback.
+        feedback = self.worker_calls()[1]["argv"][-1]
+        for field, value in verdict["findings"][0].items():
+            self.assertIn(value, feedback, field)
+        log = self.review_logs()[0].read_text(encoding="utf-8")
+        self.assertIn("format_retry: 1 of 1", log)
+        self.assertIn("decision: changes_requested", log)
+        self.assertNotIn("result: FAILED", log)
+        self.assertFalse(Path(correction["cwd"]).exists())
+
+    def test_format_retry_can_approve_without_another_worker_attempt(self):
+        self.set_reviewer(
+            'Here is my verdict: {"decision":"approved","findings":[]}',
+            self.approved(),
+        )
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(len(self.worker_calls()), 1)
+        self.assertEqual(len(self.reviewer_calls()), 2)
+        self.assertEqual(self.attempt_record()["attempts"], 1)
+        self.assertEqual(self.latest_review()["findings"], [])
+
+    def test_format_retry_is_bounded(self):
+        self.env["ACTL_FAKE_REVIEW_JSON"] = "not a JSON verdict"
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertEqual(len(self.reviewer_calls()), 2)
+        self.assertEqual(len(self.worker_calls()), 1)
+        self.assertEqual(self.attempt_record()["attempts"], 1)
+        self.assertEqual(self.attempt_record()["feedback"], "")
+        self.assertIsNone(self.latest_review())
+        self.assertIn("format_retry: 1 of 1", self.review_log())
+        self.assertIn("result: FAILED", self.review_log())
+
+    def test_empty_format_retry_does_not_reuse_the_previous_response(self):
+        self.set_reviewer("not a JSON verdict", "")
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertIn("produced no text output", result.stderr)
+        self.assertEqual(len(self.reviewer_calls()), 2)
+        self.assertIsNone(self.latest_review())
+
+    def test_semantically_invalid_verdict_is_not_reformatted(self):
+        verdict = self.major()
+        verdict["decision"] = "approved"
+        self.set_reviewer(verdict, self.approved())
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("approved verdict contains", result.stderr)
+        self.assertEqual(len(self.reviewer_calls()), 1)
+        self.assertIsNone(self.latest_review())
+
+    def test_semantically_invalid_correction_is_refused(self):
+        verdict = self.major()
+        verdict["decision"] = "approved"
+        self.set_reviewer("not a JSON verdict", verdict, self.approved())
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertIn("approved verdict contains", result.stderr)
+        self.assertEqual(len(self.reviewer_calls()), 2)
+        self.assertEqual(len(self.worker_calls()), 1)
+        self.assertIsNone(self.latest_review())
+
     def test_reviewer_error_retry_does_not_spend_a_worker_attempt(self):
         self.env["ACTL_FAKE_REVIEW_JSON"] = "not a JSON verdict"
         self.make_task()
@@ -346,7 +455,7 @@ class InfrastructureRetryTests(RepairTestCase):
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertEqual(self.task_status(), "STAGED")
         self.assertEqual(len(self.worker_calls()), 1)
-        self.assertEqual(len(self.reviewer_calls()), 2)
+        self.assertEqual(len(self.reviewer_calls()), 3)
         self.assertIn("Re-verifying task t1", second.stdout)
         self.assertNotIn("Worker attempt 2/3", second.stdout)
 
@@ -370,6 +479,7 @@ class InfrastructureRetryTests(RepairTestCase):
         self.set_reviewer(
             self.major("First finding."),
             "not a JSON verdict",
+            "still not a JSON verdict",
             self.major("Second finding."),
             self.approved(),
         )

@@ -1969,7 +1969,8 @@ def _run_reviewer(
     The worktree is discarded on every path. The returned verdict has already
     been validated; malformed output raises :class:`review.ReviewError`. The
     reviewer always evaluates the complete cumulative task diff, never just
-    the latest repair commit.
+    the latest repair commit. A format failure gets one correction turn in
+    the same session without consuming a worker attempt.
     """
     base_commit = execution.branch_base(actl_dir, task.id)
     if base_commit is None:
@@ -2004,41 +2005,57 @@ def _run_reviewer(
             agent=opencode.REVIEWER_AGENT,
         )
         log.write("session: " + session.id + "\n")
-        # Flush before the reviewer starts writing to the same file through
-        # its inherited stdout descriptor, so the header stays on top.
-        log.flush()
-        try:
-            exit_code = opencode.run_headless(
-                binary, review_path, session.id, reviewer_model, prompt, log,
-                pass_fds=(lock_fd,), agent=opencode.REVIEWER_AGENT,
-                output_format="json",
-            )
-        except (opencode.OpenCodeError, OSError) as exc:
-            _log_review_failure(log, str(exc))
-            raise
-        log.write("---\nfinished_at: " + _utc_now() + "\n")
-        log.write("exit_code: " + str(exit_code) + "\n")
-        log.flush()
-        if exit_code != 0:
-            _log_review_failure(
-                log, "the reviewer exited with status " + str(exit_code)
-            )
-            raise review.ReviewError(
-                "the reviewer exited with status " + str(exit_code)
-            )
-        try:
-            _require_reviewer_checkout(review_path, commit)
-        except (review.ReviewError, execution.ExecutionError) as exc:
-            _log_review_failure(log, str(exc))
-            raise
-        log.write("checkout: " + commit + " (unchanged)\n")
-        log.flush()
-        output = Path(log.name).read_text(encoding="utf-8", errors="replace")
-        try:
-            verdict = review.verdict_from_output(output)
-        except review.ReviewError as exc:
-            _log_review_failure(log, str(exc))
-            raise
+        for format_attempt in range(2):
+            # Flush before the child writes through the inherited descriptor.
+            # Parse only this turn, never a verdict from an earlier turn if
+            # the correction produces no text (or reuses message IDs).
+            log.flush()
+            output_start = log.tell()
+            try:
+                exit_code = opencode.run_headless(
+                    binary, review_path, session.id, reviewer_model, prompt, log,
+                    pass_fds=(lock_fd,), agent=opencode.REVIEWER_AGENT,
+                    output_format="json",
+                )
+            except (opencode.OpenCodeError, OSError) as exc:
+                _log_review_failure(log, str(exc))
+                raise
+            log.write("---\nfinished_at: " + _utc_now() + "\n")
+            log.write("exit_code: " + str(exit_code) + "\n")
+            log.flush()
+            if exit_code != 0:
+                _log_review_failure(
+                    log, "the reviewer exited with status " + str(exit_code)
+                )
+                raise review.ReviewError(
+                    "the reviewer exited with status " + str(exit_code)
+                )
+            try:
+                _require_reviewer_checkout(review_path, commit)
+                _require_commit_intact(root, worktree, commit, "the review")
+            except (review.ReviewError, execution.ExecutionError) as exc:
+                _log_review_failure(log, str(exc))
+                raise
+            log.write("checkout: " + commit + " (unchanged)\n")
+            log.flush()
+            with open(log.name, "rb") as transcript:
+                transcript.seek(output_start)
+                output = transcript.read().decode("utf-8", errors="replace")
+            try:
+                verdict = review.verdict_from_output(output)
+            except review.ReviewFormatError as exc:
+                if format_attempt == 0:
+                    log.write("format_error: " + str(exc) + "\n")
+                    log.write("format_retry: 1 of 1\n")
+                    _event("Reviewer output format invalid; retrying once")
+                    prompt = review.format_retry_prompt()
+                    continue
+                _log_review_failure(log, str(exc))
+                raise
+            except review.ReviewError as exc:
+                _log_review_failure(log, str(exc))
+                raise
+            break
         log.write("decision: " + verdict.decision + "\n")
         log.write(
             "findings: "

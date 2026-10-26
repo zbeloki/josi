@@ -662,16 +662,28 @@ The reviewer must answer with one JSON verdict:
 
 The verdict is parsed strictly. The reviewer's final message must be exactly
 one complete JSON object - a single surrounding Markdown code fence is
-tolerated, but prose, several objects, and truncated JSON are refused.
-Malformed output, unknown decisions or severities, an approval that carries a
-critical or major finding, and a `changes_requested` verdict without a
-blocking finding are all invalid: the task becomes `FAILED` and nothing is
-recorded as an approval. Every critical or major finding must include a
-scenario, impact, and location. Valid verdicts are stored in `.actl/tasks.db`
-(the `reviews` table) with the commit they refer to, and Stage 6 feeds the
-critical and major findings back to the next worker attempt. Reviewer
-execution and format failures are recorded in the review log with a reason;
-they fail the task and never trigger a repair worker.
+tolerated, but prose, several objects, and truncated JSON are refused. When
+a nonempty final message is not one JSON object, actl asks the same reviewer
+once to reformat its existing verdict, preserving the decision and every
+finding.
+
+This formatting-only correction uses the same session and isolated checkout,
+does not repeat validation or consume a worker attempt, and is recorded in
+the same review log. Only the correction turn's output is parsed, with the
+same strict validation and checkout/commit integrity checks.
+
+Output that remains malformed, unknown decisions or severities, an approval
+that carries a critical or major finding, and a `changes_requested` verdict
+without a blocking finding are all invalid: the task becomes `FAILED` and
+nothing is recorded as an approval. Every critical or major finding must
+include a scenario, impact, and location. Valid verdicts are stored in
+`.actl/tasks.db` (the `reviews` table) with the commit they refer to, and
+Stage 6 feeds the critical and major findings back to the next worker
+attempt. Reviewer execution failures, invalid verdicts, and format failures
+that persist after the one correction are recorded in the review log with a
+reason; they fail the task and never trigger a repair worker. Semantic
+errors (such as an approval with a blocking finding) are not retried or
+automatically repaired.
 
 The review policy is the built-in risk-based policy plus, when present, the
 project's `REVIEW_POLICY.md`:

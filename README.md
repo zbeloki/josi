@@ -541,16 +541,97 @@ with a header (task, attempt, model, branch, commit) and ends with the result
 (exit codes, status, verdict, failure reason), and an earlier attempt's logs
 are never overwritten. The logs are written continuously while the stage
 runs, and each path is printed when the stage starts as well as in the final
-summary; use `tail -f` to watch a run. Each worker, reviewer, and
-review-format-retry invocation also records its token counts and available
-cost in that invocation's log, never on the terminal, and stores them in
-`.actl/tasks.db` with their task and run attribution so a task's usage
-accumulates across attempts and CLI invocations. `actl task show` then
-reports the task's accumulated `cost_total`, `cost_input`, and `cost_output`
-across every attempt and retry, while `actl run show` reports only the usage
-attributed to that run; a `cost_status` of `complete`, `incomplete`, or
-`unavailable` makes a partially known or missing amount visible instead of
-presenting it as zero, and per-invocation token counts stay in the logs.
+summary; use `tail -f` to watch a run.
+
+### Usage and cost reporting
+
+Every worker attempt, review, and review-format retry reads its usage from
+OpenCode's session metadata (`GET /api/session/<id>`), which reports the
+session's cumulative `cost` and token counts. For a reused session, actl
+subtracts the cumulative totals read before the turn from the totals read
+after it; for a fresh session, the reported totals are that turn's usage.
+Each invocation's token counts (input, output, reasoning, cache read, and
+cache write) and available cost data are written to that invocation's log and
+stored in `.actl/tasks.db` with its task id, run id, stage, and attempt.
+
+The `cost_total` is OpenCode's reported cost when OpenCode provides one. When
+the model's pricing metadata is also available (`GET /api/model`), actl
+derives `cost_input` and `cost_output` from the token counts and those
+prices, including cache reads and writes in the input cost and reasoning
+tokens in the output cost. A reported total is kept even when pricing is
+missing, but then the input/output split remains unavailable. If OpenCode
+reports no total and both input and output costs can be derived, the total is
+their sum. If neither is available, the amount is recorded as `unavailable`,
+never as zero.
+
+`actl task show` reports totals that accumulate over every usage record for
+the task: all worker attempts, reviews, review-format retries, repairs, and
+separate CLI invocations. `actl run show` reports only records attributed to
+that run, so usage from the same task in an earlier or later run is not
+included. The `cost_status` line summarizes the included records:
+
+- `complete` - every included record has a total, input, and output cost.
+- `incomplete` - some amounts are known but at least one is missing.
+- `unavailable` - no amount is known, including when no usage was recorded.
+
+Known amounts are still summed when the status is `incomplete`; missing
+amounts stay `unavailable` instead of being presented as a confirmed zero.
+Per-invocation token counts are recorded only in the logs and are not printed
+by the `show` commands. For example, one invocation's log ends with:
+
+```text
+usage: input=3000 output=300 reasoning=0 cache_read=0 cache_write=0
+cost: total=0.030000 input=0.009000 output=0.004500 source=reported complete=yes
+usage_status: available
+```
+
+After two worker attempts and two reviews, `actl task show t1` prints the
+accumulated costs:
+
+```text
+id: t1
+title: Add the feature
+status: STAGED
+created_at: 2026-10-26T16:43:32.849+00:00
+updated_at: 2026-10-26T16:43:33.317+00:00
+depends_on: (none)
+description:
+Do the thing.
+cost_total: 0.100000
+cost_input: 0.018000
+cost_output: 0.007200
+cost_status: complete
+```
+
+`actl run show r1` prints only the usage attributed to run r1, before its
+associated tasks:
+
+```text
+id: r1
+status: COMPLETE
+branch: actl/run/r1
+base_branch: main
+start_commit: 6ca6366258d1036ef8d74b664be2004a57b257ec
+final_commit: 9f0ec482f951b4899d14888d9deda64eb43b4b1f
+created_at: 2026-10-26T16:43:32.898+00:00
+updated_at: 2026-10-26T16:43:33.323+00:00
+cost_total: 0.100000
+cost_input: 0.018000
+cost_output: 0.007200
+cost_status: complete
+tasks:
+t1  STAGED  Add the feature
+```
+
+If OpenCode reports a total without pricing metadata, the show commands keep
+that total but mark the split incomplete:
+
+```text
+cost_total: 0.040000
+cost_input: unavailable
+cost_output: unavailable
+cost_status: incomplete
+```
 
 Only one execution may run per project. The lock is an exclusive, nonblocking
 `fcntl.flock` on `.actl/execution.lock`, and the locked file descriptor is

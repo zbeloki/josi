@@ -96,6 +96,13 @@ PLANNER_TITLE = "actl planner"
 PLANNER_AGENT_NAME = "actl-planner"
 PLANNER_AGENT_PATH = Path(".opencode") / "agents" / (PLANNER_AGENT_NAME + ".md")
 
+# Model settings written by ``actl init`` when the matching argument is
+# omitted and the project does not configure one yet. Explicit arguments
+# always win, and a re-init preserves values already stored.
+DEFAULT_WORKER_MODEL = "openrouter/deepseek/deepseek-v4.1-flash"
+DEFAULT_REVIEWER_MODEL = "openrouter/openai/gpt-6-luna#high"
+DEFAULT_ESCALATION_WORKER_MODEL = "openrouter/z-ai/glm-5.3-flash#high"
+
 # OpenCode loads this file as a custom agent: the frontmatter declares a
 # primary agent that can read and explore the project and manage its tasks,
 # but never edits it. OpenCode appends these rules after its own broad
@@ -623,6 +630,18 @@ def cmd_init(args) -> int:
             )
         except ProjectError as exc:
             return _fail(str(exc))
+    # Each model setting falls back to the stored value on a re-init and to
+    # the built-in default otherwise. An explicit argument always wins.
+    requested_models = {
+        "worker_model": worker_model,
+        "reviewer_model": reviewer_model,
+        "escalation_worker_model": escalation_worker_model,
+    }
+    default_models = {
+        "worker_model": DEFAULT_WORKER_MODEL,
+        "reviewer_model": DEFAULT_REVIEWER_MODEL,
+        "escalation_worker_model": DEFAULT_ESCALATION_WORKER_MODEL,
+    }
 
     actl_dir = root / PROJECT_DIR
     metadata_path = actl_dir / PROJECT_METADATA
@@ -635,18 +654,14 @@ def cmd_init(args) -> int:
                 "remove '" + str(actl_dir) + "' and re-run 'actl init'"
             )
         updates = {}
-        if worker_model is not None and metadata.get("worker_model") != worker_model:
-            updates["worker_model"] = worker_model
-        if (
-            reviewer_model is not None
-            and metadata.get("reviewer_model") != reviewer_model
-        ):
-            updates["reviewer_model"] = reviewer_model
-        if (
-            escalation_worker_model is not None
-            and metadata.get("escalation_worker_model") != escalation_worker_model
-        ):
-            updates["escalation_worker_model"] = escalation_worker_model
+        for key, default in default_models.items():
+            value = requested_models[key]
+            if value is None:
+                value = metadata.get(key)
+                if value is None:
+                    value = default
+            if metadata.get(key) != value:
+                updates[key] = value
         stored_base = metadata.get("base_branch")
         if args.base is not None:
             # An explicit --base is the user's decision: it may replace an
@@ -695,13 +710,22 @@ def cmd_init(args) -> int:
             "name": root.name,
             "created_at": _utc_now(),
             "base_branch": base_branch,
+            "worker_model": (
+                worker_model
+                if worker_model is not None
+                else DEFAULT_WORKER_MODEL
+            ),
+            "reviewer_model": (
+                reviewer_model
+                if reviewer_model is not None
+                else DEFAULT_REVIEWER_MODEL
+            ),
+            "escalation_worker_model": (
+                escalation_worker_model
+                if escalation_worker_model is not None
+                else DEFAULT_ESCALATION_WORKER_MODEL
+            ),
         }
-        if worker_model is not None:
-            metadata["worker_model"] = worker_model
-        if reviewer_model is not None:
-            metadata["reviewer_model"] = reviewer_model
-        if escalation_worker_model is not None:
-            metadata["escalation_worker_model"] = escalation_worker_model
         try:
             actl_dir.mkdir(parents=True, exist_ok=True)
             _write_metadata(metadata_path, metadata)
@@ -711,6 +735,9 @@ def cmd_init(args) -> int:
             )
         print("Initialized actl in " + str(root))
         print("Base branch: " + base_branch)
+        print("Worker model: " + metadata["worker_model"])
+        print("Reviewer model: " + metadata["reviewer_model"])
+        print("Escalation worker model: " + metadata["escalation_worker_model"])
 
     # Creating the task database here (and again, idempotently, on every task
     # command) is safe: the schema uses CREATE TABLE IF NOT EXISTS, so
@@ -2856,18 +2883,20 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--worker-model", metavar="MODEL",
         help="set the project's worker model (provider/model[#variant]);"
-             " required by 'actl task run' whenever the worker runs",
+             " default openrouter/deepseek/deepseek-v4.1-flash; required by"
+             " 'actl task run' whenever the worker runs",
     )
     init.add_argument(
         "--reviewer-model", metavar="MODEL",
         help="set the project's reviewer model (provider/model[#variant]);"
-             " required by 'actl task run'",
+             " default openrouter/openai/gpt-6-luna#high; required by"
+             " 'actl task run'",
     )
     init.add_argument(
         "--escalation-worker-model", metavar="MODEL",
         help="set the model for the third and final worker attempt of a"
-             " repair cycle (provider/model[#variant]); required by"
-             " 'actl task run'",
+             " repair cycle (provider/model[#variant]); default"
+             " openrouter/z-ai/glm-5.3-flash#high; required by 'actl task run'",
     )
     init.add_argument(
         "--base", metavar="BRANCH",

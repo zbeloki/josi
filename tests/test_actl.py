@@ -494,6 +494,102 @@ class InitTests(ActlTestCase):
         gitignore = (self.repo / ".gitignore").read_text(encoding="utf-8")
         self.assertIn(".actl/", gitignore.splitlines())
 
+    def test_init_stores_default_models(self):
+        self.init_git()
+        result = self.run_actl("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
+        self.assertEqual(
+            metadata["worker_model"], "openrouter/deepseek/deepseek-v4.1-flash"
+        )
+        self.assertEqual(
+            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#high"
+        )
+        self.assertEqual(
+            metadata["escalation_worker_model"], "openrouter/z-ai/glm-5.3-flash#high"
+        )
+        # The defaults are reported so the user knows what was configured.
+        self.assertIn(
+            "Worker model: openrouter/deepseek/deepseek-v4.1-flash",
+            result.stdout,
+        )
+        self.assertIn(
+            "Reviewer model: openrouter/openai/gpt-6-luna#high", result.stdout
+        )
+        self.assertIn(
+            "Escalation worker model: openrouter/z-ai/glm-5.3-flash#high",
+            result.stdout,
+        )
+
+    def test_init_explicit_model_overrides_only_its_default(self):
+        self.init_git()
+        result = self.run_actl("init", "--worker-model", "provider/custom")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
+        self.assertEqual(metadata["worker_model"], "provider/custom")
+        self.assertEqual(
+            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#high"
+        )
+        self.assertEqual(
+            metadata["escalation_worker_model"], "openrouter/z-ai/glm-5.3-flash#high"
+        )
+
+    def test_reinit_preserves_models_and_fills_missing_ones(self):
+        self.init_git()
+        self.assertEqual(
+            self.run_actl(
+                "init",
+                "--worker-model", "provider/worker",
+                "--reviewer-model", "provider/reviewer",
+                "--escalation-worker-model", "provider/escalation",
+            ).returncode,
+            0,
+        )
+        # A plain re-init preserves every stored value.
+        before = self.metadata_path().read_bytes()
+        result = self.run_actl("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("already initialized", result.stdout)
+        self.assertEqual(self.metadata_path().read_bytes(), before)
+
+        # Removing one model makes a plain re-init fill only that field.
+        metadata = json.loads(before.decode("utf-8"))
+        del metadata["reviewer_model"]
+        self.metadata_path().write_text(
+            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+        )
+        result = self.run_actl("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "Updated the reviewer model to openrouter/openai/gpt-6-luna#high",
+            result.stdout,
+        )
+        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
+        self.assertEqual(metadata["worker_model"], "provider/worker")
+        self.assertEqual(
+            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#high"
+        )
+        self.assertEqual(
+            metadata["escalation_worker_model"], "provider/escalation"
+        )
+
+    def test_reinit_explicit_model_updates_only_that_role(self):
+        self.initialize()
+        result = self.run_actl("init", "--reviewer-model", "provider/other")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Updated the reviewer model to provider/other", result.stdout)
+
+        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
+        self.assertEqual(metadata["reviewer_model"], "provider/other")
+        self.assertEqual(
+            metadata["worker_model"], "openrouter/deepseek/deepseek-v4.1-flash"
+        )
+        self.assertEqual(
+            metadata["escalation_worker_model"], "openrouter/z-ai/glm-5.3-flash#high"
+        )
+
     def test_init_outside_git_repository(self):
         result = self.run_actl("init")
         self.assertNotEqual(result.returncode, 0)

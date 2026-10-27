@@ -24,7 +24,8 @@
   worktree with the project's test-writer model (see :mod:`actl.testgen`):
   it writes and commits the task's tests, or explicitly decides that the
   task needs none. Its outcome is recorded in ``.actl/testgen/tN`` so a
-  retry never repeats a completed stage.
+  retry never repeats a completed stage, and the worker prompt instructs
+  the worker to keep the generated tests unchanged.
 * The reviewer gets a temporary detached worktree under ``.actl/review/``
   (see ``add_review_worktree``), so its checkout can never touch the task
   worktree.
@@ -750,6 +751,10 @@ def worker_prompt(
     ``feedback`` that explains why the previous attempt was rejected: the
     failed validation command and its output, or the blocking reviewer
     findings. The branch is never reset or discarded.
+
+    The instructions always tell the worker to keep the tests the
+    test-generation stage produced: the worker implements the task around
+    the generated tests and never modifies, weakens, or deletes them.
     """
     description = task.description.strip() or "(none)"
     lines = [
@@ -781,6 +786,9 @@ def worker_prompt(
         "- Inspect the relevant project files and follow the existing style.",
         "- Modify the code as needed to implement the task, without touching",
         "  unrelated functionality.",
+        "- Do not modify the tests that were generated for this task before",
+        "  your first attempt: keep the generated tests as they are and",
+        "  implement the task so they pass.",
         "- Run the relevant tests or checks to verify your work.",
         "- Commit your changes on the current branch with Git. When you finish,",
         "  the worktree must be clean: no uncommitted or untracked files",

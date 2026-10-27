@@ -7,12 +7,21 @@ default; it changes nothing) or commits test changes; the stage has its own
 timestamped log, records its usage under the distinct ``test_writer`` stage,
 and treats execution errors, invalid outcomes, uncommitted changes, and a
 dirty worktree as failures instead of starting the worker.
+
+These tests also cover the stage's integration into task execution: a
+completed stage is never repeated - not for a repair attempt and not when an
+interrupted execution is resumed - a failed stage consumes no worker attempt,
+the worker prompt tells the worker to keep the generated tests unchanged, the
+test-writer commit stays part of the reviewed changes, and tasks that need no
+worker (approved or verification-only) never launch the stage.
 """
 
 from __future__ import annotations
 
 import json
 import shutil
+import subprocess
+import sys
 import unittest
 
 from test_verification import VerificationTestCase
@@ -303,6 +312,186 @@ class TestGenerationStageTests(TestGenTestCase):
             [self.outcome_record(1), self.outcome_record(2)],
             [{"decision": "no_tests_needed"}, {"decision": "no_tests_needed"}],
         )
+
+    def test_repair_attempts_do_not_rerun_the_stage(self):
+        # A failing validation command drives the task through all three
+        # worker attempts in the same worktree; the completed stage is not
+        # repeated for any repair attempt.
+        self.set_validation("exit 3")
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.task_status(), "NEEDS_HUMAN")
+        self.assertEqual(len(self.worker_calls()), 3)
+        self.assertEqual(
+            len(self.generation_calls()), 1, "the stage must not repeat"
+        )
+        self.assertEqual(
+            self.outcome_record(), {"decision": "no_tests_needed"}
+        )
+
+    def test_resuming_a_completed_stage_does_not_rerun_it(self):
+        # The execution is interrupted after the stage completed but before
+        # the first worker attempt finished: resuming the task starts the
+        # worker without repeating the completed stage.
+        self.make_task()
+        marker = self.base / "worker.pid"
+        release = self.base / "worker.release"
+        self.addCleanup(self.kill_pid, marker)
+        self.env["ACTL_FAKE_RUN_MARKER"] = str(marker)
+        self.env["ACTL_FAKE_RUN_WAIT_FOR"] = str(release)
+
+        parent = subprocess.Popen(
+            [sys.executable, "-m", "actl", "task", "run", "t1"],
+            cwd=str(self.repo), env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            self.assertTrue(
+                self.wait_for_path(marker), "the worker never started"
+            )
+        finally:
+            parent.kill()
+            parent.wait(timeout=30)
+            parent.stdout.close()
+            parent.stderr.close()
+        # The waiting worker holds the inherited lock; kill it too.
+        self.kill_pid(marker)
+        self.assertTrue(
+            self.wait_for_lock_release(),
+            "the interrupted worker kept the lock",
+        )
+
+        # The stage had completed before the worker was interrupted.
+        self.assertEqual(
+            self.outcome_record(), {"decision": "no_tests_needed"}
+        )
+        self.assertEqual(len(self.generation_calls()), 1)
+        self.assertEqual(self.task_status(), "RUNNING")
+        workers = len(self.worker_calls())
+
+        del self.env["ACTL_FAKE_RUN_MARKER"]
+        del self.env["ACTL_FAKE_RUN_WAIT_FOR"]
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("left RUNNING", result.stdout)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(
+            len(self.generation_calls()), 1, "the stage must not repeat"
+        )
+        self.assertEqual(len(self.worker_calls()), workers + 1)
+
+    def test_failed_stage_leaves_the_attempt_budget_unused(self):
+        # A failed stage stops before the worker: no worker attempt is
+        # consumed, and the retry starts the worker at attempt 1 of 3.
+        self.env["ACTL_FAKE_TESTS_EXIT"] = "3"
+        self.make_task()
+        self.assertNotEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertEqual(self.worker_calls(), [])
+        self.assertFalse(
+            (self.repo / ".actl" / "attempts" / "t1").exists(),
+            "a failed test-generation stage must not consume an attempt",
+        )
+
+        del self.env["ACTL_FAKE_TESTS_EXIT"]
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertIn("Worker attempt 1/3", result.stdout)
+        self.assertEqual(len(self.worker_calls()), 1)
+        record = json.loads(
+            (self.repo / ".actl" / "attempts" / "t1").read_text(
+                encoding="utf-8"
+            )
+        )
+        self.assertEqual(record["attempts"], 1)
+
+    def test_worker_prompt_keeps_the_generated_tests(self):
+        # The worker is explicitly instructed not to modify the tests the
+        # stage generated: it implements the task around them.
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        prompt = self.worker_prompt()
+        self.assertIn(
+            "Do not modify the tests that were generated for this task",
+            prompt,
+        )
+        self.assertIn("keep the generated tests as they are", prompt)
+
+    def test_generated_tests_stay_part_of_the_reviewed_changes(self):
+        # The test-writer commit stays on the task branch: validation can
+        # run the generated tests in the task worktree, and the reviewer
+        # evaluates the cumulative diff that includes them.
+        self.env["ACTL_FAKE_TESTS"] = "commit"
+        self.env["ACTL_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
+        self.set_validation("cat test-output.txt")
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertIn("Validation passed", result.stdout)
+
+        subjects = self.git(
+            "log", "--format=%s", "actl/t1"
+        ).stdout.splitlines()
+        self.assertEqual(subjects[0], "worker: implement task")
+        self.assertEqual(subjects[1], "test writer: add tests")
+
+        prompt = self.reviewer_prompt()
+        self.assertIn("test-output.txt", prompt)
+        self.assertIn("test change", prompt)
+        self.assertIn(self.base_sha, prompt)
+
+    def test_approved_task_does_not_launch_generation(self):
+        # An APPROVED task needs no worker: the retry stages the recorded
+        # commit without any agent turn, the test writer included.
+        self.make_task()
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        generations = len(self.generation_calls())
+        workers = len(self.worker_calls())
+        reviewers = len(self.reviewer_calls())
+
+        # An interruption between the approval and the staging status.
+        self.set_task_status("APPROVED")
+        self.interrupt_run()
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(
+            len(self.generation_calls()), generations,
+            "an approved task must not launch test generation",
+        )
+        self.assertEqual(len(self.worker_calls()), workers)
+        self.assertEqual(len(self.reviewer_calls()), reviewers)
+
+    def test_verification_only_resume_does_not_launch_generation(self):
+        # An IMPLEMENTED task is re-validated and re-reviewed without a
+        # worker; no test-generation turn launches for it either.
+        self.make_task()
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        generations = len(self.generation_calls())
+        workers = len(self.worker_calls())
+
+        # An interrupted execution left the task at IMPLEMENTED, and a
+        # human fix was committed on its branch before the resume.
+        self.set_task_status("IMPLEMENTED")
+        self.interrupt_run()
+        worktree = self.worktree()
+        (worktree / "second.txt").write_text(
+            "second change\n", encoding="utf-8"
+        )
+        self.commit("second change", cwd=worktree)
+
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(
+            len(self.generation_calls()), generations,
+            "a verification-only resume must not launch test generation",
+        )
+        self.assertEqual(len(self.worker_calls()), workers)
 
 
 if __name__ == "__main__":

@@ -346,8 +346,9 @@ same command to finalize its status.
 ```
 
 The worker prompt contains the task title, its description, and the worker
-instructions: implement the task, run the relevant checks, commit the changes
-on the branch, keep the worktree clean, and never merge into the run branch.
+instructions: implement the task, keep the tests the test-generation stage
+wrote unchanged, run the relevant checks, commit the changes on the branch,
+keep the worktree clean, and never merge into the run branch.
 
 The test writer receives the task title and description in the task worktree
 with its own instructions: decide whether the task needs automated tests, and

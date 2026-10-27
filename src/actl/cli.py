@@ -27,7 +27,9 @@ Stage 4:
   worktree with the project's test-writer model: it writes and commits the
   task's tests, or explicitly decides that no tests are needed. Execution
   errors, invalid outcomes, uncommitted changes, and a dirty worktree fail
-  the stage instead of starting the worker.
+  the stage instead of starting the worker. The worker prompt instructs the
+  worker to keep the generated tests unchanged; the configured validation
+  commands still run after the worker and can execute those tests.
 
 Stage 5:
 

@@ -13,7 +13,10 @@ completed stage is never repeated - not for a repair attempt and not when an
 interrupted execution is resumed - a failed stage consumes no worker attempt,
 the worker prompt tells the worker to keep the generated tests unchanged, the
 test-writer commit stays part of the reviewed changes, and tasks that need no
-worker (approved or verification-only) never launch the stage.
+worker (approved or verification-only) never launch the stage. The stage
+never runs the generated tests itself: the project's configured validation
+commands exercise them after the worker, and validation stays optional when
+no commands are configured.
 """
 
 from __future__ import annotations
@@ -25,6 +28,8 @@ import sys
 import unittest
 
 from test_verification import VerificationTestCase
+
+from actl import tasks
 
 TESTS_WRITTEN = {"decision": "tests_written", "summary": "added tests"}
 
@@ -443,6 +448,91 @@ class TestGenerationStageTests(TestGenTestCase):
         self.assertIn("test-output.txt", prompt)
         self.assertIn("test change", prompt)
         self.assertIn(self.base_sha, prompt)
+
+    def test_project_validation_commands_exercise_the_generated_tests(self):
+        # The stage never runs the generated tests itself: after the worker,
+        # the project's own validation commands run in the task worktree,
+        # where they see the test writer's committed tests and the worker's
+        # implementation.
+        self.env["ACTL_FAKE_TESTS"] = "commit"
+        self.env["ACTL_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
+        self.set_validation("cat worker-output.txt test-output.txt")
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertIn("Validation passed", result.stdout)
+
+        # The command only succeeds because both files exist: the tests were
+        # committed before the worker ran, and validation ran after it.
+        log = self.validation_log()
+        self.assertIn("$ cat worker-output.txt test-output.txt", log)
+        self.assertIn("result: PASSED", log)
+        # The validated commit is the worker's commit on top of the
+        # test-writer commit, so the command ran on the generated tests.
+        self.assertIn("commit: " + self.rev("actl/t1"), log)
+        subjects = self.git(
+            "log", "--format=%s", "actl/t1"
+        ).stdout.splitlines()
+        self.assertEqual(subjects[0], "worker: implement task")
+        self.assertEqual(subjects[1], "test writer: add tests")
+
+    def test_validation_stays_optional_for_generated_tests(self):
+        # Without configured validation commands nothing runs the generated
+        # tests, and the run still succeeds: validation is the project's
+        # choice, never something actl adds.
+        self.env["ACTL_FAKE_TESTS"] = "commit"
+        self.env["ACTL_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertIn(
+            "Validation skipped (no validation commands configured)",
+            result.stdout,
+        )
+        self.assertEqual(self.validation_logs(), [])
+        # The generated tests are still committed on the task branch.
+        subjects = self.git(
+            "log", "--format=%s", "actl/t1"
+        ).stdout.splitlines()
+        self.assertEqual(subjects[1], "test writer: add tests")
+
+    def test_test_writer_usage_is_recorded_in_its_own_log(self):
+        # The test-generation stage's usage goes into its own -tests.log and
+        # is stored under the distinct test_writer stage, separate from the
+        # worker's and reviewer's records.
+        self.env["ACTL_FAKE_SESSION_USAGE"] = json.dumps({
+            "cost": 0.004,
+            "tokens": {"input": 400, "output": 40,
+                       "cache": {"read": 0, "write": 0}},
+        })
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("usage: input=", result.stdout)
+
+        logs = self.generation_logs()
+        self.assertEqual(len(logs), 1)
+        self.assertTrue(logs[0].name.endswith("-tests.log"))
+        self.assertTrue(self.log_paths(), "the worker keeps its own log")
+        log = logs[0].read_text(encoding="utf-8")
+        self.assertIn("usage: input=400 output=40", log)
+        self.assertIn("cost: total=0.004000", log)
+        self.assertIn("usage_status: available", log)
+
+        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        try:
+            rows = tasks.task_usage(conn, 1)
+        finally:
+            conn.close()
+        test_writer = [row for row in rows if row.stage == "test_writer"]
+        self.assertEqual(len(test_writer), 1)
+        self.assertEqual(test_writer[0].attempt, 1)
+        self.assertEqual(test_writer[0].model, "writer/model")
+        self.assertEqual(test_writer[0].input_tokens, 400)
+        self.assertEqual(test_writer[0].output_tokens, 40)
+        self.assertAlmostEqual(test_writer[0].cost_total, 0.004)
 
     def test_approved_task_does_not_launch_generation(self):
         # An APPROVED task needs no worker: the retry stages the recorded

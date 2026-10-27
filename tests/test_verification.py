@@ -640,10 +640,10 @@ class PolicyTests(VerificationTestCase):
             "MAJOR",
             "MINOR",
             "SUGGESTION",
-            "likelihood and impact",
-            "must never block approval",
+            "likelihood and severity",
+            "Reject only for CRITICAL or MAJOR findings",
             "speculative improvements",
-            "sufficiently correct and safe",
+            "sufficiently reliable",
         ):
             self.assertIn(phrase, prompt)
 
@@ -660,7 +660,7 @@ class PolicyTests(VerificationTestCase):
         self.assertIn("Require a security review for auth changes.", prompt)
         # The built-in rules stay in force next to the project policy.
         self.assertIn("CRITICAL", prompt)
-        self.assertIn("must never block approval", prompt)
+        self.assertIn("Reject only for CRITICAL or MAJOR findings", prompt)
 
     def test_without_a_project_policy_only_the_builtin_is_used(self):
         self.assertFalse((self.repo / "REVIEW_POLICY.md").exists())

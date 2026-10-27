@@ -62,7 +62,9 @@ actl run merge r1           # integrate a completed run into the base branch
   model, required by `actl task run` like the reviewer and escalation models.
   Re-running `actl init` preserves every model already stored and fills in a
   default only for a setting that is missing; passing an argument updates that
-  one setting and leaves the others untouched.
+  one setting and leaves the others untouched. It never configures validation
+  commands: validation is optional project configuration (see
+  "Validation and review").
   `actl init --base BRANCH` sets the base branch that task branches are
   created from; without it the branch is detected, and when the choice is
   ambiguous actl asks. It works in repositories without commits, where it
@@ -175,7 +177,11 @@ One run goes through these steps:
    worktree with the project's test-writer model and the built-in `build`
    agent. It decides whether the task needs automated tests: it either
    writes and commits them on the task branch, or explicitly decides that no
-   tests are needed and changes nothing. A completed stage is recorded (and
+   tests are needed and changes nothing. The generated tests stay committed
+   on the task branch: the worker implements the task around them, and the
+   project's configured validation commands exercise them after the worker -
+   actl never runs the tests itself, and validation stays optional when no
+   commands are configured. A completed stage is recorded (and
    never repeated on a retry); an execution error, an invalid outcome,
    uncommitted changes, or a dirty worktree fails the task instead of
    starting the worker.
@@ -521,6 +527,14 @@ stage that was interrupted before it completed (no recorded decision and no
 committed changes on the task branch) runs again on the next execution;
 committed changes on the task branch from any earlier work always skip it.
 
+The stage itself never runs the generated tests. After the worker succeeds,
+the project's configured validation commands run in the task worktree, where
+the test-writer commit is already part of the branch, so those commands
+exercise the generated tests like any other project check. Validation
+commands are project configuration and stay optional: with no commands
+configured, validation is skipped and the run continues with review, and
+`actl init` never adds pytest or any other validation command by default.
+
 All four settings are written by every `actl init`: a setting that is omitted
 keeps the value already stored, and a default is filled in only when no value
 is stored yet. Passing an argument overrides just that setting, so a single
@@ -785,6 +799,11 @@ Validation commands are project configuration in `.actl/project.json`:
   }
 }
 ```
+
+The list is entirely the project's choice: `actl init` never writes a
+`validation` section and never adds pytest or any other validation command by
+default. The tests the test-generation stage commits are exercised by these
+commands after the worker, not by the stage itself.
 
 - Commands run sequentially in the task worktree, exactly as written (a
   shell), and stop at the first non-zero exit.
@@ -1060,7 +1079,21 @@ worktree, a task branch moving during review, the built-in and project
 review policies, the configured models, the missing-reviewer-model preflight
 and its ordering before the execution lock, the recorded branch base, and
 validating/reviewing an `IMPLEMENTED` task without rerunning the worker or
-requiring a worker model. The Stage 6 tests cover the repair loop: approval on
+requiring a worker model. The test-generation suite (`test_testgen`) covers
+the stage that runs before the first worker attempt: the test writer's
+session, configured model, JSON output format, task worktree, and position
+before the worker; `no_tests_needed` succeeding without a commit and
+`tests_written` counting only together with committed test changes; invalid
+outcomes, execution errors, uncommitted or untracked changes, and empty
+commits failing the stage before the worker starts; the stage's own
+`-tests.log` and the separate `test_writer` usage records; the worker prompt
+keeping the generated tests unchanged; the completed stage persisting across
+retries, repair attempts, and resumes while a failed stage reruns without
+spending a worker attempt; and the test-writer model's `actl init` defaults,
+overrides, malformed values, and missing-model preflight before the execution
+lock. The generated tests are exercised by the project's own validation
+commands after the worker, and validation stays optional: `actl init` adds no
+validation command by default. The Stage 6 tests cover the repair loop: approval on
 the first attempt, minor findings without a retry, a second attempt with
 reviewer feedback, escalation on the third attempt, `NEEDS_HUMAN` after three
 rejections or three validation failures, validation feedback, cumulative

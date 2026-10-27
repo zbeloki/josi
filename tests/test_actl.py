@@ -494,6 +494,12 @@ class ActlTestCase(unittest.TestCase):
         for key in list(self.env):
             if key.startswith("ACTL_FAKE_") and key != "ACTL_FAKE_LOG":
                 del self.env[key]
+            # OpenCode configuration must not leak in from the invoking
+            # environment (for example a parent OpenCode session exporting
+            # OPENCODE_CONFIG_CONTENT): every launch under test must carry
+            # exactly the configuration actl builds itself.
+            elif key.startswith("OPENCODE_"):
+                del self.env[key]
 
     # -- helpers ---------------------------------------------------------
 
@@ -762,6 +768,29 @@ class InitTests(ActlTestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid test writer model", result.stderr)
         self.assertFalse((self.repo / ".actl").exists())
+
+    def test_init_adds_no_validation_commands(self):
+        # Validation commands are the project's own configuration: init
+        # records only the models and the base branch and never invents a
+        # validation command (no pytest, nothing else), so validation is
+        # skipped until the project adds commands itself.
+        self.init_git()
+        result = self.run_actl("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
+        self.assertEqual(
+            set(metadata),
+            {
+                "schema_version", "name", "created_at", "base_branch",
+                "worker_model", "reviewer_model", "escalation_worker_model",
+                "test_writer_model",
+            },
+        )
+
+        # A re-init never adds one either.
+        self.assertEqual(self.run_actl("init").returncode, 0)
+        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
+        self.assertNotIn("validation", metadata)
 
     def test_init_outside_git_repository(self):
         result = self.run_actl("init")

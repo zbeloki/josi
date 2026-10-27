@@ -622,6 +622,70 @@ class InitTests(ActlTestCase):
             metadata["escalation_worker_model"], "openrouter/deepseek/deepseek-v4.1-flash#high"
         )
 
+    def test_init_stores_default_test_writer_model(self):
+        self.init_git()
+        result = self.run_actl("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
+
+        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
+        self.assertEqual(
+            metadata["test_writer_model"],
+            "openrouter/deepseek/deepseek-v4.1-flash#low",
+        )
+        self.assertIn(
+            "Test writer model: openrouter/deepseek/deepseek-v4.1-flash#low",
+            result.stdout,
+        )
+
+    def test_reinit_fills_missing_test_writer_model(self):
+        self.initialize()
+        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
+        del metadata["test_writer_model"]
+        self.metadata_path().write_text(
+            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+        )
+        result = self.run_actl("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "Updated the test writer model to"
+            " openrouter/deepseek/deepseek-v4.1-flash#low",
+            result.stdout,
+        )
+        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
+        self.assertEqual(
+            metadata["test_writer_model"],
+            "openrouter/deepseek/deepseek-v4.1-flash#low",
+        )
+
+    def test_reinit_explicit_test_writer_model_updates_only_that_role(self):
+        self.initialize()
+        result = self.run_actl("init", "--test-writer-model", "provider/tests")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Updated the test writer model to provider/tests", result.stdout)
+
+        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
+        self.assertEqual(metadata["test_writer_model"], "provider/tests")
+        self.assertEqual(
+            metadata["worker_model"], "openrouter/z-ai/glm-5.3-flash"
+        )
+        self.assertEqual(
+            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#medium"
+        )
+
+    def test_init_invalid_test_writer_model_is_rejected(self):
+        self.init_git()
+        for value in ("", "model", "provider/", "/model", "two words/model"):
+            with self.subTest(value=value):
+                result = self.run_actl("init", "--test-writer-model", value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invalid test writer model", result.stderr)
+        # A leading dash would be read as an option; with the "=" form it
+        # reaches actl and is rejected as invalid.
+        result = self.run_actl("init", "--test-writer-model=-flag/model")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid test writer model", result.stderr)
+        self.assertFalse((self.repo / ".actl").exists())
+
     def test_init_outside_git_repository(self):
         result = self.run_actl("init")
         self.assertNotEqual(result.returncode, 0)

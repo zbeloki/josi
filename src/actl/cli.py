@@ -104,6 +104,7 @@ PLANNER_AGENT_PATH = Path(".opencode") / "agents" / (PLANNER_AGENT_NAME + ".md")
 DEFAULT_WORKER_MODEL = "openrouter/z-ai/glm-5.3-flash"
 DEFAULT_REVIEWER_MODEL = "openrouter/openai/gpt-6-luna#medium"
 DEFAULT_ESCALATION_WORKER_MODEL = "openrouter/deepseek/deepseek-v4.1-flash#high"
+DEFAULT_TEST_WRITER_MODEL = "openrouter/deepseek/deepseek-v4.1-flash#low"
 
 # OpenCode loads this file as a custom agent: the frontmatter declares a
 # primary agent that can read and explore the project and manage its tasks,
@@ -399,6 +400,10 @@ def _parse_reviewer_model(value: str) -> str:
     return _parse_model(value, "reviewer")
 
 
+def _parse_test_writer_model(value: str) -> str:
+    return _parse_model(value, "test writer")
+
+
 def _worker_model(metadata: dict) -> str:
     """Return the project's worker model or raise :class:`ProjectError`."""
     model = metadata.get("worker_model")
@@ -456,6 +461,27 @@ def _escalation_worker_model(metadata: dict) -> str:
             + repr(model)
         )
     return _parse_model(model, "escalation worker")
+
+
+def _test_writer_model(metadata: dict) -> str:
+    """Return the project's test-writer model or raise.
+
+    Required by ``actl task run`` from the start, exactly like the reviewer
+    and escalation models: without it the run refuses before any lock,
+    worktree, or task change.
+    """
+    model = metadata.get("test_writer_model")
+    if model is None:
+        raise ProjectError(
+            "no test writer model is configured for this project; run"
+            " 'actl init --test-writer-model provider/model' first"
+        )
+    if not isinstance(model, str):
+        raise ProjectError(
+            "project metadata has an invalid 'test_writer_model' value "
+            + repr(model)
+        )
+    return _parse_test_writer_model(model)
 
 
 def _validate_explicit_base_branch(root: Path, value: str) -> str:
@@ -632,17 +658,25 @@ def cmd_init(args) -> int:
             )
         except ProjectError as exc:
             return _fail(str(exc))
+    test_writer_model = None
+    if args.test_writer_model is not None:
+        try:
+            test_writer_model = _parse_test_writer_model(args.test_writer_model)
+        except ProjectError as exc:
+            return _fail(str(exc))
     # Each model setting falls back to the stored value on a re-init and to
     # the built-in default otherwise. An explicit argument always wins.
     requested_models = {
         "worker_model": worker_model,
         "reviewer_model": reviewer_model,
         "escalation_worker_model": escalation_worker_model,
+        "test_writer_model": test_writer_model,
     }
     default_models = {
         "worker_model": DEFAULT_WORKER_MODEL,
         "reviewer_model": DEFAULT_REVIEWER_MODEL,
         "escalation_worker_model": DEFAULT_ESCALATION_WORKER_MODEL,
+        "test_writer_model": DEFAULT_TEST_WRITER_MODEL,
     }
 
     actl_dir = root / PROJECT_DIR
@@ -698,6 +732,11 @@ def cmd_init(args) -> int:
                     "Updated the escalation worker model to "
                     + updates["escalation_worker_model"]
                 )
+            if "test_writer_model" in updates:
+                print(
+                    "Updated the test writer model to "
+                    + updates["test_writer_model"]
+                )
             if "base_branch" in updates:
                 print("Updated the base branch to " + updates["base_branch"])
         else:
@@ -727,6 +766,11 @@ def cmd_init(args) -> int:
                 if escalation_worker_model is not None
                 else DEFAULT_ESCALATION_WORKER_MODEL
             ),
+            "test_writer_model": (
+                test_writer_model
+                if test_writer_model is not None
+                else DEFAULT_TEST_WRITER_MODEL
+            ),
         }
         try:
             actl_dir.mkdir(parents=True, exist_ok=True)
@@ -740,6 +784,7 @@ def cmd_init(args) -> int:
         print("Worker model: " + metadata["worker_model"])
         print("Reviewer model: " + metadata["reviewer_model"])
         print("Escalation worker model: " + metadata["escalation_worker_model"])
+        print("Test writer model: " + metadata["test_writer_model"])
 
     # Creating the task database here (and again, idempotently, on every task
     # command) is safe: the schema uses CREATE TABLE IF NOT EXISTS, so
@@ -1184,6 +1229,10 @@ def cmd_task_run(args) -> int:
         metadata = load_project_metadata(root)
         reviewer_model = _reviewer_model(metadata)
         escalation_worker_model = _escalation_worker_model(metadata)
+        # The test-writer model is required like the reviewer and escalation
+        # models: a missing or malformed value refuses the run before the
+        # lock, the worktrees, or any OpenCode launch.
+        _test_writer_model(metadata)
         validation_commands = validation.commands_from_metadata(metadata)
         base_branch = _run_base_branch(root, metadata)
         binary = opencode.find_binary()
@@ -3006,6 +3055,12 @@ def build_parser() -> argparse.ArgumentParser:
              " repair cycle (provider/model[#variant]); default"
              " openrouter/deepseek/deepseek-v4.1-flash#high; required by"
              " 'actl task run'",
+    )
+    init.add_argument(
+        "--test-writer-model", metavar="MODEL",
+        help="set the project's test-writer model (provider/model[#variant]);"
+             " default openrouter/deepseek/deepseek-v4.1-flash#low; required"
+             " by 'actl task run'",
     )
     init.add_argument(
         "--base", metavar="BRANCH",

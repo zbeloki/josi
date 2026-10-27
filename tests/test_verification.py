@@ -62,6 +62,11 @@ class VerificationTestCase(TaskRunTestCase):
         metadata.pop("escalation_worker_model", None)
         self.write_metadata(metadata)
 
+    def remove_test_writer_model(self):
+        metadata = self.metadata()
+        metadata.pop("test_writer_model", None)
+        self.write_metadata(metadata)
+
     def dirty_base(self):
         (self.repo / "base-scratch.txt").write_text(
             "dirty\n", encoding="utf-8"
@@ -988,6 +993,95 @@ class Stage5IntegrationTests(VerificationTestCase):
         diff = prompt.split("```diff\n", 1)[1].split("\n```", 1)[0]
         self.assertIn("worker-output.txt", diff)
         self.assertIn("second.txt", diff)
+
+
+@unittest.skipUnless(shutil.which("git"), "git is required")
+class TestWriterModelConfigTests(VerificationTestCase):
+    def test_missing_test_writer_model_fails_before_any_work(self):
+        self.remove_test_writer_model()
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no test writer model", result.stderr)
+        self.assertIn("actl init --test-writer-model", result.stderr)
+        self.assertEqual(self.task_status(), "PENDING")
+        self.assertEqual(self.worker_calls(), [], "no worker may start")
+        self.assertEqual(self.reviewer_calls(), [], "no reviewer may start")
+        self.assertFalse((self.repo / ".actl" / "worktrees").exists())
+        self.assertEqual(
+            list((self.repo / ".actl" / "runs").glob("t1-*.log")), [],
+            "no stage may start without a test-writer model",
+        )
+        self.assertFalse(
+            (self.repo / ".actl" / "execution.lock").exists(),
+            "the lock must not be taken",
+        )
+
+    def test_missing_test_writer_model_precedes_the_execution_lock(self):
+        # With the lock held elsewhere, the run still reports the missing
+        # test-writer model instead of the lock conflict: the refusal happens
+        # before the lock is attempted.
+        self.remove_test_writer_model()
+        self.make_task()
+        lock_path = self.repo / ".actl" / "execution.lock"
+        handle = open(lock_path, "a+b")
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            result = self.run_task("t1")
+        finally:
+            handle.close()
+
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no test writer model", result.stderr)
+        self.assertNotIn("already running", result.stderr)
+        self.assertEqual(self.task_status(), "PENDING")
+        self.assertEqual(self.calls(), [])
+
+    def test_malformed_test_writer_model_in_metadata_is_rejected(self):
+        metadata = self.metadata()
+        metadata["test_writer_model"] = "not a model"
+        self.write_metadata(metadata)
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid test writer model", result.stderr)
+        self.assertEqual(self.worker_calls(), [])
+        self.assertEqual(self.task_status(), "PENDING")
+
+    def test_invalid_test_writer_model_value_in_metadata_is_rejected(self):
+        metadata = self.metadata()
+        metadata["test_writer_model"] = 42
+        self.write_metadata(metadata)
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("invalid 'test_writer_model'", result.stderr)
+        self.assertEqual(self.worker_calls(), [])
+
+    def test_test_writer_model_is_stored_updated_and_preserved(self):
+        # init already stored the default during setUp; an explicit override
+        # updates only this setting.
+        self.assertEqual(
+            self.metadata()["test_writer_model"],
+            "openrouter/deepseek/deepseek-v4.1-flash#low",
+        )
+        result = self.run_actl("init", "--test-writer-model", "provider/writer")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Updated the test writer model", result.stdout)
+        self.assertEqual(self.metadata()["test_writer_model"], "provider/writer")
+        # The other model settings are untouched.
+        self.assertEqual(self.metadata()["worker_model"], "provider/model")
+        self.assertEqual(self.metadata()["reviewer_model"], "reviewer/model")
+
+        # A plain init never removes the configured test-writer model.
+        self.assertEqual(self.run_actl("init").returncode, 0)
+        self.assertEqual(self.metadata()["test_writer_model"], "provider/writer")
+
+        for value in ("", "model", "provider/", "/model", "two words/model"):
+            with self.subTest(value=value):
+                result = self.run_actl("init", "--test-writer-model", value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invalid test writer model", result.stderr)
 
 
 if __name__ == "__main__":

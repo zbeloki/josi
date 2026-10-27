@@ -477,6 +477,18 @@ execution lock, creating a worktree, or changing the task, instead of
 silently skipping the independent review. An `IMPLEMENTED` task is validated
 and reviewed without launching the worker again.
 
+The test-writer model is project configuration required for every run:
+
+```sh
+actl init --test-writer-model openrouter/deepseek/deepseek-v4.1-flash#low
+```
+
+It is stored as `test_writer_model` in `.actl/project.json` and defaults to
+`openrouter/deepseek/deepseek-v4.1-flash#low` when `actl init` runs without
+`--test-writer-model`. `actl task run` requires it exactly like the reviewer
+and escalation models: without one the run fails before taking the execution
+lock, creating a worktree, or changing the task.
+
 All four settings are written by every `actl init`: a setting that is omitted
 keeps the value already stored, and a default is filled in only when no value
 is stored yet. Passing an argument overrides just that setting, so a single

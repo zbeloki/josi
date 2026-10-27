@@ -2991,20 +2991,21 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--worker-model", metavar="MODEL",
         help="set the project's worker model (provider/model[#variant]);"
-             " default openrouter/deepseek/deepseek-v4.1-flash; required by"
+             " default openrouter/z-ai/glm-5.3-flash; required by"
              " 'actl task run' whenever the worker runs",
     )
     init.add_argument(
         "--reviewer-model", metavar="MODEL",
         help="set the project's reviewer model (provider/model[#variant]);"
-             " default openrouter/openai/gpt-6-luna#high; required by"
+             " default openrouter/openai/gpt-6-luna#medium; required by"
              " 'actl task run'",
     )
     init.add_argument(
         "--escalation-worker-model", metavar="MODEL",
         help="set the model for the third and final worker attempt of a"
              " repair cycle (provider/model[#variant]); default"
-             " openrouter/z-ai/glm-5.3-flash#high; required by 'actl task run'",
+             " openrouter/deepseek/deepseek-v4.1-flash#high; required by"
+             " 'actl task run'",
     )
     init.add_argument(
         "--base", metavar="BRANCH",

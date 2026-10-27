@@ -533,24 +533,24 @@ class InitTests(ActlTestCase):
 
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertEqual(
-            metadata["worker_model"], "openrouter/deepseek/deepseek-v4.1-flash"
+            metadata["worker_model"], "openrouter/z-ai/glm-5.3-flash"
         )
         self.assertEqual(
-            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#high"
+            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#medium"
         )
         self.assertEqual(
-            metadata["escalation_worker_model"], "openrouter/z-ai/glm-5.3-flash#high"
+            metadata["escalation_worker_model"], "openrouter/deepseek/deepseek-v4.1-flash#high"
         )
         # The defaults are reported so the user knows what was configured.
         self.assertIn(
-            "Worker model: openrouter/deepseek/deepseek-v4.1-flash",
+            "Worker model: openrouter/z-ai/glm-5.3-flash",
             result.stdout,
         )
         self.assertIn(
-            "Reviewer model: openrouter/openai/gpt-6-luna#high", result.stdout
+            "Reviewer model: openrouter/openai/gpt-6-luna#medium", result.stdout
         )
         self.assertIn(
-            "Escalation worker model: openrouter/z-ai/glm-5.3-flash#high",
+            "Escalation worker model: openrouter/deepseek/deepseek-v4.1-flash#high",
             result.stdout,
         )
 
@@ -562,10 +562,10 @@ class InitTests(ActlTestCase):
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertEqual(metadata["worker_model"], "provider/custom")
         self.assertEqual(
-            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#high"
+            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#medium"
         )
         self.assertEqual(
-            metadata["escalation_worker_model"], "openrouter/z-ai/glm-5.3-flash#high"
+            metadata["escalation_worker_model"], "openrouter/deepseek/deepseek-v4.1-flash#high"
         )
 
     def test_reinit_preserves_models_and_fills_missing_ones(self):
@@ -595,13 +595,13 @@ class InitTests(ActlTestCase):
         result = self.run_actl("init")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "Updated the reviewer model to openrouter/openai/gpt-6-luna#high",
+            "Updated the reviewer model to openrouter/openai/gpt-6-luna#medium",
             result.stdout,
         )
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertEqual(metadata["worker_model"], "provider/worker")
         self.assertEqual(
-            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#high"
+            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#medium"
         )
         self.assertEqual(
             metadata["escalation_worker_model"], "provider/escalation"
@@ -616,10 +616,10 @@ class InitTests(ActlTestCase):
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertEqual(metadata["reviewer_model"], "provider/other")
         self.assertEqual(
-            metadata["worker_model"], "openrouter/deepseek/deepseek-v4.1-flash"
+            metadata["worker_model"], "openrouter/z-ai/glm-5.3-flash"
         )
         self.assertEqual(
-            metadata["escalation_worker_model"], "openrouter/z-ai/glm-5.3-flash#high"
+            metadata["escalation_worker_model"], "openrouter/deepseek/deepseek-v4.1-flash#high"
         )
 
     def test_init_outside_git_repository(self):

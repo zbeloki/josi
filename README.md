@@ -46,17 +46,20 @@ actl run merge r1           # integrate a completed run into the base branch
 - `actl init` requires a Git repository, creates `.actl/project.json`, and adds
   `.actl/` to `.gitignore` (existing `.gitignore` content is preserved).
   Running it again is harmless. It also checks that OpenCode is installed.
-  It always records all three model settings, so a project is ready to run a
+  It always records all four model settings, so a project is ready to run a
   task right away. Without an argument each setting gets a default:
-  `worker_model` = `openrouter/deepseek/deepseek-v4.1-flash`,
-  `reviewer_model` = `openrouter/openai/gpt-6-luna#high`, and
-  `escalation_worker_model` = `openrouter/z-ai/glm-5.3-flash#high`.
+  `worker_model` = `openrouter/z-ai/glm-5.3-flash`,
+  `reviewer_model` = `openrouter/openai/gpt-6-luna#medium`,
+  `escalation_worker_model` = `openrouter/deepseek/deepseek-v4.1-flash#high`,
+  and `test_writer_model` = `openrouter/deepseek/deepseek-v4.1-flash#low`.
   `actl init --worker-model MODEL` overrides the default worker model, for
   example `actl init --worker-model openrouter/anthropic/claude-sonnet-latest`;
   `actl init --reviewer-model MODEL` overrides the independent reviewer's
   model, which `actl task run` requires; and
   `actl init --escalation-worker-model MODEL` overrides the stronger model used
-  for the third and final repair attempt, which `actl task run` also requires.
+  for the third and final repair attempt, which `actl task run` also requires;
+  and `actl init --test-writer-model MODEL` overrides the project's test-writer
+  model, required by `actl task run` like the reviewer and escalation models.
   Re-running `actl init` preserves every model already stored and fills in a
   default only for a setting that is missing; passing an argument updates that
   one setting and leaves the others untouched.
@@ -437,7 +440,7 @@ actl init --worker-model provider/model#variant   # with a model variant
 
 It is stored as `worker_model` in `.actl/project.json` (the file may be
 edited directly as well) and defaults to
-`openrouter/deepseek/deepseek-v4.1-flash` when `actl init` runs without
+`openrouter/z-ai/glm-5.3-flash` when `actl init` runs without
 `--worker-model`. `actl task run` requires it whenever the worker
 runs: a task that is not `IMPLEMENTED` fails before the worktree is prepared
 or anything is launched without one, while an `IMPLEMENTED` task is validated
@@ -451,7 +454,7 @@ actl init --escalation-worker-model openrouter/anthropic/claude-opus-latest
 ```
 
 It is stored as `escalation_worker_model` in `.actl/project.json` and defaults
-to `openrouter/z-ai/glm-5.3-flash#high` when `actl init` runs without
+to `openrouter/deepseek/deepseek-v4.1-flash#high` when `actl init` runs without
 `--escalation-worker-model`. It is used
 for the third and final worker attempt of a repair cycle. `actl task run`
 requires it exactly like the reviewer model: without one the run fails before
@@ -467,14 +470,14 @@ actl init --reviewer-model openrouter/anthropic/claude-sonnet-latest
 ```
 
 It is stored as `reviewer_model` in `.actl/project.json` and defaults to
-`openrouter/openai/gpt-6-luna#high` when `actl init` runs without
+`openrouter/openai/gpt-6-luna#medium` when `actl init` runs without
 `--reviewer-model`. `actl task run`
 requires it: without a reviewer model the command fails before taking the
 execution lock, creating a worktree, or changing the task, instead of
 silently skipping the independent review. An `IMPLEMENTED` task is validated
 and reviewed without launching the worker again.
 
-All three settings are written by every `actl init`: a setting that is omitted
+All four settings are written by every `actl init`: a setting that is omitted
 keeps the value already stored, and a default is filled in only when no value
 is stored yet. Passing an argument overrides just that setting, so a single
 re-init can change one model without disturbing the others. The stored values
@@ -951,8 +954,8 @@ these processes also receives actl's launch-time configuration through
 ```
 .actl/
 ├── project.json    # schema_version, name, worker_model, reviewer_model,
-│                   # escalation_worker_model, validation.commands,
-│                   # base_branch, created_at
+│                   # escalation_worker_model, test_writer_model,
+│                   # validation.commands, base_branch, created_at
 ├── planner.json    # active planner session id, created_at
 ├── tasks.db        # SQLite database (tasks, dependencies, reviews,
 │                   # runs, run selections, per-invocation usage)

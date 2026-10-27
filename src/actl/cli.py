@@ -101,9 +101,9 @@ PLANNER_AGENT_PATH = Path(".opencode") / "agents" / (PLANNER_AGENT_NAME + ".md")
 # Model settings written by ``actl init`` when the matching argument is
 # omitted and the project does not configure one yet. Explicit arguments
 # always win, and a re-init preserves values already stored.
-DEFAULT_WORKER_MODEL = "openrouter/deepseek/deepseek-v4.1-flash"
-DEFAULT_REVIEWER_MODEL = "openrouter/openai/gpt-6-luna#high"
-DEFAULT_ESCALATION_WORKER_MODEL = "openrouter/z-ai/glm-5.3-flash#high"
+DEFAULT_WORKER_MODEL = "openrouter/z-ai/glm-5.3-flash"
+DEFAULT_REVIEWER_MODEL = "openrouter/openai/gpt-6-luna#medium"
+DEFAULT_ESCALATION_WORKER_MODEL = "openrouter/deepseek/deepseek-v4.1-flash#high"
 
 # OpenCode loads this file as a custom agent: the frontmatter declares a
 # primary agent that can read and explore the project and manage its tasks,

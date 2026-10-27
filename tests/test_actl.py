@@ -84,6 +84,25 @@ Behaviour is controlled through environment variables:
                               ``commit`` (replace a tracked file and commit),
                               ``dirty`` (modify a tracked file), or
                               ``untracked`` (write a scratch file)
+* ``ACTL_FAKE_TESTS``       - test-writer behaviour on ``opencode run
+                              --format json`` with the build agent: none
+                              (default; change nothing and decide that no
+                              tests are needed), commit (commit a new
+                              ``test-output.txt``), dirty (leave an
+                              uncommitted file), untracked (leave an
+                              untracked file), or empty (make an empty
+                              commit)
+* ``ACTL_FAKE_TESTS_JSON``  - the final test-writer message (defaults to a
+                              ``no_tests_needed`` decision)
+* ``ACTL_FAKE_TESTS_EXIT``  - exit code for the test-writer invocation
+* ``ACTL_FAKE_TESTS_SEQUENCE`` - JSON list of per-invocation test-writer
+                              behaviours (a string behaviour or an object
+                              with optional ``behavior`` and ``exit``
+                              members) selected with
+                              ``ACTL_FAKE_TESTS_COUNT_FILE``; entries past
+                              the end fall back to ``ACTL_FAKE_TESTS``
+* ``ACTL_FAKE_TESTS_COUNT_FILE`` - file counting test-writer invocations;
+                              used with ``ACTL_FAKE_TESTS_SEQUENCE``
 * ``ACTL_FAKE_SESSION_USAGE`` - JSON object with the cumulative ``cost`` and
                               ``tokens`` reported by every session lookup
 * ``ACTL_FAKE_SESSION_USAGE_SEQUENCE`` - JSON list of per-lookup cumulative
@@ -190,6 +209,60 @@ def _worker_plan():
     elif isinstance(item, str):
         behavior = item
     return behavior, exit_code, wait_for, index
+
+
+def _tests_plan():
+    """Return ``(behavior, exit_code)`` for this test-writer invocation."""
+    behavior = os.environ.get("ACTL_FAKE_TESTS", "none")
+    exit_code = int(os.environ.get("ACTL_FAKE_TESTS_EXIT", "0"))
+    index = _next_index(os.environ.get("ACTL_FAKE_TESTS_COUNT_FILE"))
+    item = _sequence_item("ACTL_FAKE_TESTS_SEQUENCE", index)
+    if isinstance(item, dict):
+        behavior = item.get("behavior", behavior)
+        exit_code = int(item.get("exit", exit_code))
+    elif isinstance(item, str):
+        behavior = item
+    return behavior, exit_code
+
+
+def _run_test_writer():
+    """Emulate one noninteractive test-writer turn in the current directory."""
+    behavior, exit_code = _tests_plan()
+    if behavior == "commit":
+        with open("test-output.txt", "a", encoding="utf-8") as handle:
+            handle.write("test change\\n")
+        subprocess.run(["git", "add", "test-output.txt"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Fake Test Writer",
+             "-c", "user.email=test-writer@example.invalid",
+             "commit", "-m", "test writer: add tests"],
+            check=True, capture_output=True,
+        )
+    elif behavior == "dirty":
+        with open("test-output.txt", "a", encoding="utf-8") as handle:
+            handle.write("uncommitted tests\\n")
+    elif behavior == "untracked":
+        with open("test-scratch.txt", "w", encoding="utf-8") as handle:
+            handle.write("test scratch\\n")
+    elif behavior == "empty":
+        subprocess.run(
+            ["git", "-c", "user.name=Fake Test Writer",
+             "-c", "user.email=test-writer@example.invalid",
+             "commit", "--allow-empty", "-m", "test writer: empty commit"],
+            check=True, capture_output=True,
+        )
+    print(json.dumps({"type": "step_start",
+                      "part": {"type": "step-start"}}))
+    message = os.environ.get(
+        "ACTL_FAKE_TESTS_JSON",
+        '{"decision":"no_tests_needed","reason":"no tests required"}',
+    )
+    print(json.dumps({
+        "type": "text",
+        "part": {"type": "text", "messageID": "msg_fake_tests",
+                 "text": message},
+    }))
+    return exit_code
 
 
 def _run_reviewer():
@@ -377,6 +450,10 @@ def main():
     if argv and argv[0] == "run":
         if "--agent" in argv and argv[argv.index("--agent") + 1] == "plan":
             return _run_reviewer()
+        # The test writer is the noninteractive turn that answers with a
+        # JSON decision while using the worker (build) agent.
+        if "--format" in argv:
+            return _run_test_writer()
         return _run_worker()
 
     # Anything after the api and run handling is treated as the interactive

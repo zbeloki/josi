@@ -21,6 +21,7 @@ from dataclasses import dataclass, replace
 from typing import Optional
 
 # Invocation stages actl attributes usage to.
+STAGE_TEST_WRITER = "test_writer"
 STAGE_WORKER = "worker"
 STAGE_REVIEW = "review"
 STAGE_REVIEW_FORMAT_RETRY = "review_format_retry"

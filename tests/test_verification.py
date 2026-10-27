@@ -114,7 +114,12 @@ class VerificationTestCase(TaskRunTestCase):
         return [
             path for path in self.log_paths()
             if "-validation" not in path.name and "-review" not in path.name
+            and "-tests" not in path.name
         ]
+
+    def generation_logs(self):
+        """The test-generation stage's own logs."""
+        return sorted((self.repo / ".actl" / "runs").glob("t1-*-tests.log"))
 
     def validation_log(self):
         paths = self.validation_logs()

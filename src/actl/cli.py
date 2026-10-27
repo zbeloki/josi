@@ -23,6 +23,11 @@ Stage 4:
 
 * ``actl task run <id>`` executes one task with a noninteractive OpenCode
   worker inside a dedicated Git worktree, under a project-wide execution lock.
+* Before the first worker attempt, a test-generation turn runs in the same
+  worktree with the project's test-writer model: it writes and commits the
+  task's tests, or explicitly decides that no tests are needed. Execution
+  errors, invalid outcomes, uncommitted changes, and a dirty worktree fail
+  the stage instead of starting the worker.
 
 Stage 5:
 
@@ -86,7 +91,8 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (
-    __version__, execution, opencode, review, tasks, usage, validation,
+    __version__, execution, opencode, review, tasks, testgen, usage,
+    validation,
 )
 
 PROJECT_DIR = ".actl"
@@ -1204,7 +1210,7 @@ _RUNNABLE_STATUSES = (
 
 
 def cmd_task_run(args) -> int:
-    """Execute tasks inside a run: worker, validation, review, and staging."""
+    """Execute tasks: tests, worker, validation, review, and staging."""
     try:
         if args.all_tasks:
             if args.ids:
@@ -1232,7 +1238,7 @@ def cmd_task_run(args) -> int:
         # The test-writer model is required like the reviewer and escalation
         # models: a missing or malformed value refuses the run before the
         # lock, the worktrees, or any OpenCode launch.
-        _test_writer_model(metadata)
+        test_writer_model = _test_writer_model(metadata)
         validation_commands = validation.commands_from_metadata(metadata)
         base_branch = _run_base_branch(root, metadata)
         binary = opencode.find_binary()
@@ -1265,12 +1271,12 @@ def cmd_task_run(args) -> int:
                 return _run_all(
                     binary, root, actl_dir, lock_fd, metadata, base_branch,
                     reviewer_model, escalation_worker_model,
-                    validation_commands, run,
+                    test_writer_model, validation_commands, run,
                 )
             return _run_explicit(
                 binary, root, actl_dir, lock_fd, requested, metadata,
                 base_branch, reviewer_model, escalation_worker_model,
-                validation_commands, run,
+                test_writer_model, validation_commands, run,
             )
     except (
         ProjectError, tasks.TaskError, sqlite3.Error,
@@ -1310,7 +1316,8 @@ def _preflight_tasks(actl_dir: Path, requested) -> None:
 
 def _run_explicit(
     binary, root, actl_dir, lock_fd, requested, metadata, base_branch,
-    reviewer_model, escalation_worker_model, validation_commands, run,
+    reviewer_model, escalation_worker_model, test_writer_model,
+    validation_commands, run,
 ) -> int:
     """Execute an explicit task list strictly in the order it was given.
 
@@ -1327,8 +1334,8 @@ def _run_explicit(
     for task_id in requested:
         code, detail, run = _execute_task(
             binary, root, actl_dir, task_id, metadata, lock_fd, base_branch,
-            reviewer_model, escalation_worker_model, validation_commands, run,
-            selection,
+            reviewer_model, escalation_worker_model, test_writer_model,
+            validation_commands, run, selection,
         )
         if code != 0:
             if batch:
@@ -1357,7 +1364,8 @@ def _dependency_satisfied(dep_id, state, run) -> bool:
 
 def _run_all(
     binary, root, actl_dir, lock_fd, metadata, base_branch,
-    reviewer_model, escalation_worker_model, validation_commands, run,
+    reviewer_model, escalation_worker_model, test_writer_model,
+    validation_commands, run,
 ) -> int:
     """Execute every eligible task in dependency order, one at a time.
 
@@ -1429,8 +1437,8 @@ def _run_all(
             )
         code, detail, run = _execute_task(
             binary, root, actl_dir, ready.id, metadata, lock_fd, base_branch,
-            reviewer_model, escalation_worker_model, validation_commands, run,
-            selection,
+            reviewer_model, escalation_worker_model, test_writer_model,
+            validation_commands, run, selection,
         )
         if code != 0:
             _print_summary(completed, stopped=(ready.id, detail))
@@ -1574,8 +1582,8 @@ def _print_summary(
 
 def _execute_task(
     binary, root, actl_dir, task_id, metadata, lock_fd, base_branch,
-    reviewer_model, escalation_worker_model, validation_commands, run,
-    selection,
+    reviewer_model, escalation_worker_model, test_writer_model,
+    validation_commands, run, selection,
 ) -> tuple:
     """Run one task while the execution lock is held.
 
@@ -1584,6 +1592,12 @@ def _execute_task(
     before the first task that actually executes. The task branch is created
     from the run branch, and an approval is fast-forwarded into the run
     branch and marked STAGED - never into the configured base branch.
+
+    Before the first worker attempt, the test-generation stage runs in the
+    same worktree with the project's test-writer model: it writes and commits
+    the task's tests, or explicitly decides that the task needs none. A
+    completed stage is never repeated (its outcome is recorded), and a failed
+    one stops the task like any other stage failure.
 
     A task gets up to three completed worker attempts in the same branch and
     worktree: the first two with the project's worker model and the third
@@ -1704,6 +1718,7 @@ def _execute_task(
         print("model: " + _worker_model(metadata))
         print("reviewer model: " + reviewer_model)
         print("escalation model: " + escalation_worker_model)
+        print("test writer model: " + test_writer_model)
         if task.status == tasks.STATUS_RUNNING:
             _event(
                 "Retrying task t" + str(task.id)
@@ -1734,18 +1749,76 @@ def _execute_task(
             return _needs_human(actl_dir, task, verification, attempts, run)
         _set_task_status(actl_dir, task.id, tasks.STATUS_RUNNING)
 
+    worktree = None
     while attempts < execution.MAX_WORKER_ATTEMPTS:
         attempt = attempts + 1
+        # The task branch and worktree are prepared once for the whole
+        # worker sequence and reused as they are: the test-generation stage
+        # and every worker attempt run in the same worktree, and nothing is
+        # ever reset between attempts.
+        if worktree is None:
+            announce = attempt == 1
+            try:
+                if announce:
+                    _event("Preparing worktree")
+                worktree = execution.ensure_worktree(
+                    root, actl_dir, task,
+                    retry=not (
+                        task.status == tasks.STATUS_PENDING and attempts == 0
+                    ),
+                    base_branch=run.branch,
+                )
+            except execution.ExecutionError as exc:
+                reason = str(exc)
+                _set_task_status(actl_dir, task.id, tasks.STATUS_FAILED)
+                _event("Task status: FAILED")
+                _fail("task t" + str(task.id) + " failed: " + reason)
+                return 1, "worktree preparation failed", run
+            if announce:
+                if worktree.created:
+                    _event(
+                        "Created worktree " + str(worktree.path)
+                        + " (branch " + worktree.branch + ")"
+                    )
+                else:
+                    _event(
+                        "Reusing worktree " + str(worktree.path)
+                        + " (branch " + worktree.branch + ")"
+                    )
+        if attempt == 1:
+            # The test-generation stage runs once, before the first worker
+            # attempt, so the worker starts from the tests it left behind.
+            try:
+                generate_tests = _needs_test_generation(
+                    actl_dir, task, worktree, run.branch,
+                )
+            except execution.ExecutionError as exc:
+                return _verification_failed(actl_dir, task.id, str(exc), run)
+            if generate_tests:
+                outcome, reason, tests_log = _run_test_generation(
+                    binary, actl_dir, task, lock_fd, run.branch,
+                    test_writer_model, run.id, worktree,
+                )
+                if outcome == tasks.STATUS_FAILED:
+                    _event("Test generation failed")
+                    _set_task_status(actl_dir, task.id, tasks.STATUS_FAILED)
+                    _event("Task status: FAILED")
+                    _fail(
+                        "task t" + str(task.id)
+                        + " failed: test generation: " + reason
+                        + " (log: " + str(tests_log) + ")"
+                    )
+                    return 1, "test generation failed", run
+                execution.record_testgen_outcome(actl_dir, task.id, outcome)
         model = _attempt_model(metadata, attempt, escalation_worker_model)
         _event(
             "Worker attempt " + str(attempt) + "/"
             + str(execution.MAX_WORKER_ATTEMPTS) + " (" + model + ")"
         )
         status, reason, log_path = _run_worker_attempt(
-            binary, root, actl_dir, task, lock_fd, run.branch,
+            binary, actl_dir, task, lock_fd, run.branch,
             attempt=attempt, model=model, feedback=feedback,
-            retry=not (attempt == 1 and task.status == tasks.STATUS_PENDING),
-            announce_worktree=attempt == 1, run_id=run.id,
+            run_id=run.id, worktree=worktree,
         )
         if status != tasks.STATUS_IMPLEMENTED:
             _set_task_status(actl_dir, task.id, status)
@@ -1791,10 +1864,10 @@ def _execute_task(
 
 
 def _run_worker_attempt(
-    binary, root, actl_dir, task, lock_fd, base_branch, attempt, model,
-    feedback, retry, announce_worktree, run_id,
+    binary, actl_dir, task, lock_fd, base_branch, attempt, model, feedback,
+    run_id, worktree,
 ):
-    """Run one worker attempt in the task worktree.
+    """Run one worker attempt in the prepared task worktree.
 
     Returns ``(status, reason, log_path)``: ``IMPLEMENTED`` with an empty
     reason when the worker left a clean, committed implementation;
@@ -1819,27 +1892,10 @@ def _run_worker_attempt(
         status = tasks.STATUS_FAILED
         reason = ""
         exit_code = None
-        worktree = None
         session = None
         try:
-            if announce_worktree:
-                _event("Preparing worktree")
-            worktree = execution.ensure_worktree(
-                root, actl_dir, task, retry=retry, base_branch=base_branch,
-            )
             log.write("branch: " + worktree.branch + "\n")
             log.write("worktree: " + str(worktree.path) + "\n")
-            if announce_worktree:
-                if worktree.created:
-                    _event(
-                        "Created worktree " + str(worktree.path)
-                        + " (branch " + worktree.branch + ")"
-                    )
-                else:
-                    _event(
-                        "Reusing worktree " + str(worktree.path)
-                        + " (branch " + worktree.branch + ")"
-                    )
             session = opencode.create_session(
                 binary, worktree.path,
                 title="actl task t" + str(task.id) + ": " + task.title,
@@ -1868,7 +1924,7 @@ def _run_worker_attempt(
         except (execution.ExecutionError, opencode.OpenCodeError, OSError) as exc:
             reason = str(exc)
 
-        if session is not None and worktree is not None:
+        if session is not None:
             _capture_usage(
                 binary, worktree.path, session.id, model, task, run_id,
                 usage.STAGE_WORKER, attempt, log, actl_dir,
@@ -1882,6 +1938,150 @@ def _run_worker_attempt(
         if reason:
             log.write("reason: " + reason + "\n")
     return status, reason, log_path
+
+
+def _needs_test_generation(
+    actl_dir: Path, task, worktree, base_branch: str,
+) -> bool:
+    """Whether the test-generation stage still has to run for ``task``.
+
+    The stage runs once, before the first worker attempt. A recorded outcome
+    means it already completed - even when it decided that no tests are
+    needed and committed nothing. Committed changes on the task branch mean
+    an earlier execution already produced work there (an interrupted test
+    writer, or an implementation left by an older actl version), and a fresh
+    test-writing turn must never run after it.
+    """
+    if execution.testgen_outcome(actl_dir, task.id) is not None:
+        return False
+    return not execution.worktree_has_committed_changes(
+        worktree.path, base_branch
+    )
+
+
+def _run_test_generation(
+    binary, actl_dir, task, lock_fd, base_branch, model, run_id, worktree,
+):
+    """Run the test-generation stage in the prepared task worktree.
+
+    The test writer receives the task title and description with the
+    project's test-writer model and answers with one JSON decision (see
+    :mod:`actl.testgen`). Returns ``(status, reason, log_path)`` like
+    :func:`_run_worker_attempt`: the parsed decision with an empty reason
+    when the stage succeeded, and ``FAILED`` with a reason for an execution
+    error, an invalid outcome, uncommitted changes, or a dirty worktree.
+    The stage's transcript goes into its own timestamped log and its model
+    usage is recorded under the distinct test-writer stage.
+    """
+    log_path, log = execution.open_stage_log(actl_dir, task.id, "tests")
+    with log:
+        log.write("actl test generation\n")
+        log.write("task: t" + str(task.id) + " - " + task.title + "\n")
+        log.write("model: " + model + "\n")
+        log.write("started_at: " + _utc_now() + "\n")
+
+        _set_task_status(actl_dir, task.id, tasks.STATUS_RUNNING)
+        status = tasks.STATUS_FAILED
+        reason = ""
+        exit_code = None
+        session = None
+        try:
+            log.write("branch: " + worktree.branch + "\n")
+            log.write("worktree: " + str(worktree.path) + "\n")
+            session = opencode.create_session(
+                binary, worktree.path,
+                title="actl test writer t" + str(task.id) + ": " + task.title,
+                agent=opencode.WORKER_AGENT,
+            )
+            log.write("session: " + session.id + "\n")
+            log.write("---\n")
+            # Flush before the test writer starts writing to the same file
+            # through its inherited stdout descriptor, so the header stays
+            # on top and the parsed answer can be read back by position.
+            log.flush()
+            output_start = log.tell()
+            _event("Test writer started (model " + model + ")")
+            _event("tests log: " + str(log_path))
+            exit_code = opencode.run_headless(
+                binary, worktree.path, session.id, model,
+                testgen.build_prompt(task, worktree.branch, base_branch),
+                log, pass_fds=(lock_fd,), output_format="json",
+            )
+            if exit_code == 0:
+                _event("Test writer finished with exit code 0")
+            else:
+                _event("Test writer failed with exit code " + str(exit_code))
+            with open(log.name, "rb") as transcript:
+                transcript.seek(output_start)
+                output = transcript.read().decode("utf-8", errors="replace")
+            status, reason = _evaluate_test_generation(
+                worktree, exit_code, base_branch, output,
+            )
+        except (execution.ExecutionError, opencode.OpenCodeError, OSError) as exc:
+            reason = str(exc)
+
+        if session is not None:
+            _capture_usage(
+                binary, worktree.path, session.id, model, task, run_id,
+                usage.STAGE_TEST_WRITER, 1, log, actl_dir,
+            )
+
+        log.write("---\n")
+        log.write("finished_at: " + _utc_now() + "\n")
+        if exit_code is not None:
+            log.write("exit_code: " + str(exit_code) + "\n")
+        log.write("result: " + status + "\n")
+        if reason:
+            log.write("reason: " + reason + "\n")
+    if status != tasks.STATUS_FAILED:
+        if status == testgen.DECISION_TESTS_WRITTEN:
+            _event("Test generation finished (tests committed)")
+        else:
+            _event("Test generation finished (no tests needed)")
+    return status, reason, log_path
+
+
+def _evaluate_test_generation(worktree, exit_code, base_branch, output):
+    """Turn a finished test-generation run into ``(status, reason)``.
+
+    A non-zero exit, a worktree left on another branch, uncommitted or
+    untracked changes, and an unusable answer are all stage failures: the
+    worker must never start from an uncertain state. A ``tests_written``
+    decision counts only together with committed changes; a
+    ``no_tests_needed`` decision succeeds without requiring a commit.
+    """
+    if exit_code != 0:
+        return (
+            tasks.STATUS_FAILED,
+            "the OpenCode test writer exited with status " + str(exit_code),
+        )
+    branch = execution.worktree_branch(worktree.path)
+    if branch != worktree.branch:
+        return (
+            tasks.STATUS_FAILED,
+            "the test writer left the worktree on '" + branch
+            + "' instead of '" + worktree.branch + "'",
+        )
+    dirty = execution.worktree_dirty(worktree.path)
+    if dirty:
+        return (
+            tasks.STATUS_FAILED,
+            "the test writer left the worktree dirty (commit or remove the"
+            " changes and run the task again)",
+        )
+    try:
+        decision = testgen.outcome_from_output(output)
+    except testgen.TestGenError as exc:
+        return tasks.STATUS_FAILED, str(exc)
+    if decision == testgen.DECISION_TESTS_WRITTEN and not (
+        execution.worktree_has_committed_changes(worktree.path, base_branch)
+    ):
+        return (
+            tasks.STATUS_FAILED,
+            "the test writer reported " + testgen.DECISION_TESTS_WRITTEN
+            + " but committed no test changes relative to " + base_branch,
+        )
+    return decision, ""
 
 
 # OpenCode's model list carries the pricing metadata actl derives costs
@@ -3109,7 +3309,8 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = task_sub.add_parser(
         "run",
-        help="execute tasks: worker, validation, review, and staging",
+        help="execute tasks: test generation, worker, validation, review,"
+             " and staging",
     )
     run.add_argument(
         "ids", nargs="*", metavar="ID",

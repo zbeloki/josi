@@ -35,7 +35,7 @@ actl init                   # register the Git repository as an actl project
 actl plan                   # start (or resume) the planner; it can manage tasks
 actl plan --new             # start a fresh planner session
 actl task list              # list the project's tasks
-actl task run t1            # run a task: worker, validation, review, staging
+actl task run t1            # run a task: tests, worker, review, staging
 actl task run t1 t2 t3      # run tasks sequentially in the given order
 actl task run --all         # run every eligible task in dependency order
 actl run list               # list runs and their statuses
@@ -128,10 +128,11 @@ actl task delete t2
 
 ## Running tasks
 
-`actl task run` executes tasks end to end inside a **run**: a noninteractive
-OpenCode worker implements each task in an isolated Git worktree, the
-project's validation commands run on the worker's commit, an independent
-reviewer approves or rejects that exact commit, and the approved commit is
+`actl task run` executes tasks end to end inside a **run**: a
+test-generation turn writes the task's tests first, a noninteractive OpenCode
+worker implements each task in an isolated Git worktree, the project's
+validation commands run on the worker's commit, an independent reviewer
+approves or rejects that exact commit, and the approved commit is
 fast-forwarded into the run branch, which marks the task `STAGED`. The
 configured base branch is never touched during execution; `actl run merge`
 integrates the whole run later and marks its tasks `DONE`. A failed validation
@@ -140,7 +141,7 @@ automatic repair: actl runs up to three worker attempts in all and escalates
 the last one to a stronger model.
 
 ```sh
-actl task run t1          # one task: worker, validation, review, and staging
+actl task run t1          # one task: tests, worker, validation, review, staging
 actl task run t1 t2 t3    # the listed tasks, sequentially, in that order
 actl task run --all       # every eligible task, in dependency order
 actl run merge r1         # integrate the completed run into the base branch
@@ -148,12 +149,12 @@ actl run merge r1         # integrate the completed run into the base branch
 
 One run goes through these steps:
 
-1. The project must be initialized with a reviewer model and an escalation
-   worker model, and the task must exist, be runnable, and have all its
-   dependencies satisfied (`DONE`, or `STAGED` in the run being executed). A
-   task that starts the worker also needs the worker model; without a
-   reviewer or escalation model the command refuses before any lock,
-   worktree, or task change.
+1. The project must be initialized with a reviewer model, an escalation
+   worker model, and a test-writer model, and the task must exist, be
+   runnable, and have all its dependencies satisfied (`DONE`, or `STAGED` in
+   the run being executed). A task that starts the worker also needs the
+   worker model; without one of the required models the command refuses
+   before any lock, worktree, or task change.
 2. The project-wide execution lock is taken. A second `actl task run` in the
    same project refuses immediately while an execution is active, whether it
    is another single task or a multi-task batch.
@@ -170,30 +171,38 @@ One run goes through these steps:
    from the base branch, so a task starts from the previous staged task's
    result. They are created the first time the task runs in this run - never
    at `actl task create`.
-5. OpenCode runs one noninteractive turn inside the worktree with the
+5. Before the first worker attempt, a test-generation turn runs in the task
+   worktree with the project's test-writer model and the built-in `build`
+   agent. It decides whether the task needs automated tests: it either
+   writes and commits them on the task branch, or explicitly decides that no
+   tests are needed and changes nothing. A completed stage is recorded (and
+   never repeated on a retry); an execution error, an invalid outcome,
+   uncommitted changes, or a dirty worktree fails the task instead of
+   starting the worker.
+6. OpenCode runs one noninteractive turn inside the worktree with the
    project's worker model and the built-in `build` agent
    (`opencode run --agent build --model MODEL --session ID`). A repair
    attempt uses the escalation model on the third attempt and carries the
    previous failure as feedback; the worker continues on the same branch and
    actl never resets the branch or discards earlier commits.
-6. The worker's complete stdout and stderr are written straight into a log
+7. The worker's complete stdout and stderr are written straight into a log
    file under `.actl/runs/` while it runs; the log path is printed when the
    worker starts, so the run can be followed with `tail -f <logfile>`.
-7. After the worker succeeds, the configured validation commands run in the
+8. After the worker succeeds, the configured validation commands run in the
    task worktree (see below) and an independent reviewer examines the
    validated commit in a temporary worktree.
-8. An approval marks the task `APPROVED` and actl stages it: the exact
+9. An approval marks the task `APPROVED` and actl stages it: the exact
    validated and approved commit is fast-forwarded into the run branch (see
    below) and the task becomes `STAGED`. A failed validation command or a
    rejection with critical or major findings starts the next worker attempt
    in the same branch and worktree, with the failure as feedback; when all
    three attempts are used the task ends `NEEDS_HUMAN`.
-9. When the batch ends and every task selected for the run is staged (or
-   already DONE), and the run branch still points at the expected commit, the
-   run is marked `COMPLETE` with that verified commit as its final commit. A
-   batch stopped by a failed task, a blocked `--all`, or a crash leaves the
-   run `RUNNING` and resumable, and is never reported as finished.
-10. Only after the run is integrated into the base branch with
+10. When the batch ends and every task selected for the run is staged (or
+    already DONE), and the run branch still points at the expected commit, the
+    run is marked `COMPLETE` with that verified commit as its final commit. A
+    batch stopped by a failed task, a blocked `--all`, or a crash leaves the
+    run `RUNNING` and resumable, and is never reported as finished.
+11. Only after the run is integrated into the base branch with
     `actl run merge` is a staged task marked `DONE`. DONE means the task's
     approved commit is part of the configured base branch; it is never
     recorded while the task is merely staged, and a task that is already DONE
@@ -205,12 +214,12 @@ worker, validation, and review and attempts to stage the recorded approved
 commit into the run.
 
 The terminal shows only actl's own timestamped events - task, models,
-worktree preparation, worker start, worker exit code, validation start and
-result, reviewer start and verdict, the staging merge, and the final task
-status - plus the log paths and the final reminder with the `actl run merge`
-command. Transcripts and validation output never reach the terminal. A
-multi-task run prints a final summary of the completed tasks and of the task
-that stopped it, if any.
+worktree preparation, test-writer start and outcome, worker start, worker
+exit code, validation start and result, reviewer start and verdict, the
+staging merge, and the final task status - plus the log paths and the final
+reminder with the `actl run merge` command. Transcripts and validation output
+never reach the terminal. A multi-task run prints a final summary of the
+completed tasks and of the task that stopped it, if any.
 
 ### Staging into the run branch
 
@@ -339,6 +348,16 @@ same command to finalize its status.
 The worker prompt contains the task title, its description, and the worker
 instructions: implement the task, run the relevant checks, commit the changes
 on the branch, keep the worktree clean, and never merge into the run branch.
+
+The test writer receives the task title and description in the task worktree
+with its own instructions: decide whether the task needs automated tests, and
+either write and commit them (running them to verify they pass) or explicitly
+decide that no tests are needed and change nothing. It must end its turn with
+exactly one JSON decision - `tests_written` or `no_tests_needed` - which is
+parsed strictly like the reviewer's verdict; prose, several objects, and
+unknown decisions are refused. `tests_written` counts only together with
+committed changes, `no_tests_needed` succeeds without requiring a commit, and
+either way the worktree must be clean before the worker starts.
 
 The lifecycle is:
 
@@ -489,6 +508,18 @@ It is stored as `test_writer_model` in `.actl/project.json` and defaults to
 and escalation models: without one the run fails before taking the execution
 lock, creating a worktree, or changing the task.
 
+The model drives the **test-generation stage**: a separate noninteractive
+OpenCode turn with the built-in `build` agent that runs in the task worktree
+before the first worker attempt (`opencode run --agent build --model MODEL
+--session ID --format json "<prompt>"`). The turn's transcript goes into its
+own timestamped log (`.actl/runs/t1-<timestamp>-tests.log`) and its usage is
+recorded under the distinct `test_writer` stage. When the stage succeeds, its
+decision is recorded in `.actl/testgen/t1` and never repeated - not on a
+worker retry, and not after the attempt budget was deliberately reset. A
+stage that was interrupted before it completed (no recorded decision and no
+committed changes on the task branch) runs again on the next execution;
+committed changes on the task branch from any earlier work always skip it.
+
 All four settings are written by every `actl init`: a setting that is omitted
 keeps the value already stored, and a default is filled in only when no value
 is stored yet. Passing an argument overrides just that setting, so a single
@@ -549,25 +580,29 @@ selection; a project initialized before `base_branch` existed gains one on
 the next `actl init`, and `actl task run` keeps working by detecting the
 branch without writing metadata.
 
-Every worker attempt writes its own log: `.actl/runs/t1-<timestamp>.log` for
-the worker, plus `.actl/runs/t1-<timestamp>-validation.log` and
+Every stage writes its own log: `.actl/runs/t1-<timestamp>.log` for the
+worker, `.actl/runs/t1-<timestamp>-tests.log` for the test-generation stage
+that runs before the first worker attempt, plus
+`.actl/runs/t1-<timestamp>-validation.log` and
 `.actl/runs/t1-<timestamp>-review.log` when those stages run. Each log starts
 with a header (task, attempt, model, branch, commit) and ends with the result
-(exit codes, status, verdict, failure reason), and an earlier attempt's logs
-are never overwritten. The logs are written continuously while the stage
-runs, and each path is printed when the stage starts as well as in the final
-summary; use `tail -f` to watch a run.
+(exit codes, status, decision, verdict, failure reason), and an earlier
+attempt's logs are never overwritten. The logs are written continuously while
+the stage runs, and each path is printed when the stage starts as well as in
+the final summary; use `tail -f` to watch a run.
 
 ### Usage and cost reporting
 
-Every worker attempt, review, and review-format retry reads its usage from
-OpenCode's session metadata (`GET /api/session/<id>`), which reports the
-session's cumulative `cost` and token counts. For a reused session, actl
-subtracts the cumulative totals read before the turn from the totals read
-after it; for a fresh session, the reported totals are that turn's usage.
-Each invocation's token counts (input, output, reasoning, cache read, and
-cache write) and available cost data are written to that invocation's log and
-stored in `.actl/tasks.db` with its task id, run id, stage, and attempt.
+Every worker attempt, test-generation turn, review, and review-format retry
+reads its usage from OpenCode's session metadata (`GET /api/session/<id>`),
+which reports the session's cumulative `cost` and token counts. For a reused
+session, actl subtracts the cumulative totals read before the turn from the
+totals read after it; for a fresh session, the reported totals are that
+turn's usage. Each invocation's token counts (input, output, reasoning,
+cache read, and cache write) and available cost data are written to that
+invocation's log and stored in `.actl/tasks.db` with its task id, run id,
+stage (`worker`, `test_writer`, `review`, or `review_format_retry`), and
+attempt.
 
 The `cost_total` is OpenCode's reported cost when OpenCode provides one. When
 the model's pricing metadata is also available (`GET /api/model`), actl
@@ -580,8 +615,9 @@ their sum. If neither is available, the amount is recorded as `unavailable`,
 never as zero.
 
 `actl task show` reports totals that accumulate over every usage record for
-the task: all worker attempts, reviews, review-format retries, repairs, and
-separate CLI invocations. `actl run show` reports only records attributed to
+the task: the test-generation stage, all worker attempts, reviews,
+review-format retries, repairs, and separate CLI invocations. `actl run show`
+reports only records attributed to
 that run, so usage from the same task in an earlier or later run is not
 included. The `cost_status` line summarizes the included records:
 
@@ -694,7 +730,13 @@ The console reports each attempt with its model and outcome:
 ```text
 task t1: Add authentication
 
-[14:00] Worker attempt 1/3 (provider/model)
+[14:00] Preparing worktree
+[14:00] Created worktree .actl/worktrees/t1 (branch actl/t1)
+[14:00] Test writer started (model tests/model)
+[14:00] tests log: .actl/runs/t1-20260101T140000123456Z-tests.log
+[14:01] Test writer finished with exit code 0
+[14:01] Test generation finished (no tests needed)
+[14:01] Worker attempt 1/3 (provider/model)
 [14:03] Validation passed
 [14:04] Reviewer started
 [14:05] Review requested changes (2 major findings)
@@ -950,6 +992,8 @@ conversations itself. It uses these OpenCode surfaces:
 | Open the planner TUI | `opencode <project-root> --session <id>` |
 | Create a worker session in a task worktree | `opencode api POST /api/session` (location and agent `build`) |
 | Run the worker noninteractively | `opencode run --agent build --model <model> --session <id> "<prompt>"` |
+| Create a test-writer session in a task worktree | `opencode api POST /api/session` (location and agent `build`) |
+| Run the test writer and read its decision | `opencode run --agent build --model <model> --session <id> --format json "<prompt>"` |
 | Create a reviewer session in a temporary worktree | `opencode api POST /api/session` (location and agent `plan`) |
 | Run the reviewer and get a machine-readable verdict | `opencode run --agent plan --model <model> --session <id> --format json "<prompt>"` |
 
@@ -974,7 +1018,9 @@ these processes also receives actl's launch-time configuration through
 ├── execution.lock  # project-wide execution lock (fcntl.flock)
 ├── base/           # branch-creation commit per task: t1, t2, ...
 ├── attempts/       # used worker attempts + next-attempt feedback: t1, t2, ...
-├── runs/           # tN-<timestamp>.log worker, -validation.log, -review.log
+├── testgen/        # recorded test-generation outcome per task: t1, t2, ...
+├── runs/           # tN-<timestamp>.log worker, -tests.log, -validation.log,
+│                   # -review.log
 ├── review/         # temporary reviewer worktrees (removed after review)
 ├── integrate/      # temporary merge worktrees (removed after the merge)
 ├── run-worktrees/  # one Git worktree per run: r1/, r2/, ...

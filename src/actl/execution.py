@@ -20,6 +20,11 @@
 * One noninteractive OpenCode turn runs inside the worktree and its output is
   streamed into a log file under ``.actl/runs/``. Validation and review get
   their own logs in the same directory.
+* Before the first worker attempt, a test-generation turn runs in the same
+  worktree with the project's test-writer model (see :mod:`actl.testgen`):
+  it writes and commits the task's tests, or explicitly decides that the
+  task needs none. Its outcome is recorded in ``.actl/testgen/tN`` so a
+  retry never repeats a completed stage.
 * The reviewer gets a temporary detached worktree under ``.actl/review/``
   (see ``add_review_worktree``), so its checkout can never touch the task
   worktree.
@@ -61,6 +66,7 @@ INTEGRATE_DIR = "integrate"
 BASE_DIR = "base"
 RUNS_DIR = "runs"
 ATTEMPTS_DIR = "attempts"
+TESTGEN_DIR = "testgen"
 #: Total worker attempts a task gets before it needs a human (Stage 6).
 MAX_WORKER_ATTEMPTS = 3
 DEFAULT_BASE_CANDIDATES = ("main", "master")
@@ -476,6 +482,42 @@ def branch_base(actl_dir: Path, task_id: int):
     return commit or None
 
 
+def record_testgen_outcome(actl_dir: Path, task_id: int, decision: str) -> None:
+    """Record that the test-generation stage completed with ``decision``.
+
+    The record is written only after the stage succeeded, so an interrupted
+    or failed stage never suppresses a later one.
+    """
+    path = actl_dir / TESTGEN_DIR / ("t" + str(task_id))
+    payload = {"decision": decision}
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
+    except OSError as exc:
+        raise ExecutionError(
+            "cannot record the test-generation outcome " + str(path)
+            + " (" + str(exc) + ")"
+        )
+
+
+def testgen_outcome(actl_dir: Path, task_id: int):
+    """Return the recorded test-generation decision, or None.
+
+    A missing record means the stage has not completed yet. A record that
+    cannot be read or parsed is ignored rather than fatal: the stage would
+    simply run again, which a broken marker must never silently prevent.
+    """
+    path = actl_dir / TESTGEN_DIR / ("t" + str(task_id))
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    decision = data.get("decision")
+    return decision if isinstance(decision, str) else None
+
+
 def remove_temporary_worktree(root: Path, path: Path) -> str:
     """Remove a temporary worktree; return an error text or "".
 
@@ -676,8 +718,8 @@ def open_stage_log(actl_dir: Path, task_id: int, stage):
 
     The name carries a microsecond timestamp and is created exclusively, so a
     run can never truncate an earlier run's log. ``stage`` (for example
-    ``"validation"`` or ``"review"``) is appended to the worker's plain
-    ``tN-<timestamp>.log`` name.
+    ``"tests"``, ``"validation"``, or ``"review"``) is appended to the
+    worker's plain ``tN-<timestamp>.log`` name.
     """
     name = "t" + str(task_id) + "-" + timestamp()
     if stage:

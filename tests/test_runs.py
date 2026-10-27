@@ -130,6 +130,7 @@ class TaskRunTestCase(ActlTestCase):
                 (self.repo / ".actl" / "runs").glob(task_id + "-*.log")
             )
             if "-validation" not in path.name and "-review" not in path.name
+            and "-tests" not in path.name
         ]
 
     def log_text(self, task_id="t1"):
@@ -143,15 +144,26 @@ class TaskRunTestCase(ActlTestCase):
         return argv[argv.index("--agent") + 1] if "--agent" in argv else ""
 
     def worker_calls(self):
+        # The test writer also uses the build agent, but answers with JSON
+        # output; the worker turns are the plain transcript ones.
         return [
             call for call in self.calls()
             if call["argv"][:1] == ["run"] and self.agent_of(call) == "build"
+            and "--format" not in call["argv"]
         ]
 
     def reviewer_calls(self):
         return [
             call for call in self.calls()
             if call["argv"][:1] == ["run"] and self.agent_of(call) == "plan"
+        ]
+
+    def generation_calls(self):
+        """The test-generation turns: the build agent answering with JSON."""
+        return [
+            call for call in self.calls()
+            if call["argv"][:1] == ["run"] and self.agent_of(call) == "build"
+            and "--format" in call["argv"]
         ]
 
     def worker_prompt(self):
@@ -386,8 +398,12 @@ class TerminalOutputTests(TaskRunTestCase):
             r"\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}\]"
             r" Preparing worktree",
         )
-        self.assertLess(stdout.index("Starting worker"), stdout.index("log:"))
-        self.assertLess(stdout.index("log:"), stdout.index("Worker finished"))
+        # The worker's own log line ("... log: ...", not the test writer's
+        # "... tests log: ...") sits between the worker start and its finish.
+        worker_log = stdout.find("] log: ")
+        self.assertGreater(worker_log, 0)
+        self.assertLess(stdout.index("Starting worker"), worker_log)
+        self.assertLess(worker_log, stdout.index("Worker finished"))
 
         # The worker transcript never reaches the terminal.
         self.assertNotIn("fake opencode:", stdout)

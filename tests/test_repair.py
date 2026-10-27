@@ -753,5 +753,91 @@ class EscalationModelConfigTests(RepairTestCase):
         )
 
 
+class TaskResetTests(RepairTestCase):
+    """``actl task reset`` discards the implementation and the budget."""
+
+    def task_branch_exists(self, task_id="t1") -> bool:
+        return (
+            self.git(
+                "show-ref", "--verify", "refs/heads/actl/" + task_id, check=False
+            ).returncode
+            == 0
+        )
+
+    def test_reset_discards_branch_worktree_and_budget(self):
+        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
+        self.make_task()
+        self.assertNotEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(self.task_status(), "NEEDS_HUMAN")
+        self.assertTrue(self.worktree().is_dir())
+        self.assertTrue(self.task_branch_exists())
+        self.assertTrue((self.repo / ".actl" / "base" / "t1").is_file())
+
+        result = self.run_actl("task", "reset", "t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Reset task t1", result.stdout)
+        self.assertEqual(self.task_status(), "PENDING")
+        self.assertFalse(self.worktree().exists())
+        self.assertFalse((self.repo / ".actl" / "attempts" / "t1").exists())
+        self.assertFalse((self.repo / ".actl" / "base" / "t1").exists())
+        self.assertFalse(self.task_branch_exists())
+        # The run branch and the base branch are untouched.
+        self.assertEqual(
+            self.rev("actl/run/r1"), self.base_sha, "the run branch is untouched"
+        )
+        self.assertEqual(self.rev("main"), self.base_sha)
+
+        # A fresh execution starts over from attempt 1 on a new branch.
+        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.approved())
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertIn("Worker attempt 1/3 (provider/model)", result.stdout)
+
+    def test_reset_of_a_staged_task_is_refused(self):
+        self.make_task()
+        self.assertEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(self.task_status(), "STAGED")
+
+        result = self.run_actl("task", "reset", "t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("STAGED", result.stderr)
+        self.assertIn("actl run merge", result.stderr)
+        # Nothing was discarded.
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertTrue(self.worktree().is_dir())
+        self.assertTrue(self.task_branch_exists())
+
+    def test_reset_refuses_while_an_execution_holds_the_lock(self):
+        self.make_task()
+        lock_path = self.repo / ".actl" / "execution.lock"
+        handle = open(lock_path, "a+b")
+        self.addCleanup(handle.close)
+        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        try:
+            result = self.run_actl("task", "reset", "t1")
+        finally:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("already running", result.stderr)
+        self.assertEqual(self.task_status(), "PENDING")
+
+    def test_reset_never_touches_another_task(self):
+        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
+        self.make_task("First")
+        self.assertEqual(
+            self.run_actl("task", "create", "--title", "Second").returncode, 0
+        )
+        self.set_task_status("NEEDS_CHANGES", task_id=2)
+        self.assertNotEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(self.task_status("t1"), "NEEDS_HUMAN")
+        self.assertEqual(self.task_status("t2"), "NEEDS_CHANGES")
+
+        result = self.run_actl("task", "reset", "t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status("t1"), "PENDING")
+        self.assertEqual(self.task_status("t2"), "NEEDS_CHANGES")
+
+
 if __name__ == "__main__":
     unittest.main()

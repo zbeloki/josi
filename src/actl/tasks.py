@@ -6,7 +6,8 @@ Stage 2 keeps the project's tasks in a small SQLite database at
 task is blocked is derived from its dependencies when needed. A task's status
 is PENDING, RUNNING, IMPLEMENTED, FAILED, APPROVED, NEEDS_CHANGES,
 NEEDS_HUMAN, STAGED, or DONE; only ``actl task run`` moves a task between
-them.
+them, except that the explicit ``actl task reset`` intervention returns a
+task to PENDING.
 
 Stage 7 groups executions into runs: a run row records the run branch, its
 status (RUNNING while executing, COMPLETE once every selected task was staged,
@@ -686,6 +687,31 @@ def stage_task(conn, task_id: int, run_id: int, commit: str) -> Task:
         )
         if cursor.rowcount == 0:
             raise TaskError("run r" + str(run_id) + " does not exist")
+    return get_task(conn, task_id)
+
+
+def reset_task(conn, task_id: int) -> Task:
+    """Reset a task's stored state for a fresh execution and return it.
+
+    The task's status returns to PENDING, its run association is cleared, and
+    its stored reviews are deleted, so no stale approval can be staged and the
+    task behaves like a newly created one. Dependencies, title, description,
+    and timestamps are preserved.
+
+    The worker attempt budget (``.actl/attempts/tN``) and the task branch and
+    worktree are owned by :mod:`actl.execution` and are cleared by the caller;
+    this function only touches the database.
+    """
+    with conn:
+        conn.execute("BEGIN IMMEDIATE")
+        if not _task_exists(conn, task_id):
+            raise TaskError("task t" + str(task_id) + " does not exist")
+        conn.execute(
+            "UPDATE tasks SET status = ?, run_id = NULL, updated_at = ?"
+            " WHERE id = ?",
+            (STATUS_PENDING, _utc_now(), task_id),
+        )
+        conn.execute("DELETE FROM reviews WHERE task_id = ?", (task_id,))
     return get_task(conn, task_id)
 
 

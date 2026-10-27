@@ -17,6 +17,8 @@ from pathlib import Path
 
 from test_actl import MINIMAL_PATH, ActlTestCase
 
+from actl import tasks
+
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
 class TaskTestCase(ActlTestCase):
@@ -385,6 +387,101 @@ class TaskDependencyTests(TaskTestCase):
         finally:
             conn.close()
         self.assertEqual(len(edges), 1, edges)
+
+
+@unittest.skipUnless(shutil.which("git"), "git is required")
+class TaskResetTests(TaskTestCase):
+    """``actl task reset`` clears the attempt budget and the stored state."""
+
+    def attempts_path(self, task_id="t1") -> Path:
+        return self.repo / ".actl" / "attempts" / task_id
+
+    def set_status(self, status, task_id=1):
+        conn = tasks.connect(self.task_db())
+        try:
+            tasks.set_task_status(conn, task_id, status)
+        finally:
+            conn.close()
+
+    def record_review(self, task_id=1):
+        conn = tasks.connect(self.task_db())
+        try:
+            tasks.record_review(
+                conn, task_id, "0" * 40, "changes_requested",
+                [{"severity": "major", "description": "Broken."}],
+            )
+        finally:
+            conn.close()
+
+    def review_count(self) -> int:
+        conn = sqlite3.connect(str(self.task_db()))
+        try:
+            return conn.execute("SELECT COUNT(*) FROM reviews").fetchone()[0]
+        finally:
+            conn.close()
+
+    def test_reset_returns_the_task_to_pending_and_clears_the_budget(self):
+        self.make_tasks("Add the feature")
+        self.set_status("NEEDS_HUMAN")
+        self.attempts_path().parent.mkdir(parents=True, exist_ok=True)
+        self.attempts_path().write_text(
+            '{"attempts": 3, "feedback": "still broken"}', encoding="utf-8"
+        )
+        self.record_review()
+
+        result = self.run_actl("task", "reset", "t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Reset task t1", result.stdout)
+
+        shown = self.show("t1")
+        self.assertIn("status: PENDING", shown.stdout)
+        self.assertIn("title: Add the feature", shown.stdout)
+        self.assertFalse(self.attempts_path().exists())
+        self.assertEqual(self.review_count(), 0)
+
+    def test_reset_preserves_title_description_and_dependencies(self):
+        self.make_tasks("First", "Second")
+        self.run_actl(
+            "task", "update", "t2", "--description", "Body", "--depends-on", "t1"
+        )
+        self.set_status("FAILED", task_id=2)
+        result = self.run_actl("task", "reset", "t2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        shown = self.show("t2").stdout
+        self.assertIn("title: Second", shown)
+        self.assertIn("description:\nBody", shown)
+        self.assertIn("depends_on: t1", shown)
+        self.assertIn("status: PENDING", shown)
+
+    def test_reset_is_idempotent(self):
+        self.make_tasks("One")
+        self.assertEqual(self.run_actl("task", "reset", "t1").returncode, 0)
+        second = self.run_actl("task", "reset", "1")
+        self.assertEqual(second.returncode, 0, second.stderr)
+        self.assertIn("Reset task t1", second.stdout)
+        self.assertIn("status: PENDING", self.show("t1").stdout)
+
+    def test_reset_requires_an_existing_task(self):
+        result = self.run_actl("task", "reset", "t5")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("task t5 does not exist", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_reset_rejects_invalid_ids(self):
+        for value in ("0", "t0", "banana", "1.5"):
+            with self.subTest(value=value):
+                result = self.run_actl("task", "reset", value)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("invalid task id", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+
+    def test_reset_requires_an_initialized_project(self):
+        other = self.base / "other"
+        other.mkdir()
+        subprocess.run(["git", "init", "-q", str(other)], check=True, capture_output=True)
+        result = self.run_actl("task", "reset", "t1", cwd=other)
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("actl init", result.stderr)
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")

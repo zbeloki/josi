@@ -123,6 +123,21 @@ class PlannerRulesTests(ActlTestCase):
             with self.subTest(command=command):
                 self.assertEqual(self.ruleset.effect("shell", command), "deny")
 
+    def test_actl_task_reset_is_denied(self):
+        # Resetting discards a task's budget, branch, and worktree: an
+        # execution-state intervention the planner must never make.
+        commands = [
+            "actl task reset t1",
+            "actl task reset 3",
+            "actl task reset t1 --force",
+            # Extra whitespace must not turn it into a management command.
+            "actl task  reset t1",
+            "actl task   reset t1",
+        ]
+        for command in commands:
+            with self.subTest(command=command):
+                self.assertEqual(self.ruleset.effect("shell", command), "deny")
+
     def test_actl_run_is_denied(self):
         commands = [
             "actl run list",

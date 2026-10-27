@@ -12,6 +12,10 @@ Stage 2 commands:
 * ``actl task create|list|show|update|delete`` - manage the project's tasks
   in a local SQLite database. They are noninteractive and never touch
   OpenCode.
+* ``actl task reset`` - discard a task's attempt budget, state, branch, and
+  worktree so it can be executed again from scratch. It is an explicit
+  execution-state intervention, not a planning command: it takes the
+  execution lock and is denied to the planner.
 
 Stage 3:
 
@@ -109,10 +113,10 @@ PLANNER_AGENT_PATH = Path(".opencode") / "agents" / (PLANNER_AGENT_NAME + ".md")
 # Model settings written by ``actl init`` when the matching argument is
 # omitted and the project does not configure one yet. Explicit arguments
 # always win, and a re-init preserves values already stored.
-DEFAULT_WORKER_MODEL = "openrouter/z-ai/glm-5.3-flash"
-DEFAULT_REVIEWER_MODEL = "openrouter/openai/gpt-6-luna#medium"
-DEFAULT_ESCALATION_WORKER_MODEL = "openrouter/deepseek/deepseek-v4.1-flash#high"
-DEFAULT_TEST_WRITER_MODEL = "openrouter/deepseek/deepseek-v4.1-flash#low"
+DEFAULT_WORKER_MODEL = "openrouter/deepseek/deepseek-v4.1-flash#low"
+DEFAULT_ESCALATION_WORKER_MODEL = "openrouter/anthropic/claude-sonnet-5.5#medium"
+DEFAULT_REVIEWER_MODEL = "openrouter/openai/gpt-6-luna#high"
+DEFAULT_TEST_WRITER_MODEL = "openrouter/z-ai/glm-5.3#high"
 
 # OpenCode loads this file as a custom agent: the frontmatter declares a
 # primary agent that can read and explore the project and manage its tasks,
@@ -133,7 +137,9 @@ DEFAULT_TEST_WRITER_MODEL = "openrouter/deepseek/deepseek-v4.1-flash#low"
 # .actl/tasks.db. A broad "actl task *" deny comes before those allows (last
 # match wins), and the management allows re-enable only the documented forms;
 # "actl task run" - including whitespace variants such as "actl task  run" -
-# stays denied, so the planner can never launch a worker. "actl run *" is
+# stays denied, so the planner can never launch a worker. "actl task reset"
+# stays denied too: it discards a task's branch and worktree, which is an
+# execution-state intervention, not planning. "actl run *" is
 # denied outright: integrating a run into the base branch is the user's
 # decision, never the planner's. The "*>*" deny must
 # come after the management allows (last match wins): OpenCode reports a
@@ -227,6 +233,8 @@ actionable plan.
 - Do not execute implementation tasks or integrate runs. `actl task run` and
   `actl run` are denied: task execution and run integration are the user's
   decision, not yours.
+- Do not reset tasks. `actl task reset` is denied: discarding a task's
+  attempt budget, branch, and worktree is the user's decision, not yours.
 
 ## Managing tasks with actl
 
@@ -247,6 +255,9 @@ print plain text:
   `--clear-dependencies` removes it.
 - `actl task delete tN` deletes a task; it fails while other tasks depend
   on it.
+- `actl task reset tN` is denied to you: it discards a task's attempt
+  budget, status, branch, and worktree so the user can execute it from
+  scratch. Only the user resets tasks.
 
 Ids are printed as `t1`, `t2`, ... and commands also accept the bare number
 (`1`). `--depends-on` may be repeated or comma-separated; a dependency must
@@ -280,7 +291,9 @@ command words. Every other shell command asks for
 confirmation, and each command in a compound call is checked separately - run
 one command per shell call instead of chaining them with && or echo
 separators. `actl task run` and `actl run` are denied outright: never execute
-tasks, launch coding workers, or integrate a run into the base branch. Shell
+tasks, launch coding workers, or integrate a run into the base branch. `actl
+task reset` is denied as well: never discard a task's attempt budget, branch,
+or worktree. Shell
 redirection is denied outright: never redirect command
 output to a file, and avoid the `>` character in inline task text (for
 example, write "to" instead of an arrow).
@@ -1007,6 +1020,57 @@ def cmd_task_delete(args) -> int:
     except (ProjectError, tasks.TaskError, sqlite3.Error) as exc:
         return _fail(str(exc))
     print("Deleted task t" + str(task_id))
+    return 0
+
+
+def cmd_task_reset(args) -> int:
+    """Reset a task's attempt budget and stored state for a fresh execution."""
+    try:
+        task_id = _parse_task_id(args.id)
+        root = _project_root()
+        actl_dir = root / PROJECT_DIR
+    except (ProjectError, tasks.TaskError) as exc:
+        return _fail(str(exc))
+    try:
+        # The reset discards the task's branch and worktree, so it must not
+        # race a running execution: the project-wide lock is taken for the
+        # whole operation and an active execution is refused immediately.
+        with execution.lock(actl_dir):
+            return _reset_task(root, actl_dir, task_id)
+    except (
+        ProjectError, tasks.TaskError, sqlite3.Error, execution.ExecutionError,
+    ) as exc:
+        return _fail(str(exc))
+
+
+def _reset_task(root: Path, actl_dir: Path, task_id: int) -> int:
+    """Clear a task's budget and state while the execution lock is held.
+
+    A STAGED task is refused: its approved commit is already part of a run
+    branch that cannot be rewritten, so the run must be integrated first.
+    """
+    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    try:
+        task = tasks.get_task(conn, task_id)
+        if task.status == tasks.STATUS_STAGED:
+            run = "r" + str(task.run_id) if task.run_id is not None else "a run"
+            raise tasks.TaskError(
+                "cannot reset task t" + str(task_id) + ": it is STAGED in "
+                + run + " and its approved commit is already part of that run"
+                " branch; integrate the run with 'actl run merge "
+                + (run if task.run_id is not None else "rN") + "' first"
+            )
+        # Discard the implementation first: the database state is only reset
+        # once the branch and worktree are really gone, so a failure here
+        # leaves the task in its previous, still-recognizable state.
+        execution.clear_attempt_state(actl_dir, task_id)
+        execution.reset_task_worktree(root, actl_dir, task_id)
+        tasks.reset_task(conn, task_id)
+    finally:
+        conn.close()
+    print(
+        "Reset task t" + str(task_id) + " to PENDING with a fresh attempt budget"
+    )
     return 0
 
 
@@ -3242,26 +3306,26 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--worker-model", metavar="MODEL",
         help="set the project's worker model (provider/model[#variant]);"
-             " default openrouter/z-ai/glm-5.3-flash; required by"
+             " default " + DEFAULT_WORKER_MODEL + "; required by"
              " 'actl task run' whenever the worker runs",
     )
     init.add_argument(
         "--reviewer-model", metavar="MODEL",
         help="set the project's reviewer model (provider/model[#variant]);"
-             " default openrouter/openai/gpt-6-luna#medium; required by"
+             " default " + DEFAULT_REVIEWER_MODEL + "; required by"
              " 'actl task run'",
     )
     init.add_argument(
         "--escalation-worker-model", metavar="MODEL",
         help="set the model for the third and final worker attempt of a"
-             " repair cycle (provider/model[#variant]); default"
-             " openrouter/deepseek/deepseek-v4.1-flash#high; required by"
+             " repair cycle (provider/model[#variant]); default "
+             "" + DEFAULT_ESCALATION_WORKER_MODEL + "; required by"
              " 'actl task run'",
     )
     init.add_argument(
         "--test-writer-model", metavar="MODEL",
         help="set the project's test-writer model (provider/model[#variant]);"
-             " default openrouter/deepseek/deepseek-v4.1-flash#low; required"
+             " default " + DEFAULT_TEST_WRITER_MODEL + "; required"
              " by 'actl task run'",
     )
     init.add_argument(
@@ -3308,6 +3372,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     delete = task_sub.add_parser("delete", help="delete a task")
     delete.add_argument("id", help="task id (tN or N)")
+
+    reset = task_sub.add_parser(
+        "reset",
+        help="reset a task's attempt budget and state for a fresh execution",
+    )
+    reset.add_argument("id", help="task id (tN or N)")
 
     run = task_sub.add_parser(
         "run",
@@ -3363,6 +3433,7 @@ def main(argv=None) -> int:
             "show": cmd_task_show,
             "update": cmd_task_update,
             "delete": cmd_task_delete,
+            "reset": cmd_task_reset,
             "run": cmd_task_run,
         }
         return handlers[args.task_command](args)

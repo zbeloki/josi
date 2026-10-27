@@ -709,6 +709,63 @@ def record_attempt_state(
         )
 
 
+def clear_attempt_state(actl_dir: Path, task_id: int) -> None:
+    """Delete the task's attempt record, granting a fresh attempt budget.
+
+    Used only by the explicit ``actl task reset`` intervention. A missing
+    record is not an error: the task never spent an attempt.
+    """
+    path = actl_dir / ATTEMPTS_DIR / ("t" + str(task_id))
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ExecutionError(
+            "cannot remove the attempt record " + str(path) + " (" + str(exc) + ")"
+        )
+
+
+def reset_task_worktree(root: Path, actl_dir: Path, task_id: int) -> None:
+    """Discard a task's branch, worktree, and recorded base for a reset.
+
+    ``actl task reset`` is the explicit human intervention that starts a task
+    over: the registered worktree is force-removed (any uncommitted work goes
+    with it), the task branch is deleted, and the recorded branch base is
+    dropped, so the next execution creates a fresh branch from the run branch.
+    Only the task's own worktree and branch are touched - the run branch and
+    every other task are left alone. A task that never ran has neither, and
+    the call is a no-op.
+    """
+    branch = branch_name(task_id)
+    path = actl_dir / WORKTREES_DIR / ("t" + str(task_id))
+    registered = _registered_worktrees(root)
+    key = os.path.realpath(str(path))
+    if key in registered:
+        problem = remove_temporary_worktree(root, path)
+        if problem:
+            raise ExecutionError(
+                "cannot remove the task worktree " + str(path) + " (" + problem + ")"
+            )
+    elif path.exists():
+        raise ExecutionError(
+            str(path) + " exists but is not a registered Git worktree of this"
+            " repository; remove it by hand before resetting the task"
+        )
+    if branch_exists(root, branch):
+        _git(root, "branch", "-D", branch)
+    base = actl_dir / BASE_DIR / ("t" + str(task_id))
+    try:
+        base.unlink()
+    except FileNotFoundError:
+        pass
+    except OSError as exc:
+        raise ExecutionError(
+            "cannot remove the recorded branch base " + str(base)
+            + " (" + str(exc) + ")"
+        )
+
+
 def timestamp() -> str:
     """Return a UTC timestamp usable in file and worktree names."""
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")

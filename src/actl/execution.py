@@ -519,6 +519,26 @@ def testgen_outcome(actl_dir: Path, task_id: int):
     return decision if isinstance(decision, str) else None
 
 
+def clear_testgen_outcome(actl_dir: Path, task_id: int) -> None:
+    """Delete the task's recorded test-generation outcome.
+
+    Used only by the explicit ``actl task reset`` intervention: the record
+    belongs to the branch and worktree the reset discards, so keeping it
+    would make the next execution skip a stage that never ran on the fresh
+    branch. A missing record is not an error.
+    """
+    path = actl_dir / TESTGEN_DIR / ("t" + str(task_id))
+    try:
+        path.unlink()
+    except FileNotFoundError:
+        return
+    except OSError as exc:
+        raise ExecutionError(
+            "cannot remove the test-generation outcome " + str(path)
+            + " (" + str(exc) + ")"
+        )
+
+
 def remove_temporary_worktree(root: Path, path: Path) -> str:
     """Remove a temporary worktree; return an error text or "".
 

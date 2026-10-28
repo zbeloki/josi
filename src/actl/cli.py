@@ -1060,11 +1060,13 @@ def _reset_task(root: Path, actl_dir: Path, task_id: int) -> int:
                 " branch; integrate the run with 'actl run merge "
                 + (run if task.run_id is not None else "rN") + "' first"
             )
-        # Discard the implementation first: the database state is only reset
-        # once the branch and worktree are really gone, so a failure here
-        # leaves the task in its previous, still-recognizable state.
-        execution.clear_attempt_state(actl_dir, task_id)
+        # Discard the implementation first: the worktree cleanup runs before
+        # anything else is thrown away, so when it fails the attempt budget,
+        # the test-generation outcome, and the database state are all left
+        # untouched and the reset can simply be retried.
         execution.reset_task_worktree(root, actl_dir, task_id)
+        execution.clear_attempt_state(actl_dir, task_id)
+        execution.clear_testgen_outcome(actl_dir, task_id)
         tasks.reset_task(conn, task_id)
     finally:
         conn.close()

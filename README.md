@@ -123,16 +123,19 @@ actl task reset t2
   already part of the same run branch). `APPROVED` and `STAGED` in another
   run do not unlock dependents.
 - `actl task reset tN` starts a task over: it clears the task's worker attempt
-  budget (`.actl/attempts/tN`), returns its status to `PENDING`, clears its run
+  budget (`.actl/attempts/tN`), the recorded test-generation outcome
+  (`.actl/testgen/tN`), returns its status to `PENDING`, clears its run
   association, deletes its stored reviews, and discards its task branch and
   worktree (including any uncommitted work), so the next execution creates a
-  fresh branch from the run branch like a new task. Dependencies, title, and
-  description are preserved. It is an explicit human intervention - not a
-  planning command - so it takes the project-wide execution lock and refuses
-  while an execution is running. A `STAGED` task cannot be reset: its approved
-  commit is already part of a run branch and cannot be rewritten, so integrate
-  the run with `actl run merge` first. To grant a fresh budget while keeping
-  the existing commits, remove `.actl/attempts/tN` by hand instead.
+  fresh branch from the run branch like a new task and runs test generation
+  again. Dependencies, title, and description are preserved. The worktree is
+  removed before any state is discarded, so a failed cleanup leaves the task
+  untouched and the reset can be retried. It is an explicit human intervention
+  - not a planning command - so it takes the project-wide execution lock and
+  refuses while an execution is running. A `STAGED` task cannot be reset: its
+  approved commit is already part of a run branch and cannot be rewritten, so
+  integrate the run with `actl run merge` first. To grant a fresh budget while
+  keeping the existing commits, remove `.actl/attempts/tN` by hand instead.
 - The database is created automatically when needed, including for projects
   initialized by Stage 1. Repeated `actl init` runs and task commands never
   reset existing tasks.
@@ -803,8 +806,9 @@ task ends `NEEDS_HUMAN`; re-running it is refused until a human intervenes.
 Deleting `.actl/attempts/t1` is the explicit intervention that grants a fresh
 three-attempt budget, and the preserved branch and worktree are reused.
 `actl task reset t1` is the stronger, command-line form of that intervention:
-it also returns the task to `PENDING` and discards its branch, worktree, and
-stored reviews, so the task starts over from scratch instead of continuing on
+it also returns the task to `PENDING` and discards its branch, worktree, stored
+reviews, and recorded test-generation outcome, so the task starts over from
+scratch - including a fresh test-generation stage - instead of continuing on
 the existing commits.
 
 ## Validation and review

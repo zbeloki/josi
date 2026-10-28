@@ -93,13 +93,13 @@ def format_retry_prompt() -> str:
     )
 
 
-def outcome_from_output(output: str) -> str:
+def outcome_from_output(output: str, final_text=None) -> str:
     """Extract the test writer's decision from its ``--format json`` output.
 
     ``output`` is the complete stdout/stderr of the turn: JSONL events with
     any non-JSON stderr lines mixed in.
     """
-    text = _final_text(output)
+    text = (final_text or _final_text)(output)
     if not text.strip():
         raise TestGenError("the test writer produced no text output")
     return parse_outcome(text)

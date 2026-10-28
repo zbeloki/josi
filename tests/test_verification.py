@@ -19,6 +19,7 @@ import unittest
 from pathlib import Path
 
 from test_runs import TaskRunTestCase
+from test_actl import model_setting
 
 from actl import tasks
 
@@ -899,16 +900,16 @@ class Stage5IntegrationTests(VerificationTestCase):
 
     def test_reviewer_model_is_stored_and_validated(self):
         metadata = self.metadata()
-        self.assertEqual(metadata["reviewer_model"], "reviewer/model")
+        self.assertEqual(model_setting(metadata["reviewer_model"]), "reviewer/model")
 
         result = self.run_actl("init", "--reviewer-model", "provider/other")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Updated the reviewer model", result.stdout)
-        self.assertEqual(self.metadata()["reviewer_model"], "provider/other")
+        self.assertEqual(model_setting(self.metadata()["reviewer_model"]), "provider/other")
 
         # A plain init keeps the reviewer model.
         self.assertEqual(self.run_actl("init").returncode, 0)
-        self.assertEqual(self.metadata()["reviewer_model"], "provider/other")
+        self.assertEqual(model_setting(self.metadata()["reviewer_model"]), "provider/other")
 
         for value in ("", "model", "provider/", "/model", "two words/model"):
             with self.subTest(value=value):
@@ -1067,20 +1068,20 @@ class TestWriterModelConfigTests(VerificationTestCase):
         # init already stored the default during setUp; an explicit override
         # updates only this setting.
         self.assertEqual(
-            self.metadata()["test_writer_model"],
+            model_setting(self.metadata()["test_writer_model"]),
             "openrouter/z-ai/glm-5.3#high",
         )
         result = self.run_actl("init", "--test-writer-model", "provider/writer")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Updated the test writer model", result.stdout)
-        self.assertEqual(self.metadata()["test_writer_model"], "provider/writer")
+        self.assertEqual(model_setting(self.metadata()["test_writer_model"]), "provider/writer")
         # The other model settings are untouched.
-        self.assertEqual(self.metadata()["worker_model"], "provider/model")
-        self.assertEqual(self.metadata()["reviewer_model"], "reviewer/model")
+        self.assertEqual(model_setting(self.metadata()["worker_model"]), "provider/model")
+        self.assertEqual(model_setting(self.metadata()["reviewer_model"]), "reviewer/model")
 
         # A plain init never removes the configured test-writer model.
         self.assertEqual(self.run_actl("init").returncode, 0)
-        self.assertEqual(self.metadata()["test_writer_model"], "provider/writer")
+        self.assertEqual(model_setting(self.metadata()["test_writer_model"]), "provider/writer")
 
         for value in ("", "model", "provider/", "/model", "two words/model"):
             with self.subTest(value=value):

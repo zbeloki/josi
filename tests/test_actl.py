@@ -475,6 +475,13 @@ if __name__ == "__main__":
 MINIMAL_PATH = "/usr/bin:/bin"
 
 
+def model_setting(value):
+    """Return a stored model (a model/effort pair) as ``name#effort``."""
+    if isinstance(value, dict):
+        return value["model"] + ("#" + value["effort"] if value["effort"] else "")
+    return value
+
+
 class ActlTestCase(unittest.TestCase):
     """Shared fixtures: a temporary directory, a fake opencode, env control."""
 
@@ -622,13 +629,13 @@ class InitTests(ActlTestCase):
 
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertEqual(
-            metadata["worker_model"], "openrouter/deepseek/deepseek-v4.1-flash#low"
+            model_setting(metadata["worker_model"]), "openrouter/deepseek/deepseek-v4.1-flash#low"
         )
         self.assertEqual(
-            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#high"
+            model_setting(metadata["reviewer_model"]), "openrouter/openai/gpt-6-luna#high"
         )
         self.assertEqual(
-            metadata["escalation_worker_model"], "openrouter/anthropic/claude-sonnet-5.5#medium"
+            model_setting(metadata["escalation_worker_model"]), "openrouter/anthropic/claude-sonnet-5.5#medium"
         )
         # The defaults are reported so the user knows what was configured.
         self.assertIn(
@@ -649,12 +656,12 @@ class InitTests(ActlTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
 
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
-        self.assertEqual(metadata["worker_model"], "provider/custom")
+        self.assertEqual(model_setting(metadata["worker_model"]), "provider/custom")
         self.assertEqual(
-            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#high"
+            model_setting(metadata["reviewer_model"]), "openrouter/openai/gpt-6-luna#high"
         )
         self.assertEqual(
-            metadata["escalation_worker_model"], "openrouter/anthropic/claude-sonnet-5.5#medium"
+            model_setting(metadata["escalation_worker_model"]), "openrouter/anthropic/claude-sonnet-5.5#medium"
         )
 
     def test_reinit_preserves_models_and_fills_missing_ones(self):
@@ -688,12 +695,12 @@ class InitTests(ActlTestCase):
             result.stdout,
         )
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
-        self.assertEqual(metadata["worker_model"], "provider/worker")
+        self.assertEqual(model_setting(metadata["worker_model"]), "provider/worker")
         self.assertEqual(
-            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#high"
+            model_setting(metadata["reviewer_model"]), "openrouter/openai/gpt-6-luna#high"
         )
         self.assertEqual(
-            metadata["escalation_worker_model"], "provider/escalation"
+            model_setting(metadata["escalation_worker_model"]), "provider/escalation"
         )
 
     def test_reinit_explicit_model_updates_only_that_role(self):
@@ -703,12 +710,12 @@ class InitTests(ActlTestCase):
         self.assertIn("Updated the reviewer model to provider/other", result.stdout)
 
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
-        self.assertEqual(metadata["reviewer_model"], "provider/other")
+        self.assertEqual(model_setting(metadata["reviewer_model"]), "provider/other")
         self.assertEqual(
-            metadata["worker_model"], "openrouter/deepseek/deepseek-v4.1-flash#low"
+            model_setting(metadata["worker_model"]), "openrouter/deepseek/deepseek-v4.1-flash#low"
         )
         self.assertEqual(
-            metadata["escalation_worker_model"], "openrouter/anthropic/claude-sonnet-5.5#medium"
+            model_setting(metadata["escalation_worker_model"]), "openrouter/anthropic/claude-sonnet-5.5#medium"
         )
 
     def test_init_stores_default_test_writer_model(self):
@@ -718,7 +725,7 @@ class InitTests(ActlTestCase):
 
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertEqual(
-            metadata["test_writer_model"],
+            model_setting(metadata["test_writer_model"]),
             "openrouter/z-ai/glm-5.3#high",
         )
         self.assertIn(
@@ -742,7 +749,7 @@ class InitTests(ActlTestCase):
         )
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertEqual(
-            metadata["test_writer_model"],
+            model_setting(metadata["test_writer_model"]),
             "openrouter/z-ai/glm-5.3#high",
         )
 
@@ -753,12 +760,12 @@ class InitTests(ActlTestCase):
         self.assertIn("Updated the test writer model to provider/tests", result.stdout)
 
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
-        self.assertEqual(metadata["test_writer_model"], "provider/tests")
+        self.assertEqual(model_setting(metadata["test_writer_model"]), "provider/tests")
         self.assertEqual(
-            metadata["worker_model"], "openrouter/deepseek/deepseek-v4.1-flash#low"
+            model_setting(metadata["worker_model"]), "openrouter/deepseek/deepseek-v4.1-flash#low"
         )
         self.assertEqual(
-            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#high"
+            model_setting(metadata["reviewer_model"]), "openrouter/openai/gpt-6-luna#high"
         )
 
     def test_init_invalid_test_writer_model_is_rejected(self):
@@ -788,6 +795,7 @@ class InitTests(ActlTestCase):
             set(metadata),
             {
                 "schema_version", "name", "created_at", "base_branch",
+                "agent",
                 "worker_model", "reviewer_model", "escalation_worker_model",
                 "test_writer_model",
             },
@@ -912,7 +920,7 @@ class PlanTests(ActlTestCase):
         self.assertEqual(tuis[0]["cwd"], str(self.repo))
         self.assertEqual(argv[argv.index("--session") + 1], "ses_faketest0000000000000001")
         self.assertNotIn("--prompt", argv, "no initial user message may be sent")
-        self.assertEqual(self.planner_session_id(), "ses_faketest0000000000000001")
+        self.assertFalse(self.planner_path().exists(), "no session state is stored")
         self.assertEqual(self.switch_calls(), [], "fresh sessions already use the planner agent")
 
     def test_plan_installs_read_only_planner_agent(self):
@@ -1042,64 +1050,51 @@ class PlanTests(ActlTestCase):
         self.assertNotIn("git status", content, "stale pre-approvals must be removed")
         self.assertEqual(content, PLANNER_AGENT_DOC)
 
-    def test_resumes_existing_session(self):
+    def test_every_plan_run_starts_a_fresh_session(self):
         self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000002"
         self.assertEqual(self.run_actl("plan").returncode, 0)
-
+        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000003"
         result = self.run_actl("plan")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Resuming planner session", result.stdout)
+        self.assertIn("Started planner session", result.stdout)
+        self.assertNotIn("Resuming", result.stdout)
 
-        self.assertEqual(len(self.create_calls()), 1, "no new session may be created")
-        tuis = self.tui_calls()
-        self.assertEqual(len(tuis), 2)
-        argv = tuis[1]["argv"]
-        self.assertEqual(argv[argv.index("--session") + 1], "ses_faketest0000000000000002")
-        self.assertNotIn("--prompt", argv, "resumed sessions must not be prompted")
+        creates = self.create_calls()
+        self.assertEqual(len(creates), 2, "every run creates a session")
+        self.assertFalse(any(
+            c["argv"][:2] == ["api", "GET"] for c in self.calls()
+        ), "no earlier session is ever looked up")
+        argv = self.tui_calls()[1]["argv"]
         self.assertEqual(
-            self.switch_calls(), [], "sessions already using the planner agent are left alone"
+            argv[argv.index("--session") + 1], "ses_faketest0000000000000003"
         )
+        self.assertFalse(self.planner_path().exists())
+        # previous sessions are preserved: nothing is ever deleted
+        self.assertFalse(any("delete" in c["argv"] for c in self.calls()))
+
+    def test_plan_no_longer_accepts_new(self):
+        result = self.run_actl("plan", "--new")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.calls(), [])
 
     def test_plan_never_sends_an_initial_prompt(self):
         self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000011"
         self.assertEqual(self.run_actl("plan").returncode, 0)
         self.assertEqual(self.run_actl("plan").returncode, 0)
         self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000012"
-        self.assertEqual(self.run_actl("plan", "--new").returncode, 0)
+        self.assertEqual(self.run_actl("plan").returncode, 0)
         self.assertEqual(len(self.tui_calls()), 3)
         for call in self.tui_calls():
             self.assertNotIn("--prompt", call["argv"])
 
-    def test_plan_switches_legacy_session_agent(self):
-        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000010"
-        self.assertEqual(self.run_actl("plan").returncode, 0)
-
-        self.env["ACTL_FAKE_GET_AGENT"] = "build"  # session created before agents existed
-        result = self.run_actl("plan")
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-        switches = self.switch_calls()
-        self.assertEqual(len(switches), 1)
-        argv = switches[0]["argv"]
-        self.assertEqual(argv[2], "/api/session/ses_faketest0000000000000010/agent")
-        self.assertEqual(json.loads(argv[argv.index("--data") + 1]), {"agent": PLANNER_AGENT_NAME})
-
-        calls = self.calls()
-        switch_positions = [i for i, c in enumerate(calls) if c in switches]
-        tui_positions = [i for i, c in enumerate(calls) if c["argv"][0] != "api"]
-        self.assertEqual(len(tui_positions), 2)
-        self.assertLess(switch_positions[0], tui_positions[1], "switch before launch")
-
     def test_plan_reports_agent_switch_failure(self):
         self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000013"
-        self.assertEqual(self.run_actl("plan").returncode, 0)
-
-        self.env["ACTL_FAKE_GET_AGENT"] = "build"
+        self.env["ACTL_FAKE_CREATE_AGENT"] = "build"
         self.env["ACTL_FAKE_SWITCH_EXIT"] = "1"
         result = self.run_actl("plan")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cannot select the planner agent", result.stderr)
-        self.assertEqual(len(self.tui_calls()), 1, "OpenCode must not be launched")
+        self.assertEqual(self.tui_calls(), [], "OpenCode must not be launched")
 
     def test_plan_agent_install_failure_is_reported(self):
         self.agent_path().mkdir(parents=True)  # a directory cannot be overwritten
@@ -1107,27 +1102,6 @@ class PlanTests(ActlTestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("could not write the planner agent", result.stderr)
         self.assertEqual(self.tui_calls(), [])
-
-    def test_plan_new_starts_a_separate_session(self):
-        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000003"
-        self.assertEqual(self.run_actl("plan").returncode, 0)
-        first_id = self.planner_session_id()
-
-        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000004"
-        result = self.run_actl("plan", "--new")
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-        second_id = self.planner_session_id()
-        self.assertEqual(second_id, "ses_faketest0000000000000004")
-        self.assertNotEqual(first_id, second_id)
-        self.assertEqual(len(self.create_calls()), 2)
-        self.assertEqual(self.create_body(self.create_calls()[1])["agent"], PLANNER_AGENT_NAME)
-
-        argv = self.tui_calls()[-1]["argv"]
-        self.assertEqual(argv[argv.index("--session") + 1], second_id)
-        self.assertNotIn("--prompt", argv)
-        # previous sessions are preserved: nothing is ever deleted
-        self.assertFalse(any("delete" in c["argv"] for c in self.calls()))
 
     def test_plan_from_subdirectory_uses_project_root(self):
         sub = self.repo / "src" / "nested"
@@ -1224,61 +1198,6 @@ class PlanTests(ActlTestCase):
         result = self.run_actl("plan")
         self.assertEqual(result.returncode, 7)
         self.assertIn("exited with status 7", result.stderr)
-        # the session exists, so a later run can resume it
-        self.assertEqual(self.planner_session_id(), "ses_faketest0000000000000005")
-
-    def test_plan_refuses_unverifiable_session(self):
-        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000006"
-        self.assertEqual(self.run_actl("plan").returncode, 0)
-        self.assertEqual(len(self.tui_calls()), 1)
-
-        self.env["ACTL_FAKE_GET_EXIT"] = "1"
-        result = self.run_actl("plan")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("cannot verify planner session", result.stderr)
-        self.assertIn("--new", result.stderr)
-        self.assertEqual(len(self.tui_calls()), 1, "OpenCode must not be launched")
-
-    def test_plan_refuses_session_from_another_directory(self):
-        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000007"
-        self.assertEqual(self.run_actl("plan").returncode, 0)
-
-        self.env["ACTL_FAKE_GET_DIR"] = str(self.base / "elsewhere")
-        result = self.run_actl("plan")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("belongs to", result.stderr)
-        self.assertEqual(len(self.tui_calls()), 1, "OpenCode must not be launched")
-
-    def test_plan_with_corrupt_planner_state(self):
-        self.planner_path().write_text("{not json", encoding="utf-8")
-        result = self.run_actl("plan")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("--new", result.stderr)
-        self.assertEqual(self.tui_calls(), [])
-
-    def test_plan_with_undecodable_planner_state(self):
-        self.planner_path().write_bytes(b"\xff\xfe")
-        result = self.run_actl("plan")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("cannot resume the planner session", result.stderr)
-        self.assertIn("--new", result.stderr)
-        self.assertNotIn("Traceback", result.stderr)
-        self.assertEqual(self.tui_calls(), [])
-
-    def test_plan_new_ignores_undecodable_state(self):
-        self.planner_path().write_bytes(b"\xff\xfe")
-        result = self.run_actl("plan", "--new")
-        self.assertEqual(result.returncode, 0, result.stderr)
-
-    def test_plan_reports_state_write_failure(self):
-        self.planner_path().mkdir()
-        result = self.run_actl("plan", "--new")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("could not save the planner session state", result.stderr)
-        self.assertNotIn("Traceback", result.stderr)
-        self.assertEqual(
-            self.tui_calls(), [], "the TUI must not launch without a saved session"
-        )
 
     def test_plan_rejects_malformed_session_location(self):
         self.env["ACTL_FAKE_CREATE_LOCATION"] = json.dumps({"directory": ["bad"]})
@@ -1301,7 +1220,6 @@ class PlanTests(ActlTestCase):
         self.assertEqual(
             json.loads(argv[argv.index("--data") + 1]), {"agent": PLANNER_AGENT_NAME}
         )
-        self.assertEqual(self.planner_session_id(), "ses_faketest0000000000000014")
         self.assertEqual(len(self.tui_calls()), 1)
 
 
@@ -1335,6 +1253,7 @@ class PlanGuardTests(ActlTestCase):
             json.dumps({"schema_version": 1, "name": 42}),
             json.dumps({"schema_version": 1, "name": "repo", "base_branch": 42}),
             json.dumps({"schema_version": 1, "name": "repo", "base_branch": "  "}),
+            json.dumps({"schema_version": 1, "name": "repo", "agent": "codex"}),
         ]
         for payload in payloads:
             with self.subTest(payload=payload):

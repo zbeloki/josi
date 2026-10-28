@@ -1,7 +1,8 @@
 # actl
 
 A lightweight Python CLI for orchestrating AI coding agents through
-[OpenCode](https://opencode.ai). Stage 1 covers project setup and planning;
+[OpenCode](https://opencode.ai) or [Claude Code](https://claude.com/claude-code)
+(a per-project choice, see "Agent backends"). Stage 1 covers project setup and planning;
 Stage 2 adds a project-local task list; Stage 3 lets the planner manage that
 task list through the same `actl task` CLI; Stage 4 runs one task at a time
 with a noninteractive OpenCode worker in an isolated Git worktree; Stage 5
@@ -17,7 +18,9 @@ configured base branch and marks its tasks `DONE`.
 
 - Python 3.9+
 - Git
-- The OpenCode CLI (v2) on `PATH` (tested with OpenCode 2.1.2)
+- The CLI of the project's agent on `PATH`: OpenCode (v2, tested with OpenCode
+  2.1.2) for the default `opencode` agent, or Claude Code (`claude`) for the
+  `claude` agent
 
 ## Install
 
@@ -32,8 +35,7 @@ PYTHONPATH=src python -m actl --help
 ```sh
 cd your-project
 actl init                   # register the Git repository as an actl project
-actl plan                   # start (or resume) the planner; it can manage tasks
-actl plan --new             # start a fresh planner session
+actl plan                   # start a fresh planner session; it can manage tasks
 actl task list              # list the project's tasks
 actl task run t1            # run a task: tests, worker, review, staging
 actl task run t1 t2 t3      # run tasks sequentially in the given order
@@ -76,10 +78,60 @@ actl run merge r1           # integrate a completed run into the base branch
   except the `actl task` management commands, which are pre-approved
   (`actl task run` stays denied). Model selection stays interactive inside
   OpenCode: actl never passes `--model`.
-- Each project keeps **one active planner session**. The session ID (generated
-  by OpenCode) is stored in `.actl/planner.json`. Subsequent `actl plan` runs
-  resume that session; `actl plan --new` creates a new one and makes it active,
-  leaving earlier OpenCode sessions untouched.
+- **Every `actl plan` run starts a fresh planner session**; actl stores no
+  planner session ID and never resumes one. Earlier sessions stay available
+  inside the agent CLI.
+
+## Agent backends
+
+A project runs on one agent CLI, stored as `agent` in `.actl/project.json`:
+`opencode` (the default, also assumed for projects created before the setting
+existed) or `claude`. Every role - planner, worker, reviewer, escalation
+worker, and test writer - uses it.
+
+```sh
+actl init                      # OpenCode (default)
+actl init --agent claude       # Claude Code
+```
+
+Model settings are `(model, effort)` pairs, stored as
+`{"model": "sonnet", "effort": "low"}` and given on the command line as
+`name#effort` (the effort is optional). For OpenCode actl joins the pair back
+into `provider/model#variant`; for Claude Code it passes `--model name` and
+`--effort effort` (`low`, `medium`, `high`, `xhigh`, `max`). Each agent has
+its own defaults:
+
+| setting | `opencode` | `claude` |
+| --- | --- | --- |
+| worker | `openrouter/deepseek/deepseek-v4.1-flash#low` | `sonnet#low` |
+| reviewer | `openrouter/openai/gpt-6-luna#high` | `opus#medium` |
+| escalation worker | `openrouter/anthropic/claude-sonnet-5.5#medium` | `opus#medium` |
+| test writer | `openrouter/z-ai/glm-5.3#high` | `sonnet#medium` |
+
+`actl init --agent` on an existing project switches its agent and resets all
+four model settings to the new agent's defaults (models named in the same
+command are kept). Re-running `actl init` without `--agent` keeps the stored
+agent and models. Older projects that store models as `name#effort` strings
+keep working unchanged.
+
+With `claude`:
+
+- `actl plan` runs interactive `claude` from the project root with the planner
+  instructions appended to its system prompt. Editing, web access, subagents,
+  and MCP servers are disallowed, `actl task create|list|show|update|delete`
+  are pre-approved, and `actl task run`, `actl task reset`, and `actl run` are
+  disallowed. This is best-effort: Claude Code matches shell permissions by
+  command prefix. Model selection stays interactive.
+- Workers, the test writer, and the reviewer run as `claude -p` with the
+  prompt on stdin and `--permission-mode bypassPermissions`; the isolated task
+  worktree is the boundary. The reviewer additionally disallows the editing
+  and web tools. Each turn's answer, tokens, and cost come from the final
+  `result` event of `--output-format stream-json`.
+- Usage is recorded best-effort from that event: token counts and the cost
+  Claude Code reports. The input/output cost split is not reported, so Claude
+  totals are shown as `incomplete`.
+- A session is a UUID chosen by actl; a format retry resumes it with
+  `--resume`.
 
 ## Tasks
 
@@ -484,11 +536,12 @@ The worker model is project-level configuration:
 ```sh
 actl init --worker-model openrouter/anthropic/claude-sonnet-latest
 actl init --worker-model provider/model#variant   # with a model variant
+actl init --agent claude --worker-model sonnet#low
 ```
 
-It is stored as `worker_model` in `.actl/project.json` (the file may be
-edited directly as well) and defaults to
-`openrouter/deepseek/deepseek-v4.1-flash#low` when `actl init` runs without
+It is stored as `worker_model` in `.actl/project.json` as a model/effort pair
+(the file may be edited directly as well) and defaults to the agent's worker
+default (see "Agent backends") when `actl init` runs without
 `--worker-model`. `actl task run` requires it whenever the worker
 runs: a task that is not `IMPLEMENTED` fails before the worktree is prepared
 or anything is launched without one, while an `IMPLEMENTED` task is validated
@@ -502,7 +555,7 @@ actl init --escalation-worker-model openrouter/anthropic/claude-opus-latest
 ```
 
 It is stored as `escalation_worker_model` in `.actl/project.json` and defaults
-to `openrouter/anthropic/claude-sonnet-5.5#medium` when `actl init` runs without
+to the agent's escalation default when `actl init` runs without
 `--escalation-worker-model`. It is used
 for the third and final worker attempt of a repair cycle. `actl task run`
 requires it exactly like the reviewer model: without one the run fails before
@@ -518,7 +571,7 @@ actl init --reviewer-model openrouter/anthropic/claude-sonnet-latest
 ```
 
 It is stored as `reviewer_model` in `.actl/project.json` and defaults to
-`openrouter/openai/gpt-6-luna#high` when `actl init` runs without
+the agent's reviewer default when `actl init` runs without
 `--reviewer-model`. `actl task run`
 requires it: without a reviewer model the command fails before taking the
 execution lock, creating a worktree, or changing the task, instead of
@@ -532,7 +585,7 @@ actl init --test-writer-model openrouter/deepseek/deepseek-v4.1-flash#low
 ```
 
 It is stored as `test_writer_model` in `.actl/project.json` and defaults to
-`openrouter/z-ai/glm-5.3#high` when `actl init` runs without
+the agent's test-writer default when `actl init` runs without
 `--test-writer-model`. `actl task run` requires it exactly like the reviewer
 and escalation models: without one the run fails before taking the execution
 lock, creating a worktree, or changing the task.
@@ -986,9 +1039,8 @@ the last matching rule wins, so ordering matters. Shell commands are checked
 one resource per command, with `action: shell` and the parsed command text
 as the resource.
 
-actl binds the planner session to this agent (for `--new` and first runs) and
-re-selects it before resuming, so older sessions created before the agent
-existed are upgraded on the next `actl plan`.
+actl binds every new planner session to this agent. (The Claude Code
+backend does not use this file.)
 
 The agent file is **managed by actl**: if its content differs from the
 definition shipped with the installed actl version (for example after an
@@ -1037,10 +1089,9 @@ actl-launched processes pick it up like any other OpenCode run.
 
 ```
 .actl/
-├── project.json    # schema_version, name, worker_model, reviewer_model,
+├── project.json    # schema_version, name, agent, worker_model, reviewer_model,
 │                   # escalation_worker_model, test_writer_model,
 │                   # validation.commands, base_branch, created_at
-├── planner.json    # active planner session id, created_at
 ├── tasks.db        # SQLite database (tasks, dependencies, reviews,
 │                   # runs, run selections, per-invocation usage)
 ├── execution.lock  # project-wide execution lock (fcntl.flock)
@@ -1143,8 +1194,8 @@ an environment supplied by the caller reaches OpenCode unchanged.
 - Targets OpenCode v2; the `opencode api` surface is still marked experimental
   by OpenCode. If a future OpenCode release changes it, session creation and
   verification will fail with a clear error rather than do the wrong thing.
-- One planner session per project. Replacing it with `--new` simply forgets
-  the old session ID; the old session remains available inside OpenCode.
+- Every `actl plan` starts a fresh planner session; earlier sessions remain
+  available inside the agent CLI.
 - actl must be run from inside the project. It locates the Git repository
   root (even from a subdirectory) and requires `.actl/` there, so a nested
   Git repository is never treated as part of its parent's actl project.

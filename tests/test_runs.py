@@ -23,7 +23,7 @@ import time
 import unittest
 from pathlib import Path
 
-from test_actl import ActlTestCase
+from test_actl import ActlTestCase, model_setting
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
@@ -522,7 +522,7 @@ class WorkerModelTests(TaskRunTestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid worker model", result.stderr)
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
-        self.assertEqual(metadata["worker_model"], "provider/model")
+        self.assertEqual(model_setting(metadata["worker_model"]), "provider/model")
 
     def test_worker_model_is_stored_in_project_metadata(self):
         created_at = json.loads(
@@ -533,7 +533,7 @@ class WorkerModelTests(TaskRunTestCase):
         self.assertIn("Updated the worker model", result.stdout)
 
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
-        self.assertEqual(metadata["worker_model"], "provider/other")
+        self.assertEqual(model_setting(metadata["worker_model"]), "provider/other")
         self.assertEqual(
             metadata["created_at"], created_at, "metadata must be preserved"
         )
@@ -549,7 +549,7 @@ class WorkerModelTests(TaskRunTestCase):
         # A plain init never removes the configured model.
         self.assertEqual(self.run_actl("init").returncode, 0)
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
-        self.assertEqual(metadata["worker_model"], "provider/other")
+        self.assertEqual(model_setting(metadata["worker_model"]), "provider/other")
 
     def test_model_can_be_set_during_the_first_init(self):
         repo = self.base / "fresh"
@@ -564,7 +564,7 @@ class WorkerModelTests(TaskRunTestCase):
         metadata = json.loads(
             (repo / ".actl" / "project.json").read_text(encoding="utf-8")
         )
-        self.assertEqual(metadata["worker_model"], "provider/model")
+        self.assertEqual(model_setting(metadata["worker_model"]), "provider/model")
 
 
 class RunFailureTests(TaskRunTestCase):
@@ -844,7 +844,7 @@ class LegacyProjectTests(TaskRunTestCase):
         self.assertIn("Updated the base branch to main", result.stdout)
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertEqual(metadata["base_branch"], "main")
-        self.assertEqual(metadata["worker_model"], "provider/model")
+        self.assertEqual(model_setting(metadata["worker_model"]), "provider/model")
         self.assertEqual(metadata["name"], "repo")
 
     def test_reinit_keeps_an_existing_base_branch(self):

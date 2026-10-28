@@ -420,15 +420,14 @@ class PlannerTaskWorkflowTests(ActlTestCase):
         # A fresh CLI process reads the persisted state back.
         self.assertIn("title: Two updated", self.planner_command("task", "show", "t2").stdout)
 
-    def test_task_work_does_not_disturb_the_planner_session(self):
-        session_before = self.planner_session_id()
+    def test_plan_after_task_work_starts_a_fresh_session(self):
         self.planner_command("task", "create", "--title", "One")
         self.planner_command("task", "list")
 
         result = self.run_actl("plan")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Resuming planner session", result.stdout)
-        self.assertEqual(self.planner_session_id(), session_before)
+        self.assertIn("Started planner session", result.stdout)
+        self.assertNotIn("Resuming", result.stdout)
         for call in self.tui_calls():
             self.assertNotIn("--prompt", call["argv"])
 

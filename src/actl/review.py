@@ -238,13 +238,13 @@ def parse_verdict(text: str) -> Verdict:
     return verdict
 
 
-def verdict_from_output(output: str) -> Verdict:
+def verdict_from_output(output: str, final_text=None) -> Verdict:
     """Extract the reviewer's final message from its output and parse it.
 
     ``output`` is the complete stdout/stderr of ``opencode run --format json``:
     JSONL events with any non-JSON stderr lines mixed in.
     """
-    text = _final_text(output)
+    text = (final_text or _final_text)(output)
     if not text.strip():
         raise ReviewError("the reviewer produced no text output")
     return parse_verdict(text)

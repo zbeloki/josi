@@ -4,8 +4,9 @@ Stage 1 commands:
 
 * ``actl init`` - register the current Git repository as an actl project and
   record its base branch (``--base``, or detected/selected automatically).
-* ``actl plan`` - start or resume the project's single planner session in the
-  OpenCode TUI. ``actl plan --new`` starts a fresh session.
+* ``actl plan`` - start a fresh planner session in the project's agent CLI
+  (the OpenCode TUI or interactive Claude Code); every run starts a new one.
+* ``actl init --agent opencode|claude`` selects that agent CLI for the project.
 
 Stage 2 commands:
 
@@ -99,26 +100,17 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (
-    __version__, execution, opencode, review, tasks, testgen, usage,
+    __version__, agents, execution, opencode, review, tasks, testgen, usage,
     validation,
 )
 
 PROJECT_DIR = ".actl"
 PROJECT_METADATA = "project.json"
-PLANNER_STATE = "planner.json"
 SCHEMA_VERSION = 1
 GITIGNORE_ENTRY = ".actl/"
 PLANNER_TITLE = "actl planner"
 PLANNER_AGENT_NAME = "actl-planner"
 PLANNER_AGENT_PATH = Path(".opencode") / "agents" / (PLANNER_AGENT_NAME + ".md")
-
-# Model settings written by ``actl init`` when the matching argument is
-# omitted and the project does not configure one yet. Explicit arguments
-# always win, and a re-init preserves values already stored.
-DEFAULT_WORKER_MODEL = "openrouter/deepseek/deepseek-v4.1-flash#low"
-DEFAULT_ESCALATION_WORKER_MODEL = "openrouter/anthropic/claude-sonnet-5.5#medium"
-DEFAULT_REVIEWER_MODEL = "openrouter/openai/gpt-6-luna#high"
-DEFAULT_TEST_WRITER_MODEL = "openrouter/z-ai/glm-5.3#high"
 
 # OpenCode loads this file as a custom agent: the frontmatter declares a
 # primary agent that can read and explore the project and manage its tasks,
@@ -357,6 +349,12 @@ def load_project_metadata(root: Path) -> dict:
         )
     if not isinstance(data.get("name"), str):
         raise MetadataError(str(path) + " is missing a valid 'name'")
+    agent = data.get("agent")
+    if agent is not None and agent not in agents.AGENTS:
+        raise MetadataError(
+            str(path) + " has an invalid 'agent' value " + repr(agent)
+            + " (expected one of " + ", ".join(agents.AGENTS) + ")"
+        )
     base_branch = data.get("base_branch")
     if base_branch is not None and (
         not isinstance(base_branch, str) or not base_branch.strip()
@@ -367,79 +365,72 @@ def load_project_metadata(root: Path) -> dict:
     return data
 
 
-def load_planner_session_id(root: Path):
-    """Return the active planner session id, or None when none was stored yet."""
-    path = root / PROJECT_DIR / PLANNER_STATE
-    if not path.exists():
-        return None
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
-        raise MetadataError(str(path) + " is not readable JSON (" + str(exc) + ")")
-    session_id = data.get("session_id") if isinstance(data, dict) else None
-    if not isinstance(session_id, str) or not session_id.startswith("ses"):
-        raise MetadataError(str(path) + " does not contain a valid 'session_id'")
-    return session_id
-
-
-def save_planner_session_id(root: Path, session_id: str) -> None:
-    path = root / PROJECT_DIR / PLANNER_STATE
-    payload = {"session_id": session_id, "created_at": _utc_now()}
-    try:
-        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    except OSError as exc:
-        raise MetadataError(
-            "could not save the planner session state " + str(path)
-            + " (" + str(exc) + ")"
-        )
-
-
 def _write_metadata(path: Path, metadata: dict) -> None:
     path.write_text(json.dumps(metadata, indent=2) + "\n", encoding="utf-8")
 
 
-def _parse_model(value: str, role: str) -> str:
-    """Validate a ``provider/model`` (optionally ``#variant``) model name."""
-    model = value.strip()
-    provider, _, rest = model.partition("/")
-    if (
-        not provider
-        or not rest
-        or model.startswith("-")
-        or any(char.isspace() for char in model)
-    ):
+def project_agent(metadata: dict) -> str:
+    """Return the agent backend a project uses (OpenCode when unset)."""
+    return metadata.get("agent", agents.DEFAULT_AGENT)
+
+
+def _parse_model(value: str, role: str, agent: str = agents.DEFAULT_AGENT) -> str:
+    """Validate a model setting for ``agent`` and return it as ``name#effort``."""
+    try:
+        return agents.parse_model(agent, value, role)
+    except ValueError as exc:
+        raise ProjectError(str(exc))
+
+
+def _stored_model(setting: str) -> dict:
+    """Return the metadata form of a ``name#effort`` setting: a pair."""
+    name, effort = agents.split_model(setting)
+    return {"model": name, "effort": effort or None}
+
+
+def _stored_setting(value):
+    """Return a stored model value as ``name#effort``, or None if unreadable."""
+    if isinstance(value, str):
+        return value
+    if isinstance(value, dict) and isinstance(value.get("model"), str):
+        effort = value.get("effort")
+        if effort is None or isinstance(effort, str):
+            return agents.join_model(value["model"], effort)
+    return None
+
+
+def _model_setting(metadata: dict, key: str, role: str, flag: str) -> str:
+    """Return a project's model setting as ``name#effort`` or raise.
+
+    Metadata stores a ``{"model", "effort"}`` pair; a plain ``name#effort``
+    string written by older versions is read too.
+    """
+    value = metadata.get(key)
+    if value is None:
         raise ProjectError(
-            "invalid " + role + " model " + repr(value)
-            + " (expected provider/model, optionally provider/model#variant)"
+            "no " + role + " model is configured for this project; run"
+            " 'actl init --" + flag + " MODEL' first"
         )
-    return model
-
-
-def _parse_worker_model(value: str) -> str:
-    return _parse_model(value, "worker")
-
-
-def _parse_reviewer_model(value: str) -> str:
-    return _parse_model(value, "reviewer")
-
-
-def _parse_test_writer_model(value: str) -> str:
-    return _parse_model(value, "test writer")
+    if isinstance(value, dict):
+        name, effort = value.get("model"), value.get("effort")
+        if not isinstance(name, str) or not (
+            effort is None or isinstance(effort, str)
+        ):
+            raise ProjectError(
+                "project metadata has an invalid '" + key + "' value "
+                + repr(value)
+            )
+        value = agents.join_model(name, effort)
+    elif not isinstance(value, str):
+        raise ProjectError(
+            "project metadata has an invalid '" + key + "' value " + repr(value)
+        )
+    return _parse_model(value, role, project_agent(metadata))
 
 
 def _worker_model(metadata: dict) -> str:
     """Return the project's worker model or raise :class:`ProjectError`."""
-    model = metadata.get("worker_model")
-    if model is None:
-        raise ProjectError(
-            "no worker model is configured for this project; run"
-            " 'actl init --worker-model provider/model' first"
-        )
-    if not isinstance(model, str):
-        raise ProjectError(
-            "project metadata has an invalid 'worker_model' value " + repr(model)
-        )
-    return _parse_worker_model(model)
+    return _model_setting(metadata, "worker_model", "worker", "worker-model")
 
 
 def _reviewer_model(metadata: dict) -> str:
@@ -449,17 +440,7 @@ def _reviewer_model(metadata: dict) -> str:
     the command refuses before launching anything instead of silently
     skipping the independent review.
     """
-    model = metadata.get("reviewer_model")
-    if model is None:
-        raise ProjectError(
-            "no reviewer model is configured for this project; run"
-            " 'actl init --reviewer-model provider/model' first"
-        )
-    if not isinstance(model, str):
-        raise ProjectError(
-            "project metadata has an invalid 'reviewer_model' value " + repr(model)
-        )
-    return _parse_reviewer_model(model)
+    return _model_setting(metadata, "reviewer_model", "reviewer", "reviewer-model")
 
 
 def _escalation_worker_model(metadata: dict) -> str:
@@ -472,18 +453,10 @@ def _escalation_worker_model(metadata: dict) -> str:
     final attempt is due. Without it the run refuses before any lock,
     worktree, or task change.
     """
-    model = metadata.get("escalation_worker_model")
-    if model is None:
-        raise ProjectError(
-            "no escalation worker model is configured for this project; run"
-            " 'actl init --escalation-worker-model provider/model' first"
-        )
-    if not isinstance(model, str):
-        raise ProjectError(
-            "project metadata has an invalid 'escalation_worker_model' value "
-            + repr(model)
-        )
-    return _parse_model(model, "escalation worker")
+    return _model_setting(
+        metadata, "escalation_worker_model", "escalation worker",
+        "escalation-worker-model",
+    )
 
 
 def _test_writer_model(metadata: dict) -> str:
@@ -493,18 +466,9 @@ def _test_writer_model(metadata: dict) -> str:
     and escalation models: without it the run refuses before any lock,
     worktree, or task change.
     """
-    model = metadata.get("test_writer_model")
-    if model is None:
-        raise ProjectError(
-            "no test writer model is configured for this project; run"
-            " 'actl init --test-writer-model provider/model' first"
-        )
-    if not isinstance(model, str):
-        raise ProjectError(
-            "project metadata has an invalid 'test_writer_model' value "
-            + repr(model)
-        )
-    return _parse_test_writer_model(model)
+    return _model_setting(
+        metadata, "test_writer_model", "test writer", "test-writer-model"
+    )
 
 
 def _validate_explicit_base_branch(root: Path, value: str) -> str:
@@ -657,53 +621,9 @@ def cmd_init(args) -> int:
         root = git_toplevel(Path.cwd())
     except ProjectError as exc:
         return _fail(str(exc))
-    try:
-        opencode.find_binary()
-    except opencode.OpenCodeError as exc:
-        return _fail(str(exc))
-    worker_model = None
-    if args.worker_model is not None:
-        try:
-            worker_model = _parse_worker_model(args.worker_model)
-        except ProjectError as exc:
-            return _fail(str(exc))
-    reviewer_model = None
-    if args.reviewer_model is not None:
-        try:
-            reviewer_model = _parse_reviewer_model(args.reviewer_model)
-        except ProjectError as exc:
-            return _fail(str(exc))
-    escalation_worker_model = None
-    if args.escalation_worker_model is not None:
-        try:
-            escalation_worker_model = _parse_model(
-                args.escalation_worker_model, "escalation worker"
-            )
-        except ProjectError as exc:
-            return _fail(str(exc))
-    test_writer_model = None
-    if args.test_writer_model is not None:
-        try:
-            test_writer_model = _parse_test_writer_model(args.test_writer_model)
-        except ProjectError as exc:
-            return _fail(str(exc))
-    # Each model setting falls back to the stored value on a re-init and to
-    # the built-in default otherwise. An explicit argument always wins.
-    requested_models = {
-        "worker_model": worker_model,
-        "reviewer_model": reviewer_model,
-        "escalation_worker_model": escalation_worker_model,
-        "test_writer_model": test_writer_model,
-    }
-    default_models = {
-        "worker_model": DEFAULT_WORKER_MODEL,
-        "reviewer_model": DEFAULT_REVIEWER_MODEL,
-        "escalation_worker_model": DEFAULT_ESCALATION_WORKER_MODEL,
-        "test_writer_model": DEFAULT_TEST_WRITER_MODEL,
-    }
-
     actl_dir = root / PROJECT_DIR
     metadata_path = actl_dir / PROJECT_METADATA
+    metadata = None
     if metadata_path.exists():
         try:
             metadata = load_project_metadata(root)
@@ -712,14 +632,46 @@ def cmd_init(args) -> int:
                 "existing actl metadata is invalid (" + str(exc) + "); "
                 "remove '" + str(actl_dir) + "' and re-run 'actl init'"
             )
+    stored_agent = project_agent(metadata) if metadata is not None else None
+    agent = args.agent or stored_agent or agents.DEFAULT_AGENT
+    try:
+        agents.find_binary(agent)
+    except agents.AgentError as exc:
+        return _fail(str(exc))
+    # Each model setting falls back to the stored value on a re-init and to
+    # the agent's built-in default otherwise. An explicit argument always
+    # wins. Switching agents discards the stored models: they name models of
+    # the previous agent.
+    switching = metadata is not None and stored_agent != agent
+    requested_models = {}
+    for key, role, value in (
+        ("worker_model", "worker", args.worker_model),
+        ("reviewer_model", "reviewer", args.reviewer_model),
+        ("escalation_worker_model", "escalation worker",
+         args.escalation_worker_model),
+        ("test_writer_model", "test writer", args.test_writer_model),
+    ):
+        requested_models[key] = None
+        if value is not None:
+            try:
+                requested_models[key] = _parse_model(value, role, agent)
+            except ProjectError as exc:
+                return _fail(str(exc))
+    default_models = {
+        key: agents.default_model(agent, key) for key in agents.MODEL_KEYS
+    }
+
+    if metadata is not None:
         updates = {}
+        if switching:
+            updates["agent"] = agent
         for key, default in default_models.items():
             value = requested_models[key]
+            if value is None and not switching:
+                value = _stored_setting(metadata.get(key))
             if value is None:
-                value = metadata.get(key)
-                if value is None:
-                    value = default
-            if metadata.get(key) != value:
+                value = default
+            if switching or _stored_setting(metadata.get(key)) != value:
                 updates[key] = value
         stored_base = metadata.get("base_branch")
         if args.base is not None:
@@ -739,13 +691,18 @@ def cmd_init(args) -> int:
             except ProjectError as exc:
                 return _fail(str(exc))
         if updates:
-            metadata.update(updates)
+            for key, value in updates.items():
+                metadata[key] = (
+                    _stored_model(value) if key in agents.MODEL_KEYS else value
+                )
             try:
                 _write_metadata(metadata_path, metadata)
             except OSError as exc:
                 return _fail(
                     "could not write " + str(metadata_path) + " (" + str(exc) + ")"
                 )
+            if "agent" in updates:
+                print("Updated the agent to " + updates["agent"])
             if "worker_model" in updates:
                 print("Updated the worker model to " + updates["worker_model"])
             if "reviewer_model" in updates:
@@ -769,32 +726,19 @@ def cmd_init(args) -> int:
             base_branch = _resolve_new_base_branch(root, args.base)
         except ProjectError as exc:
             return _fail(str(exc))
+        settings = {
+            key: requested_models[key] or default_models[key]
+            for key in agents.MODEL_KEYS
+        }
         metadata = {
             "schema_version": SCHEMA_VERSION,
             "name": root.name,
             "created_at": _utc_now(),
             "base_branch": base_branch,
-            "worker_model": (
-                worker_model
-                if worker_model is not None
-                else DEFAULT_WORKER_MODEL
-            ),
-            "reviewer_model": (
-                reviewer_model
-                if reviewer_model is not None
-                else DEFAULT_REVIEWER_MODEL
-            ),
-            "escalation_worker_model": (
-                escalation_worker_model
-                if escalation_worker_model is not None
-                else DEFAULT_ESCALATION_WORKER_MODEL
-            ),
-            "test_writer_model": (
-                test_writer_model
-                if test_writer_model is not None
-                else DEFAULT_TEST_WRITER_MODEL
-            ),
+            "agent": agent,
         }
+        for key, setting in settings.items():
+            metadata[key] = _stored_model(setting)
         try:
             actl_dir.mkdir(parents=True, exist_ok=True)
             _write_metadata(metadata_path, metadata)
@@ -804,10 +748,11 @@ def cmd_init(args) -> int:
             )
         print("Initialized actl in " + str(root))
         print("Base branch: " + base_branch)
-        print("Worker model: " + metadata["worker_model"])
-        print("Reviewer model: " + metadata["reviewer_model"])
-        print("Escalation worker model: " + metadata["escalation_worker_model"])
-        print("Test writer model: " + metadata["test_writer_model"])
+        print("Agent: " + agent)
+        print("Worker model: " + settings["worker_model"])
+        print("Reviewer model: " + settings["reviewer_model"])
+        print("Escalation worker model: " + settings["escalation_worker_model"])
+        print("Test writer model: " + settings["test_writer_model"])
 
     # Creating the task database here (and again, idempotently, on every task
     # command) is safe: the schema uses CREATE TABLE IF NOT EXISTS, so
@@ -835,7 +780,7 @@ def _select_planner_agent(binary: str, root: Path, session: opencode.Session) ->
         return
     try:
         opencode.switch_agent(binary, root, session.id, PLANNER_AGENT_NAME)
-    except opencode.OpenCodeError as exc:
+    except agents.AgentError as exc:
         raise ProjectError(
             "cannot select the planner agent for session '"
             + session.id + "': " + str(exc)
@@ -862,15 +807,33 @@ def _project_root() -> Path:
     return root
 
 
+def _planner_system_prompt() -> str:
+    """Return the planner instructions: the body of the planner agent doc."""
+    return PLANNER_AGENT_DOC.split("\n---\n", 1)[1].strip()
+
+
 def cmd_plan(args) -> int:
     try:
         root = _project_root()
-    except ProjectError as exc:
+        agent = project_agent(load_project_metadata(root))
+        backend = agents.create(agent)
+    except (ProjectError, MetadataError, agents.AgentError) as exc:
         return _fail(str(exc))
-    try:
-        binary = opencode.find_binary()
-    except opencode.OpenCodeError as exc:
-        return _fail(str(exc))
+    if agent == agents.AGENT_CLAUDE:
+        print("Started a Claude Code planner session in " + str(root))
+        sys.stdout.flush()
+        try:
+            returncode = backend.launch_planner(root, _planner_system_prompt())
+        except agents.AgentError as exc:
+            return _fail(str(exc))
+        if returncode != 0:
+            print(
+                "actl: error: Claude Code exited with status " + str(returncode),
+                file=sys.stderr,
+            )
+        return returncode
+
+    binary = backend.binary
     try:
         agent_status = ensure_planner_agent(root)
     except ProjectError as exc:
@@ -881,43 +844,15 @@ def cmd_plan(args) -> int:
             + str(root / PLANNER_AGENT_PATH) + ")"
         )
 
-    session_id = None
-    if not args.new:
-        try:
-            session_id = load_planner_session_id(root)
-        except MetadataError as exc:
-            return _fail(
-                "cannot resume the planner session: " + str(exc) + "; "
-                "run 'actl plan --new' to start a fresh session"
-            )
-
-    if session_id is not None:
-        try:
-            session = opencode.get_session(binary, root, session_id)
-        except opencode.OpenCodeError as exc:
-            return _fail(
-                "cannot verify planner session '" + session_id + "': " + str(exc) + "; "
-                "run 'actl plan --new' to start a fresh session"
-            )
-        try:
-            _select_planner_agent(binary, root, session)
-        except ProjectError as exc:
-            return _fail(str(exc))
-        print(
-            "Resuming planner session " + session.id
-            + " (agent: " + PLANNER_AGENT_NAME + ") in " + str(root)
-        )
-        return _launch_tui(binary, root, session.id)
-
+    # Every plan run starts a fresh session.
     try:
         session = opencode.create_session(
             binary, root, title=PLANNER_TITLE, agent=PLANNER_AGENT_NAME
         )
-    except opencode.OpenCodeError as exc:
+    except agents.AgentError as exc:
         return _fail("could not create an OpenCode session: " + str(exc))
     try:
         _select_planner_agent(binary, root, session)
-        save_planner_session_id(root, session.id)
     except ProjectError as exc:
         return _fail(str(exc))
     print(
@@ -931,7 +866,7 @@ def _launch_tui(binary: str, root: Path, session_id: str) -> int:
     sys.stdout.flush()
     try:
         returncode = opencode.launch_tui(binary, root, session_id)
-    except opencode.OpenCodeError as exc:
+    except agents.AgentError as exc:
         return _fail(str(exc))
     if returncode != 0:
         print("actl: error: OpenCode exited with status " + str(returncode), file=sys.stderr)
@@ -1311,12 +1246,12 @@ def cmd_task_run(args) -> int:
         test_writer_model = _test_writer_model(metadata)
         validation_commands = validation.commands_from_metadata(metadata)
         base_branch = _run_base_branch(root, metadata)
-        binary = opencode.find_binary()
+        backend = agents.create(project_agent(metadata))
         actl_dir = root / PROJECT_DIR
         _preflight_tasks(actl_dir, requested)
     except (
         ProjectError, tasks.TaskError, execution.ExecutionError,
-        opencode.OpenCodeError, validation.ValidationError,
+        agents.AgentError, validation.ValidationError,
     ) as exc:
         return _fail(str(exc))
     try:
@@ -1339,18 +1274,18 @@ def cmd_task_run(args) -> int:
                     )
             if requested is None:
                 return _run_all(
-                    binary, root, actl_dir, lock_fd, metadata, base_branch,
+                    backend, root, actl_dir, lock_fd, metadata, base_branch,
                     reviewer_model, escalation_worker_model,
                     test_writer_model, validation_commands, run,
                 )
             return _run_explicit(
-                binary, root, actl_dir, lock_fd, requested, metadata,
+                backend, root, actl_dir, lock_fd, requested, metadata,
                 base_branch, reviewer_model, escalation_worker_model,
                 test_writer_model, validation_commands, run,
             )
     except (
         ProjectError, tasks.TaskError, sqlite3.Error,
-        execution.ExecutionError, opencode.OpenCodeError,
+        execution.ExecutionError, agents.AgentError,
         validation.ValidationError, review.ReviewError,
     ) as exc:
         return _fail(str(exc))
@@ -1385,7 +1320,7 @@ def _preflight_tasks(actl_dir: Path, requested) -> None:
 
 
 def _run_explicit(
-    binary, root, actl_dir, lock_fd, requested, metadata, base_branch,
+    backend, root, actl_dir, lock_fd, requested, metadata, base_branch,
     reviewer_model, escalation_worker_model, test_writer_model,
     validation_commands, run,
 ) -> int:
@@ -1403,7 +1338,7 @@ def _run_explicit(
     completed = []
     for task_id in requested:
         code, detail, run = _execute_task(
-            binary, root, actl_dir, task_id, metadata, lock_fd, base_branch,
+            backend, root, actl_dir, task_id, metadata, lock_fd, base_branch,
             reviewer_model, escalation_worker_model, test_writer_model,
             validation_commands, run, selection,
         )
@@ -1433,7 +1368,7 @@ def _dependency_satisfied(dep_id, state, run) -> bool:
 
 
 def _run_all(
-    binary, root, actl_dir, lock_fd, metadata, base_branch,
+    backend, root, actl_dir, lock_fd, metadata, base_branch,
     reviewer_model, escalation_worker_model, test_writer_model,
     validation_commands, run,
 ) -> int:
@@ -1506,7 +1441,7 @@ def _run_all(
                 " run --all' again"
             )
         code, detail, run = _execute_task(
-            binary, root, actl_dir, ready.id, metadata, lock_fd, base_branch,
+            backend, root, actl_dir, ready.id, metadata, lock_fd, base_branch,
             reviewer_model, escalation_worker_model, test_writer_model,
             validation_commands, run, selection,
         )
@@ -1651,7 +1586,7 @@ def _print_summary(
 
 
 def _execute_task(
-    binary, root, actl_dir, task_id, metadata, lock_fd, base_branch,
+    backend, root, actl_dir, task_id, metadata, lock_fd, base_branch,
     reviewer_model, escalation_worker_model, test_writer_model,
     validation_commands, run, selection,
 ) -> tuple:
@@ -1797,7 +1732,7 @@ def _execute_task(
 
     if review_first:
         verification = _validate_and_review(
-            binary, root, actl_dir, task, run.branch, reviewer_model,
+            backend, root, actl_dir, task, run.branch, reviewer_model,
             validation_commands, lock_fd, attempt=max(attempts, 1),
             announce_worktree=True, run_id=run.id,
         )
@@ -1866,7 +1801,7 @@ def _execute_task(
                 return _verification_failed(actl_dir, task.id, str(exc), run)
             if generate_tests:
                 outcome, reason, tests_log = _run_test_generation(
-                    binary, actl_dir, task, lock_fd, run.branch,
+                    backend, actl_dir, task, lock_fd, run.branch,
                     test_writer_model, run.id, worktree,
                 )
                 if outcome == tasks.STATUS_FAILED:
@@ -1886,7 +1821,7 @@ def _execute_task(
             + str(execution.MAX_WORKER_ATTEMPTS) + " (" + model + ")"
         )
         status, reason, log_path = _run_worker_attempt(
-            binary, actl_dir, task, lock_fd, run.branch,
+            backend, actl_dir, task, lock_fd, run.branch,
             attempt=attempt, model=model, feedback=feedback,
             run_id=run.id, worktree=worktree,
         )
@@ -1910,7 +1845,7 @@ def _execute_task(
         _event("Task status: IMPLEMENTED")
 
         verification = _validate_and_review(
-            binary, root, actl_dir, task, run.branch, reviewer_model,
+            backend, root, actl_dir, task, run.branch, reviewer_model,
             validation_commands, lock_fd, attempt=attempt, run_id=run.id,
         )
         if verification.outcome == "approved":
@@ -1934,7 +1869,7 @@ def _execute_task(
 
 
 def _run_worker_attempt(
-    binary, actl_dir, task, lock_fd, base_branch, attempt, model, feedback,
+    backend, actl_dir, task, lock_fd, base_branch, attempt, model, feedback,
     run_id, worktree,
 ):
     """Run one worker attempt in the prepared task worktree.
@@ -1963,13 +1898,14 @@ def _run_worker_attempt(
         reason = ""
         exit_code = None
         session = None
+        turn_start = None
         try:
             log.write("branch: " + worktree.branch + "\n")
             log.write("worktree: " + str(worktree.path) + "\n")
-            session = opencode.create_session(
-                binary, worktree.path,
+            session = backend.create_session(
+                worktree.path,
                 title="actl task t" + str(task.id) + ": " + task.title,
-                agent=opencode.WORKER_AGENT,
+                role=agents.ROLE_WORKER,
             )
             log.write("session: " + session.id + "\n")
             log.write("---\n")
@@ -1978,26 +1914,28 @@ def _run_worker_attempt(
             log.flush()
             _event("Starting worker (session " + session.id + ")")
             _event("log: " + str(log_path))
-            exit_code = opencode.run_headless(
-                binary, worktree.path, session.id, model,
+            turn_start = log.tell()
+            exit_code = backend.run_headless(
+                worktree.path, session, model,
                 execution.worker_prompt(
                     task, worktree, base_branch, attempt=attempt,
                     total=execution.MAX_WORKER_ATTEMPTS, feedback=feedback,
                 ),
-                log, pass_fds=(lock_fd,),
+                log, agents.ROLE_WORKER, pass_fds=(lock_fd,),
             )
             if exit_code == 0:
                 _event("Worker finished with exit code 0")
             else:
                 _event("Worker failed with exit code " + str(exit_code))
-            status, reason = _evaluate_run(worktree, exit_code, base_branch)
-        except (execution.ExecutionError, opencode.OpenCodeError, OSError) as exc:
+            status, reason = _evaluate_run(backend, worktree, exit_code, base_branch)
+        except (execution.ExecutionError, agents.AgentError, OSError) as exc:
             reason = str(exc)
 
         if session is not None:
             _capture_usage(
-                binary, worktree.path, session.id, model, task, run_id,
+                backend, worktree.path, session, model, task, run_id,
                 usage.STAGE_WORKER, attempt, log, actl_dir,
+                turn_output=_read_turn(log, turn_start),
             )
 
         log.write("---\n")
@@ -2030,7 +1968,7 @@ def _needs_test_generation(
 
 
 def _run_test_generation(
-    binary, actl_dir, task, lock_fd, base_branch, model, run_id, worktree,
+    backend, actl_dir, task, lock_fd, base_branch, model, run_id, worktree,
 ):
     """Run the test-generation stage in the prepared task worktree.
 
@@ -2062,10 +2000,10 @@ def _run_test_generation(
         try:
             log.write("branch: " + worktree.branch + "\n")
             log.write("worktree: " + str(worktree.path) + "\n")
-            session = opencode.create_session(
-                binary, worktree.path,
+            session = backend.create_session(
+                worktree.path,
                 title="actl test writer t" + str(task.id) + ": " + task.title,
-                agent=opencode.WORKER_AGENT,
+                role=agents.ROLE_WORKER,
             )
             log.write("session: " + session.id + "\n")
             log.write("---\n")
@@ -2083,9 +2021,9 @@ def _run_test_generation(
                 # if the correction produces no text (or reuses message IDs).
                 log.flush()
                 output_start = log.tell()
-                exit_code = opencode.run_headless(
-                    binary, worktree.path, session.id, model, prompt, log,
-                    pass_fds=(lock_fd,), output_format="json",
+                exit_code = backend.run_headless(
+                    worktree.path, session, model, prompt, log,
+                    agents.ROLE_WORKER, pass_fds=(lock_fd,), structured=True,
                 )
                 if exit_code == 0:
                     _event("Test writer finished with exit code 0")
@@ -2102,14 +2040,14 @@ def _run_test_generation(
                 # previous cumulative usage is subtracted to attribute each
                 # turn its own.
                 previous = _capture_usage(
-                    binary, worktree.path, session.id, model, task, run_id,
+                    backend, worktree.path, session, model, task, run_id,
                     usage.STAGE_TEST_WRITER if format_attempt == 0
                     else usage.STAGE_TEST_WRITER_FORMAT_RETRY,
-                    1, log, actl_dir, previous=previous,
+                    1, log, actl_dir, turn_output=output, previous=previous,
                 )
                 try:
                     status, reason = _evaluate_test_generation(
-                        worktree, exit_code, base_branch, output,
+                        backend, worktree, exit_code, base_branch, output,
                         expected_commit=expected_commit,
                     )
                 except testgen.TestGenFormatError as exc:
@@ -2128,7 +2066,7 @@ def _run_test_generation(
                 except testgen.TestGenError as exc:
                     status, reason = tasks.STATUS_FAILED, str(exc)
                 break
-        except (execution.ExecutionError, opencode.OpenCodeError, OSError) as exc:
+        except (execution.ExecutionError, agents.AgentError, OSError) as exc:
             reason = str(exc)
 
         log.write("---\n")
@@ -2147,7 +2085,7 @@ def _run_test_generation(
 
 
 def _evaluate_test_generation(
-    worktree, exit_code, base_branch, output, expected_commit=None,
+    backend, worktree, exit_code, base_branch, output, expected_commit=None,
 ):
     """Turn a finished test-generation run into ``(status, reason)``.
 
@@ -2164,7 +2102,7 @@ def _evaluate_test_generation(
     if exit_code != 0:
         return (
             tasks.STATUS_FAILED,
-            "the OpenCode test writer exited with status " + str(exit_code),
+            "the " + backend.label + " test writer exited with status " + str(exit_code),
         )
     branch = execution.worktree_branch(worktree.path)
     if branch != worktree.branch:
@@ -2187,7 +2125,7 @@ def _evaluate_test_generation(
             tasks.STATUS_FAILED,
             "the test writer changed the branch while reformatting its answer",
         )
-    decision = testgen.outcome_from_output(output)
+    decision = testgen.outcome_from_output(output, backend.final_text)
     if decision == testgen.DECISION_TESTS_WRITTEN and not (
         execution.worktree_has_committed_changes(worktree.path, base_branch)
     ):
@@ -2197,28 +2135,6 @@ def _evaluate_test_generation(
             + " but committed no test changes relative to " + base_branch,
         )
     return decision, ""
-
-
-# OpenCode's model list carries the pricing metadata actl derives costs
-# from. It is project-wide and does not change during one actl process, so it
-# is fetched at most once per process instead of once per invocation.
-_MODEL_LIST_CACHE = {}
-
-
-def _pricing_for(binary, directory, model):
-    """Return ``model``'s pricing from OpenCode, or None when unavailable.
-
-    A missing or unreadable model list is not fatal: the cost is then simply
-    left to OpenCode's own reported value, or marked unavailable.
-    """
-    models = _MODEL_LIST_CACHE.get(binary)
-    if models is None:
-        try:
-            models = opencode.model_list(binary, directory)
-        except (opencode.OpenCodeError, OSError):
-            models = []
-        _MODEL_LIST_CACHE[binary] = models
-    return usage.pricing_from_models(model, models)
 
 
 def _record_usage(
@@ -2234,37 +2150,46 @@ def _record_usage(
         conn.close()
 
 
+def _read_turn(log, start) -> str:
+    """Return what the agent wrote to ``log`` since offset ``start``."""
+    if start is None:
+        return ""
+    log.flush()
+    with open(log.name, "rb") as transcript:
+        transcript.seek(start)
+        return transcript.read().decode("utf-8", errors="replace")
+
+
 def _capture_usage(
-    binary, directory, session_id, model, task, run_id, stage, attempt, log,
-    actl_dir, previous=None,
+    backend, directory, session, model, task, run_id, stage, attempt, log,
+    actl_dir, turn_output="", previous=None,
 ):
     """Capture, log, and persist one invocation's model usage.
 
-    The session's cumulative usage is read back from OpenCode and, for a
-    session reused across turns (the reviewer's format retry), the previous
-    cumulative value is subtracted so each turn is recorded on its own. The
-    token counts go into the invocation's log only - never the terminal - and
-    the record is stored with its task and run attribution. Reading usage is
-    best-effort: a failure is logged as unavailable and never interrupts the
-    task. Returns the cumulative usage for the next turn of this session.
+    The backend reads the turn's usage: OpenCode reports the session's
+    cumulative usage, and for a session reused across turns (the reviewer's
+    format retry) the previous cumulative value is subtracted so each turn is
+    recorded on its own; Claude Code reports each turn's usage in its own
+    output (``turn_output``). The token counts go into the invocation's log
+    only - never the terminal - and the record is stored with its task and
+    run attribution. Reading usage is best-effort: a failure is logged as
+    unavailable and never interrupts the task. Returns the cumulative usage
+    for the next turn of this session.
     """
     try:
-        current = usage.parse_session(
-            opencode.session_usage(binary, directory, session_id)
+        current, record = backend.turn_usage(
+            directory, session, model, turn_output, previous
         )
-    except (opencode.OpenCodeError, OSError) as exc:
+    except (agents.AgentError, OSError) as exc:
         current = usage.unavailable()
+        record = usage.unavailable()
         log.write("usage_error: " + str(exc) + "\n")
-    record = usage.derive(
-        usage.subtract(current, previous),
-        _pricing_for(binary, directory, model),
-    )
     for line in usage.format_lines(record):
         log.write(line + "\n")
     log.flush()
     try:
         _record_usage(
-            actl_dir, task.id, run_id, stage, attempt, model, session_id,
+            actl_dir, task.id, run_id, stage, attempt, model, session.id,
             record,
         )
     except (tasks.TaskError, sqlite3.Error) as exc:
@@ -2287,7 +2212,7 @@ class _Verification:
 
 
 def _validate_and_review(
-    binary, root, actl_dir, task, base_branch, reviewer_model,
+    backend, root, actl_dir, task, base_branch, reviewer_model,
     validation_commands, lock_fd, attempt, announce_worktree=False, run_id=None,
 ) -> _Verification:
     """Validate and review one implemented commit.
@@ -2320,7 +2245,7 @@ def _validate_and_review(
                     + " (branch " + worktree.branch + ")"
                 )
         commit = _verification_commit(root, worktree, base_branch)
-    except (execution.ExecutionError, opencode.OpenCodeError, OSError) as exc:
+    except (execution.ExecutionError, agents.AgentError, OSError) as exc:
         return _Verification("failed", reason=str(exc))
 
     validation_result = None
@@ -2402,14 +2327,14 @@ def _validate_and_review(
     try:
         try:
             verdict = _run_reviewer(
-                binary, root, actl_dir, task, worktree, commit, base_branch,
+                backend, root, actl_dir, task, worktree, commit, base_branch,
                 reviewer_model, validation_result, lock_fd, review_log,
                 attempt, run_id=run_id,
             )
         finally:
             review_log.close()
     except (
-        execution.ExecutionError, opencode.OpenCodeError, review.ReviewError,
+        execution.ExecutionError, agents.AgentError, review.ReviewError,
         OSError,
     ) as exc:
         _event("Review failed")
@@ -2451,7 +2376,7 @@ def _validate_and_review(
 
 
 def _run_reviewer(
-    binary, root, actl_dir, task, worktree, commit, base_branch,
+    backend, root, actl_dir, task, worktree, commit, base_branch,
     reviewer_model, validation_result, lock_fd, log, attempt=None, run_id=None,
 ) -> review.Verdict:
     """Run the reviewer in a temporary worktree at ``commit``.
@@ -2490,10 +2415,10 @@ def _run_reviewer(
         log.write("base_commit: " + base_commit + "\n")
         log.write("review_worktree: " + str(review_path) + "\n")
         log.write("started_at: " + _utc_now() + "\n---\n")
-        session = opencode.create_session(
-            binary, review_path,
+        session = backend.create_session(
+            review_path,
             title="actl review t" + str(task.id) + ": " + task.title,
-            agent=opencode.REVIEWER_AGENT,
+            role=agents.ROLE_REVIEWER,
         )
         log.write("session: " + session.id + "\n")
         previous = None
@@ -2504,12 +2429,11 @@ def _run_reviewer(
             log.flush()
             output_start = log.tell()
             try:
-                exit_code = opencode.run_headless(
-                    binary, review_path, session.id, reviewer_model, prompt, log,
-                    pass_fds=(lock_fd,), agent=opencode.REVIEWER_AGENT,
-                    output_format="json",
+                exit_code = backend.run_headless(
+                    review_path, session, reviewer_model, prompt, log,
+                    agents.ROLE_REVIEWER, pass_fds=(lock_fd,), structured=True,
                 )
-            except (opencode.OpenCodeError, OSError) as exc:
+            except (agents.AgentError, OSError) as exc:
                 _log_review_failure(log, str(exc))
                 raise
             log.write("---\nfinished_at: " + _utc_now() + "\n")
@@ -2517,11 +2441,12 @@ def _run_reviewer(
             log.flush()
             # The session is reused for the one format retry, so the previous
             # cumulative usage is subtracted to attribute each turn its own.
+            output = _read_turn(log, output_start)
             previous = _capture_usage(
-                binary, review_path, session.id, reviewer_model, task, run_id,
+                backend, review_path, session, reviewer_model, task, run_id,
                 usage.STAGE_REVIEW if format_attempt == 0
                 else usage.STAGE_REVIEW_FORMAT_RETRY,
-                attempt, log, actl_dir, previous=previous,
+                attempt, log, actl_dir, turn_output=output, previous=previous,
             )
             if exit_code != 0:
                 _log_review_failure(
@@ -2538,11 +2463,8 @@ def _run_reviewer(
                 raise
             log.write("checkout: " + commit + " (unchanged)\n")
             log.flush()
-            with open(log.name, "rb") as transcript:
-                transcript.seek(output_start)
-                output = transcript.read().decode("utf-8", errors="replace")
             try:
-                verdict = review.verdict_from_output(output)
+                verdict = review.verdict_from_output(output, backend.final_text)
             except review.ReviewFormatError as exc:
                 if format_attempt == 0:
                     log.write("format_error: " + str(exc) + "\n")
@@ -2953,12 +2875,12 @@ def _print_findings(findings) -> None:
             print("      impact: " + finding.impact)
 
 
-def _evaluate_run(worktree, exit_code: int, base_branch: str):
+def _evaluate_run(backend, worktree, exit_code: int, base_branch: str):
     """Turn a finished worker run into ``(status, reason)``."""
     if exit_code != 0:
         return (
             tasks.STATUS_FAILED,
-            "the OpenCode worker exited with status " + str(exit_code),
+            "the " + backend.label + " worker exited with status " + str(exit_code),
         )
     branch = execution.worktree_branch(worktree.path)
     if branch != worktree.branch:
@@ -3344,7 +3266,7 @@ def _utc_now() -> str:
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         prog="actl",
-        description="Orchestrate AI coding agents through OpenCode.",
+        description="Orchestrate AI coding agents (OpenCode or Claude Code).",
     )
     parser.add_argument("--version", action="version", version="actl " + __version__)
     subparsers = parser.add_subparsers(dest="command", required=True)
@@ -3353,28 +3275,30 @@ def build_parser() -> argparse.ArgumentParser:
         "init", help="register the current Git repository as an actl project"
     )
     init.add_argument(
+        "--agent", choices=agents.AGENTS,
+        help="agent CLI the project runs on (default: opencode, or the"
+             " project's current agent); switching agents resets the model"
+             " settings to the new agent's defaults",
+    )
+    init.add_argument(
         "--worker-model", metavar="MODEL",
-        help="set the project's worker model (provider/model[#variant]);"
-             " default " + DEFAULT_WORKER_MODEL + "; required by"
-             " 'actl task run' whenever the worker runs",
+        help="set the project's worker model (name[#effort], e.g."
+             " provider/model#variant for OpenCode or sonnet#low for Claude);"
+             " required by 'actl task run' whenever the worker runs",
     )
     init.add_argument(
         "--reviewer-model", metavar="MODEL",
-        help="set the project's reviewer model (provider/model[#variant]);"
-             " default " + DEFAULT_REVIEWER_MODEL + "; required by"
+        help="set the project's reviewer model (name[#effort]); required by"
              " 'actl task run'",
     )
     init.add_argument(
         "--escalation-worker-model", metavar="MODEL",
         help="set the model for the third and final worker attempt of a"
-             " repair cycle (provider/model[#variant]); default "
-             "" + DEFAULT_ESCALATION_WORKER_MODEL + "; required by"
-             " 'actl task run'",
+             " repair cycle (name[#effort]); required by 'actl task run'",
     )
     init.add_argument(
         "--test-writer-model", metavar="MODEL",
-        help="set the project's test-writer model (provider/model[#variant]);"
-             " default " + DEFAULT_TEST_WRITER_MODEL + "; required"
+        help="set the project's test-writer model (name[#effort]); required"
              " by 'actl task run'",
     )
     init.add_argument(
@@ -3382,11 +3306,8 @@ def build_parser() -> argparse.ArgumentParser:
         help="base branch for task branches (default: detect, or ask when"
              " ambiguous)",
     )
-    plan = subparsers.add_parser(
-        "plan", help="start or resume the project's planner session"
-    )
-    plan.add_argument(
-        "--new", action="store_true", help="start a fresh planner session"
+    subparsers.add_parser(
+        "plan", help="start a fresh planner session"
     )
 
     task = subparsers.add_parser("task", help="manage project tasks")

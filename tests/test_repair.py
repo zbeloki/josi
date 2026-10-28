@@ -20,6 +20,7 @@ import unittest
 from pathlib import Path
 
 from test_verification import VerificationTestCase
+from test_actl import model_setting
 
 from actl import tasks
 
@@ -713,7 +714,7 @@ class RepairLogTests(RepairTestCase):
 class EscalationModelConfigTests(RepairTestCase):
     def test_escalation_model_is_stored_updated_and_preserved(self):
         self.assertEqual(
-            self.metadata()["escalation_worker_model"], "escalation/model"
+            model_setting(self.metadata()["escalation_worker_model"]), "escalation/model"
         )
         result = self.run_actl(
             "init", "--escalation-worker-model", "other/stronger#high"
@@ -721,13 +722,13 @@ class EscalationModelConfigTests(RepairTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Updated the escalation worker model", result.stdout)
         self.assertEqual(
-            self.metadata()["escalation_worker_model"], "other/stronger#high"
+            model_setting(self.metadata()["escalation_worker_model"]), "other/stronger#high"
         )
 
         # A plain init never removes the configured escalation model.
         self.assertEqual(self.run_actl("init").returncode, 0)
         self.assertEqual(
-            self.metadata()["escalation_worker_model"], "other/stronger#high"
+            model_setting(self.metadata()["escalation_worker_model"]), "other/stronger#high"
         )
 
     def test_invalid_escalation_model_value_in_metadata_is_rejected(self):
@@ -749,7 +750,7 @@ class EscalationModelConfigTests(RepairTestCase):
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("invalid escalation worker model", result.stderr)
         self.assertEqual(
-            self.metadata()["escalation_worker_model"], "escalation/model"
+            model_setting(self.metadata()["escalation_worker_model"]), "escalation/model"
         )
 
 

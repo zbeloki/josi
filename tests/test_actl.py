@@ -496,8 +496,7 @@ class ActlTestCase(unittest.TestCase):
                 del self.env[key]
             # OpenCode configuration must not leak in from the invoking
             # environment (for example a parent OpenCode session exporting
-            # OPENCODE_CONFIG_CONTENT): every launch under test must carry
-            # exactly the configuration actl builds itself.
+            # OPENCODE_CONFIG_CONTENT): tests set what they need explicitly.
             elif key.startswith("OPENCODE_"):
                 del self.env[key]
 

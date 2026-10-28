@@ -559,38 +559,6 @@ is stored yet. Passing an argument overrides just that setting, so a single
 re-init can change one model without disturbing the others. The stored values
 may also be edited directly in `.actl/project.json`.
 
-### OpenRouter provider routing
-
-Every OpenCode process actl launches - the planner TUI, the worker, the
-reviewer, and the escalation worker, including the launches that run from the
-task and review worktrees - receives a launch-time OpenCode configuration
-through the `OPENCODE_CONFIG_CONTENT` environment variable. actl defaults
-OpenRouter requests to provider-level price sorting:
-
-```json
-{
-  "provider": {
-    "openrouter": {
-      "body": {"provider": {"sort": "price"}}
-    }
-  }
-}
-```
-
-The setting lives on the `openrouter` provider rather than on a model, so it
-applies to every OpenRouter model actl is configured to use, whichever model
-is selected: actl never lists models or picks a provider, so adding models or
-switching the worker, reviewer, or escalation model does not change it. This
-is only a default. actl reads the project's own OpenCode configuration - the
-file named by `OPENCODE_CONFIG`, plus `opencode.json(c)` and
-`.opencode/opencode.json(c)` discovered from the filesystem root down to the
-launch directory - and layers its default *below* that configuration. A
-project or model-level setting, including a different
-`provider.openrouter.body.provider.sort`, therefore takes precedence, and
-unrelated OpenCode or OpenRouter configuration is preserved. A missing,
-unreadable, or malformed config file is ignored rather than failing the
-launch.
-
 The base branch is project-level configuration too:
 
 ```sh
@@ -1045,9 +1013,9 @@ Sessions are created explicitly (instead of letting the TUI create them
 lazily) so actl captures the real session ID. Before resuming, actl asks
 OpenCode for the session and compares its `location.directory` with the
 project root; if the session is missing, unreadable, or belongs elsewhere,
-actl reports an error instead of resuming the wrong session. Every one of
-these processes also receives actl's launch-time configuration through
-`OPENCODE_CONFIG_CONTENT` (see "OpenRouter provider routing" above).
+actl reports an error instead of resuming the wrong session. These processes
+inherit the normal process environment, including any OpenCode configuration
+variables such as `OPENCODE_CONFIG_CONTENT`, which actl never sets or alters.
 
 ## Project files
 

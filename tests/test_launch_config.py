@@ -1,9 +1,9 @@
-"""Tests for actl's launch-time OpenCode configuration.
+"""Tests that actl does not generate OpenCode configuration at launch.
 
-Every OpenCode launch made by actl passes an ``OPENCODE_CONFIG_CONTENT`` that
-defaults OpenRouter requests to provider-level price sorting. These tests cover
-the configuration builder directly and the real launch paths (the planner TUI
-and the worker/reviewer noninteractive runs in their worktrees) through the
+OpenCode processes inherit the normal process environment, and an explicitly
+supplied environment (including ``OPENCODE_CONFIG_CONTENT``) passes through
+unchanged. These tests cover the wrapper directly and the real launch paths
+(the planner TUI and the worker/reviewer runs in their worktrees) through the
 fake ``opencode`` executable from ``test_actl``.
 """
 
@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import json
 import shutil
+import subprocess
 import sys
 import unittest
 from pathlib import Path
+from unittest import mock
 
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
@@ -22,222 +24,85 @@ from actl import opencode  # noqa: E402
 from test_actl import ActlTestCase  # noqa: E402
 from test_runs import TaskRunTestCase  # noqa: E402
 
-
-def parse_config(environment):
-    """Return the object actl passed through ``OPENCODE_CONFIG_CONTENT``."""
-    return json.loads(environment[opencode.OPENCODE_CONFIG_CONTENT])
+INLINE = json.dumps({"provider": {"openrouter": {"body": {"x": 1}}}})
 
 
-class LaunchEnvironmentTests(unittest.TestCase):
-    """Unit tests for :func:`actl.opencode.launch_environment`."""
+class WrapperEnvironmentTests(unittest.TestCase):
+    """Every wrapper launch hands ``env`` to the subprocess untouched."""
 
-    def setUp(self):
-        import tempfile
+    def launches(self, env):
+        """Run each launching wrapper; return the env passed to each."""
+        completed = subprocess.CompletedProcess([], 0, stdout="{}", stderr="")
+        seen = []
+        root = Path("/tmp")
+        with mock.patch.object(
+            opencode.subprocess, "run", return_value=completed
+        ) as run:
+            opencode.launch_tui("oc", root, "s1", env=env)
+            opencode.run_headless(
+                "oc", root, "s1", "m", "p", output=None, env=env
+            )
+            opencode.run_headless(
+                "oc", root, "s1", "m", "p", output=None,
+                agent=opencode.REVIEWER_AGENT, output_format="json", env=env,
+            )
+            try:
+                opencode._api("oc", root, "GET", "/api/x", env=env)
+            except opencode.OpenCodeError:
+                pass
+            for call in run.call_args_list:
+                seen.append(call.kwargs["env"])
+        return seen
 
-        self.tmp = tempfile.TemporaryDirectory(prefix="actl-launch-")
-        self.addCleanup(self.tmp.cleanup)
-        self.root = Path(self.tmp.name).resolve()
+    def test_no_launch_environment_helper_remains(self):
+        for name in ("launch_environment", "existing_launch_config",
+                     "DEFAULT_LAUNCH_CONFIG", "OPENCODE_CONFIG_CONTENT"):
+            self.assertFalse(hasattr(opencode, name), name)
 
-    def config(self, env=None):
-        environment = opencode.launch_environment(self.root, env or {})
-        return parse_config(environment)
+    def test_omitted_env_inherits_the_process_environment(self):
+        for env in self.launches(None):
+            self.assertIsNone(env)
 
-    def write_config(self, name, data):
-        path = self.root / name
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(data, encoding="utf-8")
-
-    def test_default_sorts_openrouter_providers_by_price(self):
-        config = self.config()
-        self.assertEqual(
-            config["provider"]["openrouter"]["body"]["provider"]["sort"],
-            "price",
-        )
-
-    def test_default_is_provider_level_without_models_or_provider_list(self):
-        config = self.config()
-        openrouter = config["provider"]["openrouter"]
-        # The default must not name or list models, nor select a specific
-        # provider: it only asks OpenRouter to sort providers by price.
-        self.assertNotIn("models", openrouter)
-        self.assertEqual(set(openrouter["body"]), {"provider"})
-        self.assertEqual(openrouter["body"]["provider"], {"sort": "price"})
-        # No unrelated provider is configured and no model is pinned.
-        self.assertEqual(set(config["provider"]), {"openrouter"})
-        self.assertNotIn("model", config)
-
-    def test_project_config_is_preserved_and_overrides_default(self):
-        self.write_config("opencode.json", json.dumps({
-            "model": "openrouter/anthropic/claude-sonnet-latest",
-            "mcp": {"servers": {"demo": {"type": "local"}}},
-            "provider": {
-                "openrouter": {
-                    "body": {"provider": {"sort": "throughput"}},
-                },
-            },
-        }))
-        config = self.config()
-        self.assertEqual(
-            config["provider"]["openrouter"]["body"]["provider"]["sort"],
-            "throughput",
-        )
-        self.assertEqual(
-            config["model"], "openrouter/anthropic/claude-sonnet-latest"
-        )
-        self.assertEqual(config["mcp"]["servers"]["demo"]["type"], "local")
-
-    def test_model_specific_project_override_wins_over_the_default(self):
-        self.write_config("opencode.json", json.dumps({
-            "provider": {
-                "openrouter": {
-                    "models": {
-                        "anthropic/claude-sonnet-latest": {
-                            "body": {"provider": {"sort": "latency"}},
-                        },
-                    },
-                },
-            },
-        }))
-        config = self.config()
-        # The project's model-level setting survives next to the default.
-        self.assertEqual(
-            config["provider"]["openrouter"]["models"][
-                "anthropic/claude-sonnet-latest"
-            ]["body"]["provider"]["sort"],
-            "latency",
-        )
-        self.assertEqual(
-            config["provider"]["openrouter"]["body"]["provider"]["sort"],
-            "price",
-        )
-
-    def test_directory_config_overrides_an_ancestor_config(self):
-        ancestor = self.root / "parent"
-        child = ancestor / "project"
-        child.mkdir(parents=True)
-        (ancestor / "opencode.json").write_text(
-            json.dumps({"model": "ancestor/model"}), encoding="utf-8"
-        )
-        (child / "opencode.json").write_text(
-            json.dumps({"model": "child/model"}), encoding="utf-8"
-        )
-        config = parse_config(
-            opencode.launch_environment(child, {})
-        )
-        self.assertEqual(config["model"], "child/model")
-
-    def test_dot_opencode_config_overrides_a_direct_config(self):
-        self.write_config("opencode.json", json.dumps({"model": "direct/model"}))
-        self.write_config(
-            ".opencode/opencode.json", json.dumps({"model": "nested/model"})
-        )
-        self.assertEqual(self.config()["model"], "nested/model")
-
-    def test_jsonc_project_config_is_parsed(self):
-        self.write_config("opencode.jsonc", """\
-{
-  // Keep this model and override the default.
-  "model": "openrouter/anthropic/claude-sonnet-latest",
-  "provider": {
-    "openrouter": { "body": { "provider": { "sort": "throughput" } } },
-  },
-}
-""")
-        config = self.config()
-        self.assertEqual(
-            config["model"], "openrouter/anthropic/claude-sonnet-latest"
-        )
-        self.assertEqual(
-            config["provider"]["openrouter"]["body"]["provider"]["sort"],
-            "throughput",
-        )
-
-    def test_custom_config_is_preserved_below_project_config(self):
-        custom = self.root / "custom.json"
-        custom.write_text(json.dumps({
-            "provider": {"openrouter": {"body": {"provider": {"sort": "latency"}}}},
-            "username": "custom",
-        }), encoding="utf-8")
-        self.write_config(
-            "opencode.json",
-            json.dumps({"provider": {
-                "openrouter": {"body": {"provider": {"sort": "throughput"}}},
-            }}),
-        )
-        config = self.config({opencode.OPENCODE_CONFIG: str(custom)})
-        # Project config outranks the custom config, which outranks the default.
-        self.assertEqual(
-            config["provider"]["openrouter"]["body"]["provider"]["sort"],
-            "throughput",
-        )
-        self.assertEqual(config["username"], "custom")
-
-    def test_existing_inline_content_is_preserved_and_overrides_everything(self):
-        existing = json.dumps({
-            "provider": {"openrouter": {"body": {"provider": {"sort": "latency"}}}},
-            "other": {"kept": True},
-        })
-        self.write_config(
-            "opencode.json",
-            json.dumps({"provider": {
-                "openrouter": {"body": {"provider": {"sort": "throughput"}}},
-            }}),
-        )
-        config = self.config({opencode.OPENCODE_CONFIG_CONTENT: existing})
-        self.assertEqual(
-            config["provider"]["openrouter"]["body"]["provider"]["sort"],
-            "latency",
-        )
-        self.assertEqual(config["other"], {"kept": True})
-
-    def test_malformed_project_config_is_ignored(self):
-        self.write_config("opencode.json", "{ this is not json")
-        # A broken project config must not break a launch; the default applies.
-        self.assertEqual(
-            self.config()["provider"]["openrouter"]["body"]["provider"]["sort"],
-            "price",
-        )
-
-    def test_environment_is_returned_with_the_inline_config(self):
-        environment = opencode.launch_environment(self.root, {"KEEP": "yes"})
-        self.assertEqual(environment["KEEP"], "yes")
-        self.assertIn(opencode.OPENCODE_CONFIG_CONTENT, environment)
+    def test_explicit_env_passes_through_unchanged(self):
+        explicit = {"KEEP": "yes", "OPENCODE_CONFIG_CONTENT": INLINE}
+        envs = self.launches(explicit)
+        self.assertEqual(len(envs), 4)
+        for env in envs:
+            self.assertIs(env, explicit)
+            self.assertEqual(env, {"KEEP": "yes",
+                                   "OPENCODE_CONFIG_CONTENT": INLINE})
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
 class PlannerLaunchConfigTests(ActlTestCase):
-    """The planner TUI launch carries the OpenRouter default."""
+    """The planner launch adds no OpenCode configuration."""
 
     def setUp(self):
         super().setUp()
         self.initialize()
 
-    def test_planner_launch_passes_price_sorted_providers(self):
-        result = self.run_actl("plan")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        tui = self.tui_calls()[-1]
-        config = parse_config(tui["env"])
-        self.assertEqual(
-            config["provider"]["openrouter"]["body"]["provider"]["sort"],
-            "price",
-        )
-
-    def test_every_planner_opencode_call_carries_the_default(self):
+    def test_planner_calls_receive_no_actl_generated_config(self):
         self.assertEqual(self.run_actl("plan").returncode, 0)
         calls = self.calls()
         self.assertTrue(calls)
         for call in calls:
-            config = parse_config(call["env"])
-            self.assertEqual(
-                config["provider"]["openrouter"]["body"]["provider"]["sort"],
-                "price",
-                call["argv"],
-            )
+            self.assertEqual(call["env"], {}, call["argv"])
+
+    def test_caller_config_is_not_overwritten_by_the_planner(self):
+        self.env["OPENCODE_CONFIG_CONTENT"] = INLINE
+        self.env["OPENCODE_CONFIG"] = "/some/custom.json"
+        self.assertEqual(self.run_actl("plan").returncode, 0)
+        self.assertTrue(self.tui_calls())
+        for call in self.calls():
+            self.assertEqual(call["env"], {
+                "OPENCODE_CONFIG_CONTENT": INLINE,
+                "OPENCODE_CONFIG": "/some/custom.json",
+            }, call["argv"])
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
 class WorktreeLaunchConfigTests(TaskRunTestCase):
-    """The worker and reviewer launches in their worktrees carry the default."""
+    """Worker, reviewer, and escalation launches add no configuration."""
 
     def init_openrouter_models(self):
         for option, model in (
@@ -248,52 +113,30 @@ class WorktreeLaunchConfigTests(TaskRunTestCase):
             result = self.run_actl("init", option, model)
             self.assertEqual(result.returncode, 0, result.stderr)
 
-    def test_worker_and_reviewer_launches_carry_price_sorted_providers(self):
+    def run_and_check(self, expected_env):
         self.init_openrouter_models()
         self.make_task()
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-
         workers = self.worker_calls()
         reviewers = self.reviewer_calls()
         self.assertTrue(workers, "the worker was never launched")
         self.assertTrue(reviewers, "the reviewer was never launched")
-        # Different OpenRouter models are used, but the provider-level default
-        # is identical for both and never names a model.
-        for call in workers + reviewers:
-            config = parse_config(call["env"])
-            openrouter = config["provider"]["openrouter"]
-            self.assertEqual(
-                openrouter["body"]["provider"]["sort"], "price", call["argv"]
-            )
-            self.assertNotIn("models", openrouter)
+        for call in self.calls():
+            self.assertEqual(call["env"], expected_env, call["argv"])
 
-    def test_worktree_launches_preserve_project_configuration(self):
-        # An untracked project config above the worktree (the repository root)
-        # is discovered like OpenCode discovers it.
+    def test_worker_and_reviewer_receive_no_actl_generated_config(self):
+        self.run_and_check({})
+
+    def test_project_opencode_json_is_not_read_or_merged(self):
         (self.repo / "opencode.json").write_text(json.dumps({
-            "model": "openrouter/anthropic/claude-sonnet-latest",
-            "mcp": {"servers": {"demo": {"type": "local"}}},
-            "provider": {
-                "openrouter": {"body": {"provider": {"sort": "throughput"}}},
-            },
+            "provider": {"openrouter": {"body": {"provider": {"sort": "latency"}}}},
         }), encoding="utf-8")
-        self.init_openrouter_models()
-        self.make_task()
-        result = self.run_task("t1")
-        self.assertEqual(result.returncode, 0, result.stderr)
+        self.run_and_check({})
 
-        for call in self.worker_calls() + self.reviewer_calls():
-            config = parse_config(call["env"])
-            self.assertEqual(
-                config["provider"]["openrouter"]["body"]["provider"]["sort"],
-                "throughput",
-                call["argv"],
-            )
-            self.assertEqual(
-                config["model"], "openrouter/anthropic/claude-sonnet-latest"
-            )
-            self.assertEqual(config["mcp"]["servers"]["demo"]["type"], "local")
+    def test_caller_config_passes_through_to_every_launch_unchanged(self):
+        self.env["OPENCODE_CONFIG_CONTENT"] = INLINE
+        self.run_and_check({"OPENCODE_CONFIG_CONTENT": INLINE})
 
 
 if __name__ == "__main__":

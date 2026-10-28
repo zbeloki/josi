@@ -1022,6 +1022,17 @@ actl reports an error instead of resuming the wrong session. These processes
 inherit the normal process environment, including any OpenCode configuration
 variables such as `OPENCODE_CONFIG_CONTENT`, which actl never sets or alters.
 
+### OpenCode configuration and provider routing
+
+actl does not configure OpenCode or choose a provider route: it only passes the
+model names stored in `.actl/project.json` (for example
+`openrouter/anthropic/claude-sonnet-latest`) and leaves everything else to
+OpenCode. Provider-routing preferences, such as OpenRouter provider ordering or
+price sorting, are therefore not an actl default. To set one, use OpenCode's own
+configuration (`opencode.json`, the `OPENCODE_CONFIG` file, or the
+`OPENCODE_CONFIG_CONTENT` variable) as described in the OpenCode documentation;
+actl-launched processes pick it up like any other OpenCode run.
+
 ## Project files
 
 ```
@@ -1122,11 +1133,10 @@ integration; already approved, staged, and DONE tasks; explicit task lists;
 `--all` in dependency order; deterministic id order for independent tasks;
 stopping at the first failure or at a task that needs a human;
 `actl run list` and `actl run show`; and one execution lock per batch. A
-dedicated launch-configuration suite (`test_launch_config`) checks that the
-OpenRouter price-sort default is present on every launch path - the planner
-TUI, the worker, and the reviewer, including the worktree launches - that it
-is provider-level and independent of the selected model, and that existing
-project and model-level configuration overrides it and survives.
+dedicated launch-environment suite (`test_launch_config`) checks that no
+launch path - the planner TUI, the worker, and the reviewer, including the
+worktree launches - receives actl-generated OpenCode configuration, and that
+an environment supplied by the caller reaches OpenCode unchanged.
 
 ## Limitations
 

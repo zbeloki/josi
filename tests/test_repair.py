@@ -794,6 +794,77 @@ class TaskResetTests(RepairTestCase):
         self.assertEqual(self.task_status(), "STAGED")
         self.assertIn("Worker attempt 1/3 (provider/model)", result.stdout)
 
+    def test_reset_discards_the_recorded_test_generation_outcome(self):
+        # The test-generation outcome record (.actl/testgen/tN) belongs to
+        # the branch and worktree a reset discards: the recorded decision
+        # is stale on a fresh branch, so it goes with them, and the next
+        # execution runs test generation again instead of skipping a stage
+        # that never ran there.
+        marker = self.repo / ".actl" / "testgen" / "t1"
+        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
+        self.make_task()
+        self.assertNotEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(self.task_status(), "NEEDS_HUMAN")
+        self.assertEqual(
+            json.loads(marker.read_text(encoding="utf-8")),
+            {"decision": "no_tests_needed"},
+        )
+        generations = len(self.generation_calls())
+
+        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.approved())
+        result = self.run_actl("task", "reset", "t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Reset task t1", result.stdout)
+        self.assertFalse(marker.exists())
+
+        # The next execution runs test generation again on the fresh branch.
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(
+            len(self.generation_calls()), generations + 1,
+            "the next execution must run test generation again",
+        )
+        self.assertEqual(
+            json.loads(marker.read_text(encoding="utf-8")),
+            {"decision": "no_tests_needed"},
+        )
+
+    def test_failed_worktree_cleanup_keeps_the_budget_and_the_state(self):
+        # A locked worktree cannot be removed, so the reset fails during its
+        # cleanup. No task state may be discarded before that succeeds: the
+        # budget, the stored state, the branch, and the worktree all survive
+        # a failed reset, so it can only be retried, never half-done.
+        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
+        self.make_task()
+        self.assertNotEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(self.task_status(), "NEEDS_HUMAN")
+        record = self.attempt_record()
+        self.assertEqual(record["attempts"], 3)
+        review = self.latest_review()
+
+        self.git("worktree", "lock", str(self.worktree()))
+        result = self.run_actl("task", "reset", "t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot remove the task worktree", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+        # The attempt budget, the stored review, the status, the branch, and
+        # the worktree are all exactly as they were before the failed reset.
+        self.assertEqual(self.attempt_record(), record)
+        self.assertEqual(self.task_status(), "NEEDS_HUMAN")
+        self.assertEqual(self.latest_review(), review)
+        self.assertTrue(self.task_branch_exists())
+        self.assertTrue(self.worktree().is_dir())
+        self.assertTrue((self.repo / ".actl" / "base" / "t1").is_file())
+
+        # With the worktree removable again, the retry succeeds as before.
+        self.git("worktree", "unlock", str(self.worktree()))
+        result = self.run_actl("task", "reset", "t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "PENDING")
+        self.assertFalse((self.repo / ".actl" / "attempts" / "t1").exists())
+
     def test_reset_of_a_staged_task_is_refused(self):
         self.make_task()
         self.assertEqual(self.run_task("t1").returncode, 0)

@@ -422,10 +422,9 @@ class TestGenerationStageTests(TestGenTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         prompt = self.worker_prompt()
         self.assertIn(
-            "Do not modify the tests that were generated for this task",
-            prompt,
+            "Do not write, add, modify, weaken, or delete tests.", prompt
         )
-        self.assertIn("keep the generated tests as they are", prompt)
+        self.assertIn("keep any\n  existing tests as they are", prompt)
 
     def test_generated_tests_stay_part_of_the_reviewed_changes(self):
         # The test-writer commit stays on the task branch: validation can

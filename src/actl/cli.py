@@ -1291,6 +1291,136 @@ def cmd_task_run(args) -> int:
         return _fail(str(exc))
 
 
+def cmd_task_review(args) -> int:
+    """Validate and review a task's committed implementation, then stage it.
+
+    This is the way back after a human fixed a NEEDS_HUMAN task by hand: no
+    test generation and no worker run, only validation and review of the
+    commit already on the task branch. An approval stages the task exactly
+    like ``actl task run``; a rejection ends it NEEDS_HUMAN again.
+    """
+    try:
+        task_id = _parse_task_id(args.id)
+        root = _project_root()
+        metadata = load_project_metadata(root)
+        reviewer_model = _reviewer_model(metadata)
+        validation_commands = validation.commands_from_metadata(metadata)
+        base_branch = _run_base_branch(root, metadata)
+        backend = agents.create(project_agent(metadata))
+        actl_dir = root / PROJECT_DIR
+        _preflight_tasks(actl_dir, [task_id])
+    except (
+        ProjectError, tasks.TaskError, execution.ExecutionError,
+        agents.AgentError, validation.ValidationError,
+    ) as exc:
+        return _fail(str(exc))
+    try:
+        with execution.lock(actl_dir) as lock_fd:
+            run = _running_run(actl_dir)
+            if run is None:
+                blocker = _staged_unmerged_run(actl_dir)
+                if blocker is not None:
+                    return _fail(
+                        _new_run_refusal(actl_dir, blocker, [task_id])
+                    )
+            else:
+                _select_run_tasks(actl_dir, run.id, [task_id])
+            code, _detail, run = _review_task(
+                backend, root, actl_dir, task_id, lock_fd, base_branch,
+                reviewer_model, validation_commands, run,
+            )
+            if code != 0:
+                _leave_run_open(run)
+                return code
+            return _finish_run(actl_dir, root, run)
+    except (
+        ProjectError, tasks.TaskError, sqlite3.Error,
+        execution.ExecutionError, agents.AgentError,
+        validation.ValidationError, review.ReviewError,
+    ) as exc:
+        return _fail(str(exc))
+
+
+#: Statuses ``actl task review`` accepts: an implementation exists on the task
+#: branch and is not yet approved or integrated.
+_REVIEWABLE_STATUSES = (
+    tasks.STATUS_NEEDS_HUMAN, tasks.STATUS_FAILED, tasks.STATUS_IMPLEMENTED,
+)
+
+
+def _review_task(
+    backend, root, actl_dir, task_id, lock_fd, base_branch, reviewer_model,
+    validation_commands, run,
+) -> tuple:
+    """Validate and review one task's existing implementation.
+
+    Returns ``(exit code, short reason, run)`` like ``_execute_task``. The
+    attempt record is left untouched: the review neither spends nor refunds
+    worker attempts.
+    """
+    try:
+        task = _load_task(actl_dir, task_id)
+        if task.status not in _REVIEWABLE_STATUSES:
+            raise tasks.TaskError(
+                "cannot review task t" + str(task.id) + ": it is "
+                + task.status + "; only NEEDS_HUMAN, FAILED, or IMPLEMENTED"
+                " tasks have an implementation to review"
+            )
+        _require_dependencies(task, actl_dir, run)
+    except tasks.TaskError as exc:
+        _fail(str(exc))
+        return 1, str(exc), run
+    if run is None:
+        try:
+            run = _create_run(actl_dir, root, base_branch, [task_id])
+        except (execution.ExecutionError, tasks.TaskError, sqlite3.Error) as exc:
+            _fail("cannot start a run: " + str(exc))
+            return 1, "cannot start a run", None
+    try:
+        worktree = execution.ensure_run_worktree(root, actl_dir, run)
+    except execution.ExecutionError as exc:
+        _fail("cannot prepare run r" + str(run.id) + ": " + str(exc))
+        return 1, "cannot prepare the run", run
+    if worktree.created:
+        _event(
+            "Created run r" + str(run.id) + " (branch " + run.branch
+            + ", worktree " + str(worktree.path) + ")"
+        )
+    try:
+        state = execution.attempt_state(actl_dir, task.id)
+    except execution.ExecutionError as exc:
+        return _verification_failed(actl_dir, task.id, str(exc), run)
+    attempt = max(state[0], 1) if state is not None else 1
+
+    print("task t" + str(task.id) + ": " + task.title)
+    print("reviewer model: " + reviewer_model)
+    verification = _validate_and_review(
+        backend, root, actl_dir, task, run.branch, reviewer_model,
+        validation_commands, lock_fd, attempt=attempt,
+        announce_worktree=True, run_id=run.id,
+    )
+    if verification.outcome == "approved":
+        return _complete_task(actl_dir, root, task, verification.commit, run)
+    if verification.outcome == "failed":
+        return _verification_failed(
+            actl_dir, task.id, verification.reason, run,
+            log_hint=verification.log_hint,
+        )
+    _set_task_status(actl_dir, task.id, tasks.STATUS_NEEDS_HUMAN)
+    print("")
+    print("Task t" + str(task.id) + " \u2192 NEEDS_HUMAN")
+    message = (
+        "task t" + str(task.id) + " was not approved: " + verification.reason
+    )
+    if verification.log_hint is not None:
+        message += " (log: " + str(verification.log_hint) + ")"
+    message += (
+        "; fix it and run 'actl task review t" + str(task.id) + "' again"
+    )
+    _fail(message)
+    return 1, "needs human intervention", run
+
+
 def _preflight_tasks(actl_dir: Path, requested) -> None:
     """Validate the requested tasks before the execution lock is taken.
 
@@ -3009,6 +3139,29 @@ def _new_run_refusal(actl_dir: Path, blocker, requested) -> str:
         conn.close()
 
 
+def _require_dependencies(task, actl_dir: Path, run) -> None:
+    """Refuse a task whose dependencies are not DONE or STAGED in ``run``."""
+    if not task.depends_on:
+        return
+    unfinished = _unfinished_dependencies(actl_dir, task, run)
+    if not unfinished:
+        return
+    for dep, status, dep_run in unfinished:
+        if status == tasks.STATUS_STAGED:
+            raise tasks.TaskError(
+                _dependency_staged_message(task.id, dep, dep_run)
+            )
+    detail = ", ".join(
+        "t" + str(dep) + " (" + status + ")"
+        for dep, status, _ in unfinished
+    )
+    raise tasks.TaskError(
+        "cannot run task t" + str(task.id) + ": it depends on "
+        + detail + "; a task can run only when all its dependencies"
+        " are DONE or STAGED in the current run"
+    )
+
+
 def _require_runnable(task, actl_dir: Path, run) -> None:
     """Refuse tasks that may not be executed.
 
@@ -3025,23 +3178,7 @@ def _require_runnable(task, actl_dir: Path, run) -> None:
     deliberately grants a fresh one). A DONE task already finished
     successfully and is never executed again.
     """
-    if task.depends_on:
-        unfinished = _unfinished_dependencies(actl_dir, task, run)
-        if unfinished:
-            for dep, status, dep_run in unfinished:
-                if status == tasks.STATUS_STAGED:
-                    raise tasks.TaskError(
-                        _dependency_staged_message(task.id, dep, dep_run)
-                    )
-            detail = ", ".join(
-                "t" + str(dep) + " (" + status + ")"
-                for dep, status, _ in unfinished
-            )
-            raise tasks.TaskError(
-                "cannot run task t" + str(task.id) + ": it depends on "
-                + detail + "; a task can run only when all its dependencies"
-                " are DONE or STAGED in the current run"
-            )
+    _require_dependencies(task, actl_dir, run)
     if task.status == tasks.STATUS_DONE:
         raise tasks.TaskError(
             "cannot run task t" + str(task.id) + ": it is already DONE"
@@ -3349,6 +3486,13 @@ def build_parser() -> argparse.ArgumentParser:
     )
     reset.add_argument("id", help="task id (tN or N)")
 
+    review_cmd = task_sub.add_parser(
+        "review",
+        help="validate and review a task's existing implementation (for"
+             " example after fixing a NEEDS_HUMAN task by hand), then stage it",
+    )
+    review_cmd.add_argument("id", help="task id (tN or N)")
+
     run = task_sub.add_parser(
         "run",
         help="execute tasks: test generation, worker, validation, review,"
@@ -3404,6 +3548,7 @@ def main(argv=None) -> int:
             "update": cmd_task_update,
             "delete": cmd_task_delete,
             "reset": cmd_task_reset,
+            "review": cmd_task_review,
             "run": cmd_task_run,
         }
         return handlers[args.task_command](args)

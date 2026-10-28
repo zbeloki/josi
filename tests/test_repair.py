@@ -911,5 +911,45 @@ class TaskResetTests(RepairTestCase):
         self.assertEqual(self.task_status("t2"), "NEEDS_CHANGES")
 
 
+class TaskReviewTests(RepairTestCase):
+    """``actl task review`` re-verifies a hand-fixed NEEDS_HUMAN task."""
+
+    def exhaust(self):
+        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
+        self.make_task()
+        self.assertNotEqual(self.run_task("t1").returncode, 0)
+        self.assertEqual(self.task_status(), "NEEDS_HUMAN")
+        workers = len(self.worker_calls())
+        reviews = len(self.reviewer_calls())
+        return workers, reviews
+
+    def test_approval_stages_the_task_without_a_worker(self):
+        workers, reviews = self.exhaust()
+        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.approved())
+        result = self.run_actl("task", "review", "t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertIn("Task t1 \u2192 STAGED", result.stdout)
+        self.assertEqual(len(self.worker_calls()), workers)
+        self.assertEqual(len(self.reviewer_calls()), reviews + 1)
+
+    def test_rejection_leaves_the_task_needs_human(self):
+        workers, reviews = self.exhaust()
+        result = self.run_actl("task", "review", "t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.task_status(), "NEEDS_HUMAN")
+        self.assertIn("Task t1 \u2192 NEEDS_HUMAN", result.stdout)
+        self.assertIn("was not approved", result.stderr)
+        self.assertEqual(len(self.worker_calls()), workers)
+        self.assertEqual(len(self.reviewer_calls()), reviews + 1)
+
+    def test_pending_task_is_refused(self):
+        self.make_task()
+        result = self.run_actl("task", "review", "t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("cannot review task t1", result.stderr)
+        self.assertEqual(self.task_status(), "PENDING")
+
+
 if __name__ == "__main__":
     unittest.main()

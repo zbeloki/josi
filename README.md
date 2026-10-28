@@ -40,6 +40,7 @@ actl task list              # list the project's tasks
 actl task run t1            # run a task: tests, worker, review, staging
 actl task run t1 t2 t3      # run tasks sequentially in the given order
 actl task run --all         # run every eligible task in dependency order
+actl task review t1         # validate and review a hand-fixed task, then stage it
 actl run list               # list runs and their statuses
 actl run show r1            # show one run, its commits, and its tasks
 actl run merge r1           # integrate a completed run into the base branch
@@ -174,6 +175,13 @@ actl task reset t2
   the run the dependent is currently executing in (its approved commit is
   already part of the same run branch). `APPROVED` and `STAGED` in another
   run do not unlock dependents.
+- `actl task review tN` is the way back after you fixed a `NEEDS_HUMAN` task by
+  hand (commit the fix on the task branch first). It runs no test generation
+  and no worker: it validates and reviews the commit already on the task
+  branch. On approval the task is staged exactly as by `actl task run`; if
+  the reviewer still requests changes, the findings are reported and the task
+  stays `NEEDS_HUMAN`. It also accepts `FAILED` and `IMPLEMENTED` tasks, takes
+  the execution lock, and neither spends nor refunds worker attempts.
 - `actl task reset tN` starts a task over: it clears the task's worker attempt
   budget (`.actl/attempts/tN`), the recorded test-generation outcome
   (`.actl/testgen/tN`), returns its status to `PENDING`, clears its run

@@ -29,11 +29,13 @@ Stage 4:
   worker inside a dedicated Git worktree, under a project-wide execution lock.
 * Before the first worker attempt, a test-generation turn runs in the same
   worktree with the project's test-writer model: it writes and commits the
-  task's tests, or explicitly decides that no tests are needed. Execution
-  errors, invalid outcomes, uncommitted changes, and a dirty worktree fail
-  the stage instead of starting the worker. The worker prompt instructs the
-  worker to keep the generated tests unchanged; the configured validation
-  commands still run after the worker and can execute those tests.
+  task's tests, or explicitly decides that no tests are needed. A final
+  message that is not one JSON object is reformatted once before failing.
+  Execution errors, invalid outcomes, uncommitted changes, and a dirty
+  worktree fail the stage instead of starting the worker. The worker prompt
+  instructs the worker to keep the generated tests unchanged; the configured
+  validation commands still run after the worker and can execute those
+  tests.
 
 Stage 5:
 
@@ -2038,8 +2040,12 @@ def _run_test_generation(
     :func:`_run_worker_attempt`: the parsed decision with an empty reason
     when the stage succeeded, and ``FAILED`` with a reason for an execution
     error, an invalid outcome, uncommitted changes, or a dirty worktree.
-    The stage's transcript goes into its own timestamped log and its model
-    usage is recorded under the distinct test-writer stage.
+
+    A final message that is not one JSON object is reformatted once by the
+    same session, with no file changes allowed; a message that is still not
+    one JSON object, or a decision that is unusable, fails the stage. The
+    stage's transcript goes into its own timestamped log and its model
+    usage is recorded under the distinct test-writer stages.
     """
     log_path, log = execution.open_stage_log(actl_dir, task.id, "tests")
     with log:
@@ -2067,32 +2073,63 @@ def _run_test_generation(
             # through its inherited stdout descriptor, so the header stays
             # on top and the parsed answer can be read back by position.
             log.flush()
-            output_start = log.tell()
             _event("Test writer started (model " + model + ")")
             _event("tests log: " + str(log_path))
-            exit_code = opencode.run_headless(
-                binary, worktree.path, session.id, model,
-                testgen.build_prompt(task, worktree.branch, base_branch),
-                log, pass_fds=(lock_fd,), output_format="json",
-            )
-            if exit_code == 0:
-                _event("Test writer finished with exit code 0")
-            else:
-                _event("Test writer failed with exit code " + str(exit_code))
-            with open(log.name, "rb") as transcript:
-                transcript.seek(output_start)
-                output = transcript.read().decode("utf-8", errors="replace")
-            status, reason = _evaluate_test_generation(
-                worktree, exit_code, base_branch, output,
-            )
+            prompt = testgen.build_prompt(task, worktree.branch, base_branch)
+            expected_commit = None
+            previous = None
+            for format_attempt in range(2):
+                # Parse only this turn, never a decision from an earlier turn
+                # if the correction produces no text (or reuses message IDs).
+                log.flush()
+                output_start = log.tell()
+                exit_code = opencode.run_headless(
+                    binary, worktree.path, session.id, model, prompt, log,
+                    pass_fds=(lock_fd,), output_format="json",
+                )
+                if exit_code == 0:
+                    _event("Test writer finished with exit code 0")
+                else:
+                    _event(
+                        "Test writer failed with exit code " + str(exit_code)
+                    )
+                with open(log.name, "rb") as transcript:
+                    transcript.seek(output_start)
+                    output = transcript.read().decode(
+                        "utf-8", errors="replace"
+                    )
+                # The session is reused for the one format retry, so the
+                # previous cumulative usage is subtracted to attribute each
+                # turn its own.
+                previous = _capture_usage(
+                    binary, worktree.path, session.id, model, task, run_id,
+                    usage.STAGE_TEST_WRITER if format_attempt == 0
+                    else usage.STAGE_TEST_WRITER_FORMAT_RETRY,
+                    1, log, actl_dir, previous=previous,
+                )
+                try:
+                    status, reason = _evaluate_test_generation(
+                        worktree, exit_code, base_branch, output,
+                        expected_commit=expected_commit,
+                    )
+                except testgen.TestGenFormatError as exc:
+                    if format_attempt == 0:
+                        log.write("format_error: " + str(exc) + "\n")
+                        log.write("format_retry: 1 of 1\n")
+                        _event(
+                            "Test writer output format invalid; retrying once"
+                        )
+                        # The correction may only reformat the answer: pin the
+                        # branch tip so a turn that changes it fails the stage.
+                        expected_commit = execution.head_commit(worktree.path)
+                        prompt = testgen.format_retry_prompt()
+                        continue
+                    status, reason = tasks.STATUS_FAILED, str(exc)
+                except testgen.TestGenError as exc:
+                    status, reason = tasks.STATUS_FAILED, str(exc)
+                break
         except (execution.ExecutionError, opencode.OpenCodeError, OSError) as exc:
             reason = str(exc)
-
-        if session is not None:
-            _capture_usage(
-                binary, worktree.path, session.id, model, task, run_id,
-                usage.STAGE_TEST_WRITER, 1, log, actl_dir,
-            )
 
         log.write("---\n")
         log.write("finished_at: " + _utc_now() + "\n")
@@ -2109,14 +2146,20 @@ def _run_test_generation(
     return status, reason, log_path
 
 
-def _evaluate_test_generation(worktree, exit_code, base_branch, output):
+def _evaluate_test_generation(
+    worktree, exit_code, base_branch, output, expected_commit=None,
+):
     """Turn a finished test-generation run into ``(status, reason)``.
 
     A non-zero exit, a worktree left on another branch, uncommitted or
-    untracked changes, and an unusable answer are all stage failures: the
-    worker must never start from an uncertain state. A ``tests_written``
-    decision counts only together with committed changes; a
+    untracked changes, and a branch that moved during a reformat retry are
+    all stage failures: the worker must never start from an uncertain state. A
+    ``tests_written`` decision counts only together with committed changes; a
     ``no_tests_needed`` decision succeeds without requiring a commit.
+
+    An answer that is not one JSON object raises
+    :class:`testgen.TestGenFormatError` so the caller can ask once for a
+    reformat; an unusable decision raises :class:`testgen.TestGenError`.
     """
     if exit_code != 0:
         return (
@@ -2137,10 +2180,14 @@ def _evaluate_test_generation(worktree, exit_code, base_branch, output):
             "the test writer left the worktree dirty (commit or remove the"
             " changes and run the task again)",
         )
-    try:
-        decision = testgen.outcome_from_output(output)
-    except testgen.TestGenError as exc:
-        return tasks.STATUS_FAILED, str(exc)
+    if expected_commit is not None and (
+        execution.head_commit(worktree.path) != expected_commit
+    ):
+        return (
+            tasks.STATUS_FAILED,
+            "the test writer changed the branch while reformatting its answer",
+        )
+    decision = testgen.outcome_from_output(output)
     if decision == testgen.DECISION_TESTS_WRITTEN and not (
         execution.worktree_has_committed_changes(worktree.path, base_branch)
     ):

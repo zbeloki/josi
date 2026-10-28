@@ -97,8 +97,8 @@ Behaviour is controlled through environment variables:
 * ``ACTL_FAKE_TESTS_EXIT``  - exit code for the test-writer invocation
 * ``ACTL_FAKE_TESTS_SEQUENCE`` - JSON list of per-invocation test-writer
                               behaviours (a string behaviour or an object
-                              with optional ``behavior`` and ``exit``
-                              members) selected with
+                              with optional ``behavior``, ``exit``, and
+                              ``message`` members) selected with
                               ``ACTL_FAKE_TESTS_COUNT_FILE``; entries past
                               the end fall back to ``ACTL_FAKE_TESTS``
 * ``ACTL_FAKE_TESTS_COUNT_FILE`` - file counting test-writer invocations;
@@ -212,22 +212,28 @@ def _worker_plan():
 
 
 def _tests_plan():
-    """Return ``(behavior, exit_code)`` for this test-writer invocation."""
+    """Return ``(behavior, exit_code, message)`` for this test-writer turn.
+
+    ``message`` is the final message to print, or None to fall back to
+    ``ACTL_FAKE_TESTS_JSON``.
+    """
     behavior = os.environ.get("ACTL_FAKE_TESTS", "none")
     exit_code = int(os.environ.get("ACTL_FAKE_TESTS_EXIT", "0"))
+    message = None
     index = _next_index(os.environ.get("ACTL_FAKE_TESTS_COUNT_FILE"))
     item = _sequence_item("ACTL_FAKE_TESTS_SEQUENCE", index)
     if isinstance(item, dict):
         behavior = item.get("behavior", behavior)
         exit_code = int(item.get("exit", exit_code))
+        message = item.get("message", message)
     elif isinstance(item, str):
         behavior = item
-    return behavior, exit_code
+    return behavior, exit_code, message
 
 
 def _run_test_writer():
     """Emulate one noninteractive test-writer turn in the current directory."""
-    behavior, exit_code = _tests_plan()
+    behavior, exit_code, message = _tests_plan()
     if behavior == "commit":
         with open("test-output.txt", "a", encoding="utf-8") as handle:
             handle.write("test change\\n")
@@ -253,10 +259,11 @@ def _run_test_writer():
         )
     print(json.dumps({"type": "step_start",
                       "part": {"type": "step-start"}}))
-    message = os.environ.get(
-        "ACTL_FAKE_TESTS_JSON",
-        '{"decision":"no_tests_needed","reason":"no tests required"}',
-    )
+    if message is None:
+        message = os.environ.get(
+            "ACTL_FAKE_TESTS_JSON",
+            '{"decision":"no_tests_needed","reason":"no tests required"}',
+        )
     print(json.dumps({
         "type": "text",
         "part": {"type": "text", "messageID": "msg_fake_tests",
@@ -615,24 +622,24 @@ class InitTests(ActlTestCase):
 
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertEqual(
-            metadata["worker_model"], "openrouter/z-ai/glm-5.3-flash"
+            metadata["worker_model"], "openrouter/deepseek/deepseek-v4.1-flash#low"
         )
         self.assertEqual(
-            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#medium"
+            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#high"
         )
         self.assertEqual(
-            metadata["escalation_worker_model"], "openrouter/deepseek/deepseek-v4.1-flash#high"
+            metadata["escalation_worker_model"], "openrouter/anthropic/claude-sonnet-5.5#medium"
         )
         # The defaults are reported so the user knows what was configured.
         self.assertIn(
-            "Worker model: openrouter/z-ai/glm-5.3-flash",
+            "Worker model: openrouter/deepseek/deepseek-v4.1-flash#low",
             result.stdout,
         )
         self.assertIn(
-            "Reviewer model: openrouter/openai/gpt-6-luna#medium", result.stdout
+            "Reviewer model: openrouter/openai/gpt-6-luna#high", result.stdout
         )
         self.assertIn(
-            "Escalation worker model: openrouter/deepseek/deepseek-v4.1-flash#high",
+            "Escalation worker model: openrouter/anthropic/claude-sonnet-5.5#medium",
             result.stdout,
         )
 
@@ -644,10 +651,10 @@ class InitTests(ActlTestCase):
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertEqual(metadata["worker_model"], "provider/custom")
         self.assertEqual(
-            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#medium"
+            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#high"
         )
         self.assertEqual(
-            metadata["escalation_worker_model"], "openrouter/deepseek/deepseek-v4.1-flash#high"
+            metadata["escalation_worker_model"], "openrouter/anthropic/claude-sonnet-5.5#medium"
         )
 
     def test_reinit_preserves_models_and_fills_missing_ones(self):
@@ -677,13 +684,13 @@ class InitTests(ActlTestCase):
         result = self.run_actl("init")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
-            "Updated the reviewer model to openrouter/openai/gpt-6-luna#medium",
+            "Updated the reviewer model to openrouter/openai/gpt-6-luna#high",
             result.stdout,
         )
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertEqual(metadata["worker_model"], "provider/worker")
         self.assertEqual(
-            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#medium"
+            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#high"
         )
         self.assertEqual(
             metadata["escalation_worker_model"], "provider/escalation"
@@ -698,10 +705,10 @@ class InitTests(ActlTestCase):
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertEqual(metadata["reviewer_model"], "provider/other")
         self.assertEqual(
-            metadata["worker_model"], "openrouter/z-ai/glm-5.3-flash"
+            metadata["worker_model"], "openrouter/deepseek/deepseek-v4.1-flash#low"
         )
         self.assertEqual(
-            metadata["escalation_worker_model"], "openrouter/deepseek/deepseek-v4.1-flash#high"
+            metadata["escalation_worker_model"], "openrouter/anthropic/claude-sonnet-5.5#medium"
         )
 
     def test_init_stores_default_test_writer_model(self):
@@ -712,10 +719,10 @@ class InitTests(ActlTestCase):
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertEqual(
             metadata["test_writer_model"],
-            "openrouter/deepseek/deepseek-v4.1-flash#low",
+            "openrouter/z-ai/glm-5.3#high",
         )
         self.assertIn(
-            "Test writer model: openrouter/deepseek/deepseek-v4.1-flash#low",
+            "Test writer model: openrouter/z-ai/glm-5.3#high",
             result.stdout,
         )
 
@@ -730,13 +737,13 @@ class InitTests(ActlTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
             "Updated the test writer model to"
-            " openrouter/deepseek/deepseek-v4.1-flash#low",
+            " openrouter/z-ai/glm-5.3#high",
             result.stdout,
         )
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertEqual(
             metadata["test_writer_model"],
-            "openrouter/deepseek/deepseek-v4.1-flash#low",
+            "openrouter/z-ai/glm-5.3#high",
         )
 
     def test_reinit_explicit_test_writer_model_updates_only_that_role(self):
@@ -748,10 +755,10 @@ class InitTests(ActlTestCase):
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertEqual(metadata["test_writer_model"], "provider/tests")
         self.assertEqual(
-            metadata["worker_model"], "openrouter/z-ai/glm-5.3-flash"
+            metadata["worker_model"], "openrouter/deepseek/deepseek-v4.1-flash#low"
         )
         self.assertEqual(
-            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#medium"
+            metadata["reviewer_model"], "openrouter/openai/gpt-6-luna#high"
         )
 
     def test_init_invalid_test_writer_model_is_rejected(self):

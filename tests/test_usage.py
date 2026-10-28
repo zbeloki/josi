@@ -3,7 +3,8 @@
 The fake ``opencode`` reports configurable session usage (``GET
 /api/session/<id>``) and model pricing metadata (``GET /api/model``), so
 these tests verify that test generation, worker attempts, reviews, and
-review-format retries each record their own tokens and cost, that the
+format retries of either the reviewer or the test writer each record their
+own tokens and cost, that the
 records survive CLI invocations, and that missing data is never mistaken for
 zero. The transcripts and the terminal output stay exactly as before.
 """
@@ -291,6 +292,48 @@ class UsageCaptureTests(UsageTestCase):
         self.assertAlmostEqual(rows[3].cost_total, 0.03)
 
         log = self.review_logs()[-1].read_text(encoding="utf-8")
+        self.assertIn("format_retry: 1 of 1", log)
+        self.assertEqual(log.count("usage: input="), 2)
+
+    def test_test_writer_format_retry_is_attributed_separately(self):
+        self.set_pricing()
+        decision = {"decision": "tests_written", "summary": "added"}
+        self.env["ACTL_FAKE_TESTS_SEQUENCE"] = json.dumps([
+            {"behavior": "commit",
+             "message": "Tests pass.\n\n" + json.dumps(decision)},
+            {"message": json.dumps(decision)},
+        ])
+        self.env["ACTL_FAKE_TESTS_COUNT_FILE"] = str(self.base / "tests-count")
+        # The test-writer session is reused for the retry, so its cumulative
+        # totals grow: the second lookup's difference is the retry's usage.
+        self.set_session_sequence([
+            {"cost": 0.005, "tokens": token_counts(500)},
+            {"cost": 0.01, "tokens": token_counts(1000)},
+            {"cost": 0.02, "tokens": token_counts(2000)},
+            {"cost": 0.05, "tokens": token_counts(5000)},
+        ])
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn(
+            "Test writer output format invalid; retrying once", result.stdout
+        )
+
+        rows = self.usage_rows()
+        self.assertEqual(
+            [row.stage for row in rows],
+            ["test_writer", "test_writer_format_retry", "worker", "review"],
+        )
+        # The retry's tokens are the difference between the two cumulative
+        # test-writer lookups (1000 - 500); the worker and review sessions are
+        # fresh, so their lookups already are their own usage.
+        self.assertEqual(
+            [row.input_tokens for row in rows], [500, 500, 2000, 5000]
+        )
+        self.assertAlmostEqual(rows[0].cost_total, 0.005)
+        self.assertAlmostEqual(rows[1].cost_total, 0.005)
+
+        log = self.generation_logs()[-1].read_text(encoding="utf-8")
         self.assertIn("format_retry: 1 of 1", log)
         self.assertEqual(log.count("usage: input="), 2)
 

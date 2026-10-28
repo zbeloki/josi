@@ -10,7 +10,9 @@ Like the reviewer, the test writer must end its turn with exactly one
 complete JSON object; ``opencode run --format json`` makes the final message
 machine-readable. Parsing is strict: prose around the answer, several
 objects, truncated JSON, and unknown decisions are all rejected, so an
-ambiguous answer can never pass as a decision. The orchestration layer
+ambiguous answer can never pass as a decision. A message that is not one JSON
+object at all may be reformatted once, like the reviewer's; an unknown or
+otherwise unusable decision fails the stage directly. The orchestration layer
 combines the parsed decision with the worktree state: ``tests_written``
 counts only together with committed changes and a clean worktree, while
 ``no_tests_needed`` never requires a commit.
@@ -28,6 +30,10 @@ DECISIONS = (DECISION_TESTS_WRITTEN, DECISION_NO_TESTS_NEEDED)
 
 class TestGenError(Exception):
     """Raised when the test writer's outcome is missing or unusable."""
+
+
+class TestGenFormatError(TestGenError):
+    """The final message is not one JSON object and may be reformatted once."""
 
 
 def build_prompt(task, branch: str, base_branch: str) -> str:
@@ -73,6 +79,20 @@ def build_prompt(task, branch: str, base_branch: str) -> str:
     ])
 
 
+def format_retry_prompt() -> str:
+    """Ask the same test writer to reformat, not reconsider its decision."""
+    return (
+        "Your final message was rejected because it was not one complete"
+        " JSON object. Re-emit your decision as exactly one JSON object, and"
+        " nothing else.\n"
+        "Preserve the decision you already made, with the same summary or"
+        " reason. Do not change the decision, write or commit tests, run"
+        " commands, or modify any file. Do not use tools. Do not include a"
+        " test summary, introductory prose, Markdown fences, or any text"
+        " outside the JSON."
+    )
+
+
 def outcome_from_output(output: str) -> str:
     """Extract the test writer's decision from its ``--format json`` output.
 
@@ -89,20 +109,25 @@ def parse_outcome(text: str) -> str:
     """Parse and validate one test-writer decision.
 
     The final message must be exactly one complete JSON object whose
-    ``decision`` is one of :data:`DECISIONS`; anything else - prose, several
-    objects, truncated JSON, an unknown decision - raises
-    :class:`TestGenError`. Extra members such as a summary or a reason are
-    ignored here; the full transcript stays in the stage log.
+    ``decision`` is one of :data:`DECISIONS`; a message that is not one JSON
+    object - prose, several objects, truncated JSON - raises
+    :class:`TestGenFormatError` (the orchestration layer may ask once for a
+    reformat), while an unusable decision such as an unknown one raises a
+    plain :class:`TestGenError`. Extra members such as a summary or a reason
+    are ignored here; the full transcript stays in the stage log.
     """
     stripped = _strip_code_fence(text.strip())
     try:
         payload = json.loads(stripped)
     except ValueError:
-        raise TestGenError(
+        raise TestGenFormatError(
             "the test writer output is not one complete JSON object"
+            " (nothing may appear before or after it)"
         )
     if not isinstance(payload, dict):
-        raise TestGenError("the test writer outcome is not a JSON object")
+        raise TestGenFormatError(
+            "the test writer outcome is not a JSON object"
+        )
     decision = payload.get("decision")
     if decision not in DECISIONS:
         raise TestGenError("unknown test-writer decision " + repr(decision))

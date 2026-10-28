@@ -2,7 +2,8 @@
 
 actl records how many tokens each OpenCode invocation used and what it cost,
 so a task's usage can accumulate across worker attempts, reviews, and
-review-format retries, and across CLI invocations. The raw numbers come from
+format retries of either the reviewer or the test writer, and across CLI
+invocations. The raw numbers come from
 OpenCode's own session metadata (``GET /api/session/<id>``: the session's
 cumulative ``cost`` and ``tokens``); actl turns a session's cumulative totals
 into one invocation's usage by subtracting the totals read before the turn.
@@ -22,6 +23,7 @@ from typing import Optional
 
 # Invocation stages actl attributes usage to.
 STAGE_TEST_WRITER = "test_writer"
+STAGE_TEST_WRITER_FORMAT_RETRY = "test_writer_format_retry"
 STAGE_WORKER = "worker"
 STAGE_REVIEW = "review"
 STAGE_REVIEW_FORMAT_RETRY = "review_format_retry"

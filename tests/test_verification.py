@@ -1068,7 +1068,7 @@ class TestWriterModelConfigTests(VerificationTestCase):
         # updates only this setting.
         self.assertEqual(
             self.metadata()["test_writer_model"],
-            "openrouter/deepseek/deepseek-v4.1-flash#low",
+            "openrouter/z-ai/glm-5.3#high",
         )
         result = self.run_actl("init", "--test-writer-model", "provider/writer")
         self.assertEqual(result.returncode, 0, result.stderr)

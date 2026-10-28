@@ -48,10 +48,10 @@ actl run merge r1           # integrate a completed run into the base branch
   Running it again is harmless. It also checks that OpenCode is installed.
   It always records all four model settings, so a project is ready to run a
   task right away. Without an argument each setting gets a default:
-  `worker_model` = `openrouter/z-ai/glm-5.3-flash`,
-  `reviewer_model` = `openrouter/openai/gpt-6-luna#medium`,
-  `escalation_worker_model` = `openrouter/deepseek/deepseek-v4.1-flash#high`,
-  and `test_writer_model` = `openrouter/deepseek/deepseek-v4.1-flash#low`.
+  `worker_model` = `openrouter/deepseek/deepseek-v4.1-flash#low`,
+  `reviewer_model` = `openrouter/openai/gpt-6-luna#high`,
+  `escalation_worker_model` = `openrouter/anthropic/claude-sonnet-5.5#medium`,
+  and `test_writer_model` = `openrouter/z-ai/glm-5.3#high`.
   `actl init --worker-model MODEL` overrides the default worker model, for
   example `actl init --worker-model openrouter/anthropic/claude-sonnet-latest`;
   `actl init --reviewer-model MODEL` overrides the independent reviewer's
@@ -193,14 +193,15 @@ One run goes through these steps:
    worktree with the project's test-writer model and the built-in `build`
    agent. It decides whether the task needs automated tests: it either
    writes and commits them on the task branch, or explicitly decides that no
-   tests are needed and changes nothing. The generated tests stay committed
-   on the task branch: the worker implements the task around them, and the
-   project's configured validation commands exercise them after the worker -
-   actl never runs the tests itself, and validation stays optional when no
-   commands are configured. A completed stage is recorded (and
-   never repeated on a retry); an execution error, an invalid outcome,
-   uncommitted changes, or a dirty worktree fails the task instead of
-   starting the worker.
+   tests are needed and changes nothing. A final message that is not one
+   JSON object is reformatted once, like the reviewer's verdict. The
+   generated tests stay committed on the task branch: the worker implements
+   the task around them, and the project's configured validation commands
+   exercise them after the worker - actl never runs the tests itself, and
+   validation stays optional when no commands are configured. A completed
+   stage is recorded (and never repeated on a retry); an execution error, an
+   invalid outcome, uncommitted changes, or a dirty worktree fails the task
+   instead of starting the worker.
 6. OpenCode runs one noninteractive turn inside the worktree with the
    project's worker model and the built-in `build` agent
    (`opencode run --agent build --model MODEL --session ID`). A repair
@@ -378,9 +379,12 @@ either write and commit them (running them to verify they pass) or explicitly
 decide that no tests are needed and change nothing. It must end its turn with
 exactly one JSON decision - `tests_written` or `no_tests_needed` - which is
 parsed strictly like the reviewer's verdict; prose, several objects, and
-unknown decisions are refused. `tests_written` counts only together with
-committed changes, `no_tests_needed` succeeds without requiring a commit, and
-either way the worktree must be clean before the worker starts.
+unknown decisions are refused. A final message that is not one JSON object is
+reformatted once by the same session, like the reviewer's verdict: the
+correction may only restate the decision, and a turn that changes the branch
+fails the stage. `tests_written` counts only together with committed changes,
+`no_tests_needed` succeeds without requiring a commit, and either way the
+worktree must be clean before the worker starts.
 
 The lifecycle is:
 
@@ -484,7 +488,7 @@ actl init --worker-model provider/model#variant   # with a model variant
 
 It is stored as `worker_model` in `.actl/project.json` (the file may be
 edited directly as well) and defaults to
-`openrouter/z-ai/glm-5.3-flash` when `actl init` runs without
+`openrouter/deepseek/deepseek-v4.1-flash#low` when `actl init` runs without
 `--worker-model`. `actl task run` requires it whenever the worker
 runs: a task that is not `IMPLEMENTED` fails before the worktree is prepared
 or anything is launched without one, while an `IMPLEMENTED` task is validated
@@ -498,7 +502,7 @@ actl init --escalation-worker-model openrouter/anthropic/claude-opus-latest
 ```
 
 It is stored as `escalation_worker_model` in `.actl/project.json` and defaults
-to `openrouter/deepseek/deepseek-v4.1-flash#high` when `actl init` runs without
+to `openrouter/anthropic/claude-sonnet-5.5#medium` when `actl init` runs without
 `--escalation-worker-model`. It is used
 for the third and final worker attempt of a repair cycle. `actl task run`
 requires it exactly like the reviewer model: without one the run fails before
@@ -514,7 +518,7 @@ actl init --reviewer-model openrouter/anthropic/claude-sonnet-latest
 ```
 
 It is stored as `reviewer_model` in `.actl/project.json` and defaults to
-`openrouter/openai/gpt-6-luna#medium` when `actl init` runs without
+`openrouter/openai/gpt-6-luna#high` when `actl init` runs without
 `--reviewer-model`. `actl task run`
 requires it: without a reviewer model the command fails before taking the
 execution lock, creating a worktree, or changing the task, instead of
@@ -528,7 +532,7 @@ actl init --test-writer-model openrouter/deepseek/deepseek-v4.1-flash#low
 ```
 
 It is stored as `test_writer_model` in `.actl/project.json` and defaults to
-`openrouter/deepseek/deepseek-v4.1-flash#low` when `actl init` runs without
+`openrouter/z-ai/glm-5.3#high` when `actl init` runs without
 `--test-writer-model`. `actl task run` requires it exactly like the reviewer
 and escalation models: without one the run fails before taking the execution
 lock, creating a worktree, or changing the task.
@@ -594,16 +598,17 @@ the final summary; use `tail -f` to watch a run.
 
 ### Usage and cost reporting
 
-Every worker attempt, test-generation turn, review, and review-format retry
-reads its usage from OpenCode's session metadata (`GET /api/session/<id>`),
+Every worker attempt, test-generation turn, review, and format retry of
+either the test writer or the reviewer reads its usage from OpenCode's
+session metadata (`GET /api/session/<id>`),
 which reports the session's cumulative `cost` and token counts. For a reused
 session, actl subtracts the cumulative totals read before the turn from the
 totals read after it; for a fresh session, the reported totals are that
 turn's usage. Each invocation's token counts (input, output, reasoning,
 cache read, and cache write) and available cost data are written to that
 invocation's log and stored in `.actl/tasks.db` with its task id, run id,
-stage (`worker`, `test_writer`, `review`, or `review_format_retry`), and
-attempt.
+stage (`worker`, `test_writer`, `test_writer_format_retry`, `review`, or
+`review_format_retry`), and attempt.
 
 The `cost_total` is OpenCode's reported cost when OpenCode provides one. When
 the model's pricing metadata is also available (`GET /api/model`), actl
@@ -1077,7 +1082,10 @@ session, configured model, JSON output format, task worktree, and position
 before the worker; `no_tests_needed` succeeding without a commit and
 `tests_written` counting only together with committed test changes; invalid
 outcomes, execution errors, uncommitted or untracked changes, and empty
-commits failing the stage before the worker starts; the stage's own
+commits failing the stage before the worker starts; a prose-wrapped or
+otherwise malformed final message being reformatted once without losing the
+decision or the commit, a bounded retry, and an unusable decision or a
+branch-changing retry failing the stage; the stage's own
 `-tests.log` and the separate `test_writer` usage records; the worker prompt
 keeping the generated tests unchanged; the completed stage persisting across
 retries, repair attempts, and resumes while a failed stage reruns without

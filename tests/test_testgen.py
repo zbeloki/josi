@@ -6,7 +6,9 @@ model. The fake test writer either decides that no tests are needed (the
 default; it changes nothing) or commits test changes; the stage has its own
 timestamped log, records its usage under the distinct ``test_writer`` stage,
 and treats execution errors, invalid outcomes, uncommitted changes, and a
-dirty worktree as failures instead of starting the worker.
+dirty worktree as failures instead of starting the worker. A final message
+that is not one JSON object is reformatted once by the same session before
+the stage fails.
 
 These tests also cover the stage's integration into task execution: a
 completed stage is never repeated - not for a repair attempt and not when an
@@ -582,6 +584,105 @@ class TestGenerationStageTests(TestGenTestCase):
             "a verification-only resume must not launch test generation",
         )
         self.assertEqual(len(self.worker_calls()), workers)
+
+
+class TestGenerationFormatRetryTests(TestGenTestCase):
+    """A malformed final message is reformatted once, like a verdict."""
+
+    def set_tests_sequence(self, entries, name="tests-count"):
+        self.env["ACTL_FAKE_TESTS_SEQUENCE"] = json.dumps(entries)
+        self.env["ACTL_FAKE_TESTS_COUNT_FILE"] = str(self.base / name)
+
+    def test_prose_before_the_decision_is_reformatted(self):
+        # The test writer commits tests but wraps its decision in prose: the
+        # stage asks the same session once more for JSON only, keeps the
+        # commit, and the worker starts from it.
+        self.set_tests_sequence([
+            {"behavior": "commit",
+             "message": "All tests pass.\n\n" + json.dumps(TESTS_WRITTEN)},
+            {"message": json.dumps(TESTS_WRITTEN)},
+        ])
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertIn(
+            "Test writer output format invalid; retrying once", result.stdout
+        )
+
+        calls = self.generation_calls()
+        self.assertEqual(len(calls), 2)
+        first, retry = calls
+        self.assertEqual(
+            first["argv"][first["argv"].index("--session") + 1],
+            retry["argv"][retry["argv"].index("--session") + 1],
+            "the retry must reuse the test-writer session",
+        )
+        self.assertEqual(retry["cwd"], first["cwd"])
+        self.assertEqual(
+            retry["argv"][retry["argv"].index("--agent") + 1], "build"
+        )
+        self.assertIn("exactly one JSON object", retry["argv"][-1])
+        self.assertIn("Do not use tools", retry["argv"][-1])
+
+        log = self.latest_generation_log()
+        self.assertIn("format_error: ", log)
+        self.assertIn("format_retry: 1 of 1", log)
+        self.assertIn("result: tests_written\n", log)
+        self.assertEqual(self.outcome_record(), {"decision": "tests_written"})
+
+        # The committed tests survive the reformatting turn, and the worker
+        # implements the task on top of them.
+        subjects = self.git(
+            "log", "--format=%s", "actl/t1"
+        ).stdout.splitlines()
+        self.assertEqual(subjects[0], "worker: implement task")
+        self.assertEqual(subjects[1], "test writer: add tests")
+        self.assertEqual(len(self.worker_calls()), 1)
+
+    def test_format_retry_is_bounded(self):
+        self.set_tests_sequence([
+            {"message": "prose\n\n" + json.dumps(TESTS_WRITTEN)},
+            {"message": "still prose, no JSON at all"},
+        ])
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertIn("not one complete JSON object", result.stderr)
+        self.assertEqual(len(self.generation_calls()), 2)
+        self.assertEqual(self.worker_calls(), [], "the worker must not start")
+        log = self.latest_generation_log()
+        self.assertIn("format_retry: 1 of 1", log)
+        self.assertIn("result: FAILED\n", log)
+
+    def test_unusable_decision_is_not_reformatted(self):
+        # An unknown decision is unusable, not badly formatted: it fails the
+        # stage without spending a reformatting turn.
+        self.env["ACTL_FAKE_TESTS_JSON"] = '{"decision": "maybe"}'
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertIn("unknown test-writer decision", result.stderr)
+        self.assertEqual(len(self.generation_calls()), 1)
+        self.assertEqual(self.worker_calls(), [])
+
+    def test_retry_that_changes_the_branch_fails_the_stage(self):
+        # A reformatting turn may only restate the decision: a turn that
+        # commits again moves the branch and fails the stage.
+        self.set_tests_sequence([
+            {"behavior": "commit",
+             "message": "prose\n\n" + json.dumps(TESTS_WRITTEN)},
+            {"behavior": "commit", "message": json.dumps(TESTS_WRITTEN)},
+        ])
+        self.make_task()
+        result = self.run_task("t1")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.task_status(), "FAILED")
+        self.assertIn("changed the branch while reformatting", result.stderr)
+        self.assertEqual(len(self.generation_calls()), 2)
+        self.assertEqual(self.worker_calls(), [], "the worker must not start")
 
 
 if __name__ == "__main__":

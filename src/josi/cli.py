@@ -5,8 +5,8 @@ Stage 1 commands:
 * ``josi init`` - register the current Git repository as a Josi project and
   record its base branch (``--base``, or detected/selected automatically).
 * ``josi plan`` - start a fresh planner session in the project's agent CLI
-  (the OpenCode TUI or interactive Claude Code); every run starts a new one.
-* ``josi init --agent opencode|claude`` selects that agent CLI for the project.
+  (the OpenCode TUI, Claude Code, or Codex); every run starts a new one.
+* ``josi init --agent opencode|claude|codex`` selects that agent CLI for the project.
 
 Stage 2 commands:
 
@@ -819,8 +819,8 @@ def cmd_plan(args) -> int:
         backend = agents.create(agent)
     except (ProjectError, MetadataError, agents.AgentError) as exc:
         return _fail(str(exc))
-    if agent == agents.AGENT_CLAUDE:
-        print("Started a Claude Code planner session in " + str(root))
+    if agent in (agents.AGENT_CLAUDE, agents.AGENT_CODEX):
+        print("Started a " + backend.label + " planner session in " + str(root))
         sys.stdout.flush()
         try:
             returncode = backend.launch_planner(root, _planner_system_prompt())
@@ -828,7 +828,7 @@ def cmd_plan(args) -> int:
             return _fail(str(exc))
         if returncode != 0:
             print(
-                "josi: error: Claude Code exited with status " + str(returncode),
+                "josi: error: " + backend.label + " exited with status " + str(returncode),
                 file=sys.stderr,
             )
         return returncode
@@ -3420,7 +3420,8 @@ def build_parser() -> argparse.ArgumentParser:
     init.add_argument(
         "--worker-model", metavar="MODEL",
         help="set the project's worker model (name[#effort], e.g."
-             " provider/model#variant for OpenCode or sonnet#low for Claude);"
+             " provider/model#variant for OpenCode, sonnet#low for Claude, or"
+             " gpt-6.1-sol#low for Codex);"
              " required by 'josi task run' whenever the worker runs",
     )
     init.add_argument(

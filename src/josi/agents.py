@@ -2,11 +2,13 @@
 
 A project selects one backend (``agent`` in ``.josi/project.json``) and every
 role - planner, worker, reviewer, escalation worker, test writer - runs on it.
-Two backends exist:
+Backends include:
 
 * :class:`OpenCodeBackend` wraps the OpenCode CLI (see :mod:`josi.opencode`).
   It creates sessions explicitly, resumes them by ID, and reads usage from
   the session metadata.
+* :class:`CodexBackend` drives ``codex exec --json``, maps local session
+  handles to reported thread IDs, and resumes those threads for format retries.
 * :class:`ClaudeBackend` drives the Claude Code CLI (``claude``). A session is
   a UUID chosen by josi: the first turn passes ``--session-id`` and later turns
   of the same session pass ``--resume``. Noninteractive turns run as
@@ -33,7 +35,8 @@ from . import opencode, usage
 
 AGENT_OPENCODE = "opencode"
 AGENT_CLAUDE = "claude"
-AGENTS = (AGENT_OPENCODE, AGENT_CLAUDE)
+AGENT_CODEX = "codex"
+AGENTS = (AGENT_OPENCODE, AGENT_CLAUDE, AGENT_CODEX)
 DEFAULT_AGENT = AGENT_OPENCODE
 
 ROLE_PLANNER = "planner"
@@ -55,6 +58,12 @@ DEFAULT_MODELS = {
         ),
         "test_writer_model": ("openrouter/z-ai/glm-5.3", "high"),
     },
+    AGENT_CODEX: {
+        "worker_model": ("gpt-6.1-sol", "low"),
+        "reviewer_model": ("gpt-6.1-sol", "medium"),
+        "escalation_worker_model": ("gpt-6-astra", "medium"),
+        "test_writer_model": ("gpt-6.1-sol", "medium"),
+    },
     AGENT_CLAUDE: {
         "worker_model": ("sonnet", "low"),
         "reviewer_model": ("opus", "medium"),
@@ -62,6 +71,8 @@ DEFAULT_MODELS = {
         "test_writer_model": ("sonnet", "medium"),
     },
 }
+
+CODEX_EFFORTS = ("none", "minimal", "low", "medium", "high", "xhigh")
 
 CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 
@@ -115,17 +126,19 @@ def parse_model(agent: str, value: str, role: str) -> str:
     """
     setting = value.strip()
     name, effort = split_model(setting)
-    if agent == AGENT_CLAUDE:
+    if agent in (AGENT_CLAUDE, AGENT_CODEX):
+        efforts = CODEX_EFFORTS if agent == AGENT_CODEX else CLAUDE_EFFORTS
+        label = "Codex" if agent == AGENT_CODEX else "Claude"
         if (
             not name or name.startswith("-")
             or any(char.isspace() for char in setting)
-            or (effort and effort not in CLAUDE_EFFORTS)
+            or (effort and effort not in efforts)
             or ("#" in setting and not effort)
         ):
             raise ValueError(
                 "invalid " + role + " model " + repr(value)
-                + " (expected a Claude model such as sonnet or opus,"
-                " optionally #" + "|".join(CLAUDE_EFFORTS) + ")"
+                + " (expected a " + label + " model name,"
+                " optionally #" + "|".join(efforts) + ")"
             )
         return setting
     provider, _, rest = setting.partition("/")
@@ -143,6 +156,8 @@ def parse_model(agent: str, value: str, role: str) -> str:
 
 def find_binary(agent: str) -> str:
     """Return the absolute path of ``agent``'s executable or raise AgentError."""
+    if agent == AGENT_CODEX:
+        return CodexBackend.find_binary()
     if agent == AGENT_CLAUDE:
         return ClaudeBackend.find_binary()
     return opencode.find_binary()
@@ -150,6 +165,8 @@ def find_binary(agent: str) -> str:
 
 def create(agent: str):
     """Return the backend for ``agent`` bound to its installed executable."""
+    if agent == AGENT_CODEX:
+        return CodexBackend(find_binary(agent))
     if agent == AGENT_CLAUDE:
         return ClaudeBackend(find_binary(agent))
     return OpenCodeBackend(find_binary(agent))
@@ -357,3 +374,156 @@ def _last_result(output: str):
         if event.get("type") == "result":
             result = event
     return result
+
+
+class CodexBackend:
+    """Drive Codex directly; local handles map to CLI-created thread IDs."""
+
+    name = AGENT_CODEX
+    label = "Codex"
+
+    def __init__(self, binary: str):
+        self.binary = binary
+        self._threads = {}
+        self._started = set()
+
+    @staticmethod
+    def find_binary():
+        path = shutil.which("codex")
+        if path is None:
+            raise AgentError(
+                "Codex is not installed or not on PATH (no 'codex' executable found)"
+            )
+        return os.path.abspath(path)
+
+    def create_session(self, directory: Path, title: str, role: str):
+        return opencode.Session(id=str(uuid.uuid4()), directory=str(directory))
+
+    def run_headless(
+        self, directory, session, model, prompt, output, role,
+        pass_fds=(), structured=False,
+    ):
+        name, effort = split_model(model)
+        command = [self.binary, "exec", "--json", "--model", name]
+        if effort:
+            command += ["-c", "model_reasoning_effort=" + json.dumps(effort)]
+        # Exec options precede the resume subcommand so sandbox restrictions
+        # apply to fresh turns and retries alike.
+        if role == ROLE_REVIEWER:
+            command += ["--sandbox", "read-only", "-c", 'approval_policy="never"']
+        else:
+            command += ["--dangerously-bypass-approvals-and-sandbox"]
+        if session.id in self._started:
+            thread = self._threads.get(session.id)
+            if not thread:
+                raise AgentError("cannot resume Codex: no thread.started thread ID was reported")
+            command += ["resume", thread]
+        command.append("-")
+        self._started.add(session.id)
+        output.flush()
+        start = output.tell()
+        try:
+            proc = subprocess.run(
+                command, cwd=str(directory), input=prompt.encode("utf-8"),
+                stdout=output, stderr=subprocess.STDOUT, pass_fds=tuple(pass_fds),
+            )
+        except OSError as exc:
+            raise AgentError("could not run Codex: " + str(exc)) from exc
+        output.flush()
+        with open(output.name, "rb") as transcript:
+            transcript.seek(start)
+            events = transcript.read().decode("utf-8", errors="replace")
+        parsed = list(_events(events))
+        for event in parsed:
+            thread = event.get("thread_id")
+            if (
+                event.get("type") == "thread.started"
+                and isinstance(thread, str) and thread.strip()
+            ):
+                previous = self._threads.get(session.id)
+                if previous and previous != thread:
+                    raise AgentError("Codex resumed an unexpected thread: " + thread)
+                self._threads[session.id] = thread
+                output.write("codex_thread: " + thread + "\n")
+        output.flush()
+        if proc.returncode == 0:
+            failures = [e for e in parsed if e.get("type") in ("turn.failed", "error")]
+            if failures:
+                raise AgentError("Codex turn failed: " + json.dumps(failures[-1]))
+            if not structured and _codex_turn(events)[1] is None:
+                raise AgentError("Codex returned an incomplete event stream (no turn.completed)")
+        return proc.returncode
+
+    def final_text(self, output: str) -> str:
+        text, completed = _codex_turn(output)
+        return text if completed is not None else ""
+
+    def turn_usage(self, directory, session, model, turn_output, previous):
+        _, completed = _codex_turn(turn_output)
+        tokens = completed.get("usage") if completed else None
+        if not isinstance(tokens, dict):
+            return None, usage.unavailable()
+        total = _codex_token(tokens, "input_tokens")
+        cached = _codex_token(tokens, "cached_input_tokens")
+        # Codex input includes cached input. Josi stores the two separately.
+        uncached = (
+            total - cached
+            if total is not None and cached is not None and cached <= total
+            else None
+        )
+        return None, usage.Usage(
+            available=True, input_tokens=uncached,
+            cache_read_tokens=cached,
+            output_tokens=_codex_token(tokens, "output_tokens"),
+        )
+
+    def planner_command(self, system_prompt: str) -> list:
+        instructions = system_prompt + (
+            "\nDo not implement, execute tasks, access the web, or delegate to other agents."
+            " Use josi task create/list/show/update/delete to manage tasks;"
+            " request approval for task-management writes."
+        )
+        return [
+            self.binary, "--sandbox", "read-only", "--ask-for-approval", "on-request",
+            "-c", "developer_instructions=" + json.dumps(instructions),
+            "-c", 'web_search="disabled"', "-c", "features.multi_agent=false",
+        ]
+
+    def launch_planner(self, root: Path, system_prompt: str) -> int:
+        try:
+            return subprocess.run(self.planner_command(system_prompt), cwd=str(root)).returncode
+        except OSError as exc:
+            raise AgentError("could not launch Codex: " + str(exc)) from exc
+
+
+def _codex_turn(output: str):
+    """Only a completed turn can supply an answer; never reuse older text."""
+    pending = ""
+    text = ""
+    completed = None
+    for event in _events(output):
+        kind = event.get("type")
+        if kind in ("thread.started", "turn.started", "turn.failed", "error"):
+            pending, text, completed = "", "", None
+        elif kind in ("item.started", "item.updated", "item.completed"):
+            if completed is not None:
+                pending, text, completed = "", "", None
+            item = event.get("item")
+            if (
+                kind == "item.completed" and isinstance(item, dict)
+                and item.get("type") == "agent_message"
+            ):
+                value = item.get("text")
+                pending = value if isinstance(value, str) else ""
+        elif kind == "turn.completed":
+            text, pending = pending, ""
+            completed = event
+    return text, completed
+
+
+def _codex_token(tokens, key):
+    """Keep malformed counters unavailable, including non-finite numbers."""
+    value = tokens.get(key)
+    if isinstance(value, int) and not isinstance(value, bool) and value >= 0:
+        return value
+    return None

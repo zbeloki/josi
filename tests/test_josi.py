@@ -1253,7 +1253,7 @@ class PlanGuardTests(JosiTestCase):
             json.dumps({"schema_version": 1, "name": 42}),
             json.dumps({"schema_version": 1, "name": "repo", "base_branch": 42}),
             json.dumps({"schema_version": 1, "name": "repo", "base_branch": "  "}),
-            json.dumps({"schema_version": 1, "name": "repo", "agent": "codex"}),
+            json.dumps({"schema_version": 1, "name": "repo", "agent": "unsupported-agent"}),
         ]
         for payload in payloads:
             with self.subTest(payload=payload):

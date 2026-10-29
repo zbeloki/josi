@@ -1,7 +1,7 @@
 # Josi
 
 Josi is a lightweight Python CLI for orchestrating AI coding agents through
-[OpenCode](https://opencode.ai) or [Claude Code](https://claude.com/claude-code)
+[OpenCode](https://opencode.ai), [Claude Code](https://claude.com/claude-code), or Codex
 (a per-project choice, see "Agent backends"). Stage 1 covers project setup and planning;
 Stage 2 adds a project-local task list; Stage 3 lets the planner manage that
 task list through the same `josi task` CLI; Stage 4 runs one task at a time
@@ -20,7 +20,7 @@ configured base branch and marks its tasks `DONE`.
 - Git
 - The CLI of the project's agent on `PATH`: OpenCode (v2, tested with OpenCode
   2.1.2) for the default `opencode` agent, or Claude Code (`claude`) for the
-  `claude` agent
+  `claude` agent, or Codex (`codex`) for the `codex` agent
 
 ## Install
 
@@ -87,12 +87,13 @@ josi run merge r1           # integrate a completed run into the base branch
 
 A project runs on one agent CLI, stored as `agent` in `.josi/project.json`:
 `opencode` (the default, also assumed for projects created before the setting
-existed) or `claude`. Every role - planner, worker, reviewer, escalation
+existed), `claude`, or `codex`. Every role - planner, worker, reviewer, escalation
 worker, and test writer - uses it.
 
 ```sh
 josi init                      # OpenCode (default)
 josi init --agent claude       # Claude Code
+josi init --agent codex        # Codex
 ```
 
 Model settings are `(model, effort)` pairs, stored as
@@ -102,18 +103,47 @@ into `provider/model#variant`; for Claude Code it passes `--model name` and
 `--effort effort` (`low`, `medium`, `high`, `xhigh`, `max`). Each agent has
 its own defaults:
 
-| setting | `opencode` | `claude` |
-| --- | --- | --- |
-| worker | `openrouter/deepseek/deepseek-v4.1-flash#low` | `sonnet#low` |
-| reviewer | `openrouter/openai/gpt-6-luna#high` | `opus#medium` |
-| escalation worker | `openrouter/anthropic/claude-sonnet-5.5#medium` | `opus#medium` |
-| test writer | `openrouter/z-ai/glm-5.3#high` | `sonnet#medium` |
+| setting | `opencode` | `claude` | `codex` |
+| --- | --- | --- | --- |
+| worker | `openrouter/deepseek/deepseek-v4.1-flash#low` | `sonnet#low` | `gpt-6.1-sol#low` |
+| reviewer | `openrouter/openai/gpt-6-luna#high` | `opus#medium` | `gpt-6.1-sol#medium` |
+| escalation worker | `openrouter/anthropic/claude-sonnet-5.5#medium` | `opus#medium` | `gpt-6-astra#medium` |
+| test writer | `openrouter/z-ai/glm-5.3#high` | `sonnet#medium` | `gpt-6.1-sol#medium` |
 
 `josi init --agent` on an existing project switches its agent and resets all
 four model settings to the new agent's defaults (models named in the same
 command are kept). Re-running `josi init` without `--agent` keeps the stored
 agent and models. Older projects that store models as `name#effort` strings
 keep working unchanged.
+
+With `codex`:
+
+- Install the Codex CLI with its `codex` executable on `PATH` and authenticate
+  separately (for example, `codex login`). Your account must have access to the
+  configured models; Josi does not substitute models automatically or use an SDK.
+- Model names need no provider prefix. Josi passes `--model` and configures
+  `model_reasoning_effort` for `#none`, `#minimal`, `#low`, `#medium`, `#high`,
+  or `#xhigh`. Codex reports model-specific effort incompatibilities.
+- Workers, escalation workers, and test writers use `codex exec --json` with
+  prompts on stdin and `--dangerously-bypass-approvals-and-sandbox`. They can
+  execute commands without confirmation or sandbox restrictions, matching
+  Josi's Claude automation behavior. Use a trusted repository and environment.
+- Reviewers use a read-only sandbox with approvals disabled. Format retries
+  resume the exact thread reported by `thread.started`, with the same model,
+  effort, and permissions. Logs include the real Codex thread ID. Josi retains
+  its checkout-integrity checks.
+- `josi plan` launches a fresh interactive session at the project root, with
+  no initial message or forced model. Planner instructions use
+  `developer_instructions`; Josi does not modify `AGENTS.md`. The planner uses
+  a read-only sandbox with `on-request` approvals so users approve
+  task-management writes. Instructions prohibit implementation, task execution,
+  web access, and delegation; native web search and multi-agent features are
+  disabled for the invocation. These prompt restrictions provide weaker
+  command-level enforcement than the OpenCode planner's permission rules.
+- Normal Codex authentication and configuration are inherited; explicit Josi
+  settings take precedence. Input, cached-input, and output tokens come from
+  `turn.completed`; cached tokens are separated from input to avoid double
+  counting. Unreported usage fields and dollar costs remain unavailable.
 
 With `claude`:
 

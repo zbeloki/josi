@@ -200,8 +200,44 @@ class CodexRunTests(CodexTestCase):
             self.assertIn('web_search="disabled"', call["argv"])
             self.assertIn("features.multi_agent=false", call["argv"])
             self.assertTrue(any(v.startswith("developer_instructions=") for v in call["argv"]))
+            instructions = next(v for v in call["argv"] if v.startswith("developer_instructions="))
+            self.assertIn("read-only tools and shell commands without asking", instructions)
+            self.assertNotIn("Every other shell command asks", instructions)
+            self.assertNotIn("request approval for task-management writes", instructions)
+            self.assertIn("Create, update, or delete tasks only when the user asks", instructions)
+        self.assertEqual(
+            (self.repo / ".codex/rules/josi-planner.rules").read_text(),
+            agents.CODEX_PLANNER_RULES,
+        )
         self.assertFalse((self.repo / "AGENTS.md").exists())
         self.assertFalse((self.repo / ".opencode/agents/josi-planner.md").exists())
+
+    def test_planner_preserves_custom_configuration_and_refreshes_managed_rules(self):
+        config_dir = self.repo / ".codex"
+        rules_dir = config_dir / "rules"
+        rules_dir.mkdir(parents=True)
+        config = config_dir / "config.toml"
+        config.write_text('model = "custom-model"\n')
+        custom_rules = rules_dir / "custom.rules"
+        custom_rules.write_text('# User rules\n')
+        managed_rules = rules_dir / "josi-planner.rules"
+        managed_rules.write_text('# Outdated managed rules\n')
+        result = self.run_josi("plan")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(config.read_text(), 'model = "custom-model"\n')
+        self.assertEqual(custom_rules.read_text(), '# User rules\n')
+        self.assertEqual(managed_rules.read_text(), agents.CODEX_PLANNER_RULES)
+        self.assertIn("Codex must trust this project", result.stdout)
+        result = self.run_josi("plan")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertNotIn("Installed Josi task rules", result.stdout)
+
+    def test_planner_rule_install_failure_does_not_launch_codex(self):
+        (self.repo / ".codex").write_text("not a directory")
+        result = self.run_josi("plan")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("could not launch Codex", result.stderr)
+        self.assertEqual(self.calls(), [])
 
 
 class CodexEventTests(unittest.TestCase):

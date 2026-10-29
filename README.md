@@ -135,11 +135,23 @@ With `codex`:
 - `josi plan` launches a fresh interactive session at the project root, with
   no initial message or forced model. Planner instructions use
   `developer_instructions`; Josi does not modify `AGENTS.md`. The planner uses
-  a read-only sandbox with `on-request` approvals so users approve
-  task-management writes. Instructions prohibit implementation, task execution,
+  a read-only sandbox with `on-request` approvals. Josi installs managed command
+  [Codex command rules](https://learn.chatgpt.com/docs/agent-configuration/rules)
+  in `.codex/rules/josi-planner.rules` that pre-approve only
+  `josi task create/list/show/update/delete` outside the sandbox, allowing task
+  database writes without repeated approval prompts. Source files remain
+  read-only for ordinary commands; no directory is made writable. Read-only
+  inspection does not require confirmation. Instructions prohibit implementation, task execution,
   web access, and delegation; native web search and multi-agent features are
-  disabled for the invocation. These prompt restrictions provide weaker
-  command-level enforcement than the OpenCode planner's permission rules.
+  disabled for the invocation. Task execution/reset commands are not pre-approved.
+  Codex must trust the project before it loads project-local rules; its normal
+  trust confirmation may appear once. Josi creates `.codex/config.toml` if missing
+  and preserves existing configuration and other rules. The managed allow rules
+  remain available to other Codex sessions in this project. User/admin rules may
+  impose additional prompts or restrictions. Allow rules run matched commands
+  outside the sandbox, so use a trusted `josi` executable. Other behavioral
+  restrictions are instructions, with weaker command-level enforcement than
+  the OpenCode planner's permission rules.
 - Normal Codex authentication and configuration are inherited; explicit Josi
   settings take precedence. Input, cached-input, and output tokens come from
   `turn.completed`; cached tokens are separated from input to avoid double

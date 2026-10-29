@@ -1,21 +1,21 @@
-"""Agent backends: the CLIs actl drives to plan, implement, and review.
+"""Agent backends: the CLIs josi drives to plan, implement, and review.
 
-A project selects one backend (``agent`` in ``.actl/project.json``) and every
+A project selects one backend (``agent`` in ``.josi/project.json``) and every
 role - planner, worker, reviewer, escalation worker, test writer - runs on it.
 Two backends exist:
 
-* :class:`OpenCodeBackend` wraps the OpenCode CLI (see :mod:`actl.opencode`).
+* :class:`OpenCodeBackend` wraps the OpenCode CLI (see :mod:`josi.opencode`).
   It creates sessions explicitly, resumes them by ID, and reads usage from
   the session metadata.
 * :class:`ClaudeBackend` drives the Claude Code CLI (``claude``). A session is
-  a UUID chosen by actl: the first turn passes ``--session-id`` and later turns
+  a UUID chosen by josi: the first turn passes ``--session-id`` and later turns
   of the same session pass ``--resume``. Noninteractive turns run as
   ``claude -p --output-format stream-json --verbose`` with the prompt on stdin
   and ``--permission-mode bypassPermissions`` (the isolated worktree is the
   boundary); the stream's final ``result`` event carries the answer text, the
   token counts, and the cost of that one turn.
 
-Model settings are ``(name, effort)`` pairs. In actl's own code they travel as
+Model settings are ``(name, effort)`` pairs. In josi's own code they travel as
 one ``name#effort`` string, which OpenCode takes as ``provider/model#variant``
 and which the Claude backend splits into ``--model`` and ``--effort``.
 """
@@ -71,13 +71,13 @@ CLAUDE_EFFORTS = ("low", "medium", "high", "xhigh", "max")
 CLAUDE_PLANNER_DISALLOWED = (
     "Edit", "Write", "MultiEdit", "NotebookEdit", "WebFetch", "WebSearch",
     "Task", "Agent",
-    "Bash(actl task run:*)", "Bash(actl task reset:*)", "Bash(actl run:*)",
+    "Bash(josi task run:*)", "Bash(josi task reset:*)", "Bash(josi run:*)",
 )
 CLAUDE_PLANNER_ALLOWED = (
     "Read", "Glob", "Grep",
-    "Bash(actl task create:*)", "Bash(actl task list:*)",
-    "Bash(actl task show:*)", "Bash(actl task update:*)",
-    "Bash(actl task delete:*)",
+    "Bash(josi task create:*)", "Bash(josi task list:*)",
+    "Bash(josi task show:*)", "Bash(josi task update:*)",
+    "Bash(josi task delete:*)",
 )
 # The reviewer must not change its checkout or reach the web.
 CLAUDE_REVIEWER_DISALLOWED = (
@@ -162,7 +162,7 @@ class OpenCodeBackend:
     def __init__(self, binary: str):
         self.binary = binary
         # OpenCode's model list carries the pricing metadata costs are
-        # derived from. It does not change during one actl process.
+        # derived from. It does not change during one josi process.
         self._models = None
 
     def create_session(self, directory: Path, title: str, role: str):

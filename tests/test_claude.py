@@ -15,18 +15,18 @@ import subprocess
 import sys
 import unittest
 
-from test_actl import ActlTestCase
+from test_josi import JosiTestCase
 
-from actl import agents, usage
+from josi import agents, usage
 
 FAKE_CLAUDE = '''#!python
-"""Fake Claude Code CLI used by actl's Claude backend tests.
+"""Fake Claude Code CLI used by josi's Claude backend tests.
 
 Environment:
 
-* ``ACTL_FAKE_LOG``               - JSONL file receiving argv, cwd, and stdin
-* ``ACTL_FAKE_CLAUDE_REVIEW_JSON`` - the reviewer's final message
-* ``ACTL_FAKE_CLAUDE_EXIT``       - exit code of noninteractive turns
+* ``JOSI_FAKE_LOG``               - JSONL file receiving argv, cwd, and stdin
+* ``JOSI_FAKE_CLAUDE_REVIEW_JSON`` - the reviewer's final message
+* ``JOSI_FAKE_CLAUDE_EXIT``       - exit code of noninteractive turns
 """
 
 import json
@@ -50,7 +50,7 @@ def main():
     argv = sys.argv[1:]
     interactive = "-p" not in argv
     prompt = "" if interactive else sys.stdin.read()
-    with open(os.environ["ACTL_FAKE_LOG"], "a", encoding="utf-8") as handle:
+    with open(os.environ["JOSI_FAKE_LOG"], "a", encoding="utf-8") as handle:
         handle.write(json.dumps(
             {"argv": argv, "cwd": os.getcwd(), "stdin": prompt}
         ) + "\\n")
@@ -58,7 +58,7 @@ def main():
         return 0
     if "--disallowedTools" in argv:
         text = os.environ.get(
-            "ACTL_FAKE_CLAUDE_REVIEW_JSON",
+            "JOSI_FAKE_CLAUDE_REVIEW_JSON",
             '{"decision":"approved","findings":[]}',
         )
     elif prompt.startswith("Write the tests for this task"):
@@ -80,7 +80,7 @@ def main():
             "cache_read_input_tokens": 30, "cache_creation_input_tokens": 40,
         },
     }))
-    return int(os.environ.get("ACTL_FAKE_CLAUDE_EXIT", "0"))
+    return int(os.environ.get("JOSI_FAKE_CLAUDE_EXIT", "0"))
 
 
 if __name__ == "__main__":
@@ -88,7 +88,7 @@ if __name__ == "__main__":
 '''
 
 
-class ClaudeTestCase(ActlTestCase):
+class ClaudeTestCase(JosiTestCase):
     """A repository whose fake ``claude`` executable is on ``PATH``."""
 
     def setUp(self):
@@ -109,7 +109,7 @@ class ClaudeTestCase(ActlTestCase):
     def commit_base(self):
         self.init_git()
         self.git("symbolic-ref", "HEAD", "refs/heads/main")
-        (self.repo / ".gitignore").write_text(".actl/\n", encoding="utf-8")
+        (self.repo / ".gitignore").write_text(".josi/\n", encoding="utf-8")
         (self.repo / "README.md").write_text("base\n", encoding="utf-8")
         self.git("add", "-A")
         self.git(
@@ -132,7 +132,7 @@ class ClaudeTestCase(ActlTestCase):
 class ClaudeInitTests(ClaudeTestCase):
     def test_init_stores_claude_defaults_as_pairs(self):
         self.commit_base()
-        result = self.run_actl("init", "--agent", "claude")
+        result = self.run_josi("init", "--agent", "claude")
         self.assertEqual(result.returncode, 0, result.stderr)
         metadata = self.metadata()
         self.assertEqual(metadata["agent"], "claude")
@@ -155,7 +155,7 @@ class ClaudeInitTests(ClaudeTestCase):
 
     def test_default_agent_is_opencode_with_pair_models(self):
         self.commit_base()
-        self.assertEqual(self.run_actl("init").returncode, 0)
+        self.assertEqual(self.run_josi("init").returncode, 0)
         metadata = self.metadata()
         self.assertEqual(metadata["agent"], "opencode")
         self.assertEqual(
@@ -166,7 +166,7 @@ class ClaudeInitTests(ClaudeTestCase):
 
     def test_explicit_models_override_the_claude_defaults(self):
         self.commit_base()
-        result = self.run_actl(
+        result = self.run_josi(
             "init", "--agent", "claude", "--worker-model", "opus#high",
             "--reviewer-model", "sonnet",
         )
@@ -181,7 +181,7 @@ class ClaudeInitTests(ClaudeTestCase):
 
     def test_invalid_claude_effort_is_refused(self):
         self.commit_base()
-        result = self.run_actl(
+        result = self.run_josi(
             "init", "--agent", "claude", "--worker-model", "sonnet#turbo"
         )
         self.assertNotEqual(result.returncode, 0)
@@ -190,7 +190,7 @@ class ClaudeInitTests(ClaudeTestCase):
 
     def test_provider_model_names_are_not_required_for_claude(self):
         self.commit_base()
-        result = self.run_actl(
+        result = self.run_josi(
             "init", "--agent", "claude", "--worker-model", "claude-sonnet-5-5"
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -198,10 +198,10 @@ class ClaudeInitTests(ClaudeTestCase):
     def test_switching_agents_resets_models_to_the_new_defaults(self):
         self.commit_base()
         self.assertEqual(
-            self.run_actl("init", "--worker-model", "custom/model#x").returncode,
+            self.run_josi("init", "--worker-model", "custom/model#x").returncode,
             0,
         )
-        result = self.run_actl("init", "--agent", "claude")
+        result = self.run_josi("init", "--agent", "claude")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Updated the agent to claude", result.stdout)
         metadata = self.metadata()
@@ -212,8 +212,8 @@ class ClaudeInitTests(ClaudeTestCase):
 
     def test_switching_agents_keeps_explicit_models(self):
         self.commit_base()
-        self.assertEqual(self.run_actl("init").returncode, 0)
-        result = self.run_actl(
+        self.assertEqual(self.run_josi("init").returncode, 0)
+        result = self.run_josi(
             "init", "--agent", "claude", "--reviewer-model", "opus#high"
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -228,12 +228,12 @@ class ClaudeInitTests(ClaudeTestCase):
     def test_reinit_without_agent_preserves_the_stored_agent_and_models(self):
         self.commit_base()
         self.assertEqual(
-            self.run_actl(
+            self.run_josi(
                 "init", "--agent", "claude", "--worker-model", "opus#max"
             ).returncode,
             0,
         )
-        result = self.run_actl("init")
+        result = self.run_josi("init")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("already initialized", result.stdout)
         metadata = self.metadata()
@@ -244,12 +244,12 @@ class ClaudeInitTests(ClaudeTestCase):
 
     def test_legacy_string_models_are_read_transparently(self):
         self.commit_base()
-        self.assertEqual(self.run_actl("init").returncode, 0)
+        self.assertEqual(self.run_josi("init").returncode, 0)
         metadata = self.metadata()
         del metadata["agent"]
         metadata["worker_model"] = "provider/model#low"
         self.metadata_path().write_text(json.dumps(metadata), encoding="utf-8")
-        result = self.run_actl("init")
+        result = self.run_josi("init")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("already initialized", result.stdout)
         self.assertEqual(self.metadata()["worker_model"], "provider/model#low")
@@ -258,7 +258,7 @@ class ClaudeInitTests(ClaudeTestCase):
         self.commit_base()
         (self.bin / "claude").unlink()
         self.env["PATH"] = str(self.bin) + ":/usr/bin:/bin"
-        result = self.run_actl("init", "--agent", "claude")
+        result = self.run_josi("init", "--agent", "claude")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Claude Code is not installed", result.stderr)
 
@@ -269,11 +269,11 @@ class ClaudePlanTests(ClaudeTestCase):
         super().setUp()
         self.commit_base()
         self.assertEqual(
-            self.run_actl("init", "--agent", "claude").returncode, 0
+            self.run_josi("init", "--agent", "claude").returncode, 0
         )
 
     def test_plan_launches_an_interactive_restricted_claude(self):
-        result = self.run_actl("plan")
+        result = self.run_josi("plan")
         self.assertEqual(result.returncode, 0, result.stderr)
         (call,) = self.claude_calls()
         argv = call["argv"]
@@ -285,16 +285,16 @@ class ClaudePlanTests(ClaudeTestCase):
         self.assertNotIn("description:", prompt)
         self.assertIn("--strict-mcp-config", argv)
         denied = self.flag(call, "--disallowedTools").split(",")
-        for tool in ("Edit", "Write", "WebFetch", "Bash(actl task run:*)",
-                     "Bash(actl run:*)", "Bash(actl task reset:*)"):
+        for tool in ("Edit", "Write", "WebFetch", "Bash(josi task run:*)",
+                     "Bash(josi run:*)", "Bash(josi task reset:*)"):
             self.assertIn(tool, denied)
         allowed = self.flag(call, "--allowedTools").split(",")
-        self.assertIn("Bash(actl task create:*)", allowed)
-        self.assertNotIn("Bash(actl task run:*)", allowed)
+        self.assertIn("Bash(josi task create:*)", allowed)
+        self.assertNotIn("Bash(josi task run:*)", allowed)
 
     def test_every_plan_run_starts_a_fresh_session(self):
-        self.assertEqual(self.run_actl("plan").returncode, 0)
-        self.assertEqual(self.run_actl("plan").returncode, 0)
+        self.assertEqual(self.run_josi("plan").returncode, 0)
+        self.assertEqual(self.run_josi("plan").returncode, 0)
         first, second = self.claude_calls()
         self.assertNotEqual(
             self.flag(first, "--session-id"), self.flag(second, "--session-id")
@@ -302,14 +302,14 @@ class ClaudePlanTests(ClaudeTestCase):
         self.assertFalse(self.planner_path().exists())
 
     def test_plan_does_not_install_the_opencode_agent_file(self):
-        self.assertEqual(self.run_actl("plan").returncode, 0)
+        self.assertEqual(self.run_josi("plan").returncode, 0)
         self.assertFalse(self.agent_path().exists())
 
     def test_plan_propagates_the_exit_status(self):
         (self.bin / "claude").write_text(
             "#!/bin/sh\nexit 3\n", encoding="utf-8"
         )
-        result = self.run_actl("plan")
+        result = self.run_josi("plan")
         self.assertEqual(result.returncode, 3)
         self.assertIn("Claude Code exited with status 3", result.stderr)
 
@@ -320,16 +320,16 @@ class ClaudeRunTests(ClaudeTestCase):
         super().setUp()
         self.commit_base()
         self.assertEqual(
-            self.run_actl("init", "--agent", "claude").returncode, 0
+            self.run_josi("init", "--agent", "claude").returncode, 0
         )
-        result = self.run_actl(
+        result = self.run_josi(
             "task", "create", "--title", "Add the feature",
             "--description", "Do the thing.",
         )
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def test_task_run_drives_claude_for_every_role(self):
-        result = self.run_actl("task", "run", "t1")
+        result = self.run_josi("task", "run", "t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         tests, worker, reviewer = self.claude_calls()
 
@@ -357,20 +357,20 @@ class ClaudeRunTests(ClaudeTestCase):
         self.assertEqual(worker["cwd"], str(self.worktree_path()))
         self.assertNotEqual(reviewer["cwd"], worker["cwd"])
         self.assertIn("worker-output.txt", self.git(
-            "ls-tree", "-r", "--name-only", "actl/t1"
+            "ls-tree", "-r", "--name-only", "josi/t1"
         ).stdout)
 
     def worktree_path(self):
-        return self.repo / ".actl" / "worktrees" / "t1"
+        return self.repo / ".josi" / "worktrees" / "t1"
 
     def test_each_session_starts_once_with_session_id(self):
-        self.assertEqual(self.run_actl("task", "run", "t1").returncode, 0)
+        self.assertEqual(self.run_josi("task", "run", "t1").returncode, 0)
         sessions = [self.flag(c, "--session-id") for c in self.claude_calls()]
         self.assertEqual(len(set(sessions)), 3)
 
     def test_reviewer_format_retry_resumes_the_same_session(self):
-        self.env["ACTL_FAKE_CLAUDE_REVIEW_JSON"] = "not json at all"
-        result = self.run_actl("task", "run", "t1")
+        self.env["JOSI_FAKE_CLAUDE_REVIEW_JSON"] = "not json at all"
+        result = self.run_josi("task", "run", "t1")
         self.assertNotEqual(result.returncode, 0)
         reviewer, retry = self.claude_calls()[-2:]
         self.assertIn("--session-id", reviewer["argv"])
@@ -380,10 +380,10 @@ class ClaudeRunTests(ClaudeTestCase):
         self.assertNotIn("--session-id", retry["argv"])
 
     def test_usage_is_recorded_from_the_result_events(self):
-        self.assertEqual(self.run_actl("task", "run", "t1").returncode, 0)
-        shown = self.run_actl("task", "show", "t1")
+        self.assertEqual(self.run_josi("task", "run", "t1").returncode, 0)
+        shown = self.run_josi("task", "show", "t1")
         self.assertIn("cost_total: 0.150000", shown.stdout)
-        logs = sorted((self.repo / ".actl" / "runs").glob("t1-*.log"))
+        logs = sorted((self.repo / ".josi" / "runs").glob("t1-*.log"))
         text = "\n".join(path.read_text(encoding="utf-8") for path in logs)
         self.assertIn(
             "usage: input=10 output=20 reasoning=unavailable"
@@ -392,15 +392,15 @@ class ClaudeRunTests(ClaudeTestCase):
         )
 
     def test_a_failing_worker_fails_the_task(self):
-        self.env["ACTL_FAKE_CLAUDE_EXIT"] = "1"
-        result = self.run_actl("task", "run", "t1")
+        self.env["JOSI_FAKE_CLAUDE_EXIT"] = "1"
+        result = self.run_josi("task", "run", "t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Claude Code", result.stdout + result.stderr)
 
     def test_missing_claude_executable_refuses_the_run(self):
         (self.bin / "claude").unlink()
         self.env["PATH"] = str(self.bin) + ":/usr/bin:/bin"
-        result = self.run_actl("task", "run", "t1")
+        result = self.run_josi("task", "run", "t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Claude Code is not installed", result.stderr)
 

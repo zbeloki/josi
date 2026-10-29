@@ -1,32 +1,32 @@
-"""Command-line interface for actl.
+"""Command-line interface for josi.
 
 Stage 1 commands:
 
-* ``actl init`` - register the current Git repository as an actl project and
+* ``josi init`` - register the current Git repository as a Josi project and
   record its base branch (``--base``, or detected/selected automatically).
-* ``actl plan`` - start a fresh planner session in the project's agent CLI
+* ``josi plan`` - start a fresh planner session in the project's agent CLI
   (the OpenCode TUI or interactive Claude Code); every run starts a new one.
-* ``actl init --agent opencode|claude`` selects that agent CLI for the project.
+* ``josi init --agent opencode|claude`` selects that agent CLI for the project.
 
 Stage 2 commands:
 
-* ``actl task create|list|show|update|delete`` - manage the project's tasks
+* ``josi task create|list|show|update|delete`` - manage the project's tasks
   in a local SQLite database. They are noninteractive and never touch
   OpenCode.
-* ``actl task reset`` - discard a task's attempt budget, state, branch, and
+* ``josi task reset`` - discard a task's attempt budget, state, branch, and
   worktree so it can be executed again from scratch. It is an explicit
   execution-state intervention, not a planning command: it takes the
   execution lock and is denied to the planner.
 
 Stage 3:
 
-* The planner agent manages the same task list through the ``actl task``
+* The planner agent manages the same task list through the ``josi task``
   commands. Its agent definition documents the CLI and pre-approves exactly
   those commands, so planning and task management happen in one session.
 
 Stage 4:
 
-* ``actl task run <id>`` executes one task with a noninteractive OpenCode
+* ``josi task run <id>`` executes one task with a noninteractive OpenCode
   worker inside a dedicated Git worktree, under a project-wide execution lock.
 * Before the first worker attempt, a test-generation turn runs in the same
   worktree with the project's test-writer model: it writes and commits the
@@ -61,16 +61,16 @@ Stage 6:
   reviews the committed implementation again without spending another worker
   attempt. An interrupted attempt is retried under the same number and does
   not consume the budget. The attempt budget is persisted per task in
-  ``.actl/attempts/`` so restarting actl never resets it.
+  ``.josi/attempts/`` so restarting josi never resets it.
 
 Stage 7:
 
-* Execution is grouped into runs. ``actl task run`` creates (or resumes) one
-  run branch ``actl/run/rN`` and worktree from the configured base branch and
+* Execution is grouped into runs. ``josi task run`` creates (or resumes) one
+  run branch ``josi/run/rN`` and worktree from the configured base branch and
   creates every task branch from that run branch, so each task starts from the
   previous staged task's result. An approved task is fast-forwarded into the
   run branch and becomes STAGED; the base branch is never touched during
-  execution. ``actl task run`` accepts several task ids or ``--all`` and
+  execution. ``josi task run`` accepts several task ids or ``--all`` and
   executes them strictly sequentially under one execution lock, in the given
   order or in deterministic dependency order. A batch that stops - a failed
   task, a blocked ``--all``, or a crash - leaves its run RUNNING and
@@ -78,7 +78,7 @@ Stage 7:
   staged (or already DONE). The run records the exact commit its branch is
   expected to point at and never records or merges any other commit, so a
   change made by hand in the run worktree is refused instead of trusted.
-  ``actl run merge rN`` fast-forwards a completed run into the configured
+  ``josi run merge rN`` fast-forwards a completed run into the configured
   base branch and turns its STAGED tasks DONE; it is idempotent and also
   detects a manual merge of the run. A dependency is satisfied by DONE or by
   STAGED in the run the dependent is currently executing in; a dependency
@@ -104,12 +104,12 @@ from . import (
     validation,
 )
 
-PROJECT_DIR = ".actl"
+PROJECT_DIR = ".josi"
 PROJECT_METADATA = "project.json"
 SCHEMA_VERSION = 1
-GITIGNORE_ENTRY = ".actl/"
-PLANNER_TITLE = "actl planner"
-PLANNER_AGENT_NAME = "actl-planner"
+GITIGNORE_ENTRY = ".josi/"
+PLANNER_TITLE = "Josi planner"
+PLANNER_AGENT_NAME = "josi-planner"
 PLANNER_AGENT_PATH = Path(".opencode") / "agents" / (PLANNER_AGENT_NAME + ".md")
 
 # OpenCode loads this file as a custom agent: the frontmatter declares a
@@ -128,21 +128,21 @@ PLANNER_AGENT_PATH = Path(".opencode") / "agents" / (PLANNER_AGENT_NAME + ".md")
 # including tools that write files under an action name other than "edit".
 # The task management subcommands (create, list, show, update, delete) are the
 # only pre-approved shell commands because they only read and write
-# .actl/tasks.db. A broad "actl task *" deny comes before those allows (last
+# .josi/tasks.db. A broad "josi task *" deny comes before those allows (last
 # match wins), and the management allows re-enable only the documented forms;
-# "actl task run" - including whitespace variants such as "actl task  run" -
-# stays denied, so the planner can never launch a worker. "actl task reset"
+# "josi task run" - including whitespace variants such as "josi task  run" -
+# stays denied, so the planner can never launch a worker. "josi task reset"
 # stays denied too: it discards a task's branch and worktree, which is an
-# execution-state intervention, not planning. "actl run *" is
+# execution-state intervention, not planning. "josi run *" is
 # denied outright: integrating a run into the base branch is the user's
 # decision, never the planner's. The "*>*" deny must
 # come after the management allows (last match wins): OpenCode reports a
 # redirected statement as a single resource string, so without the deny
-# "actl task ... > src/file" would silently count as an allowed task command
+# "josi task ... > src/file" would silently count as an allowed task command
 # and could overwrite source files. The .env "ask" rules must follow the broad
 # read allow to keep their effect.
 # The body becomes the agent's system prompt. Deployed under
-# .opencode/agents/ so OpenCode discovers it for this project. actl manages
+# .opencode/agents/ so OpenCode discovers it for this project. josi manages
 # this file: ensure_planner_agent() rewrites it when its content differs
 # from this definition.
 PLANNER_AGENT_DOC = """\
@@ -181,25 +181,25 @@ permissions:
     resource: "*"
     effect: ask
   - action: shell
-    resource: "actl task *"
+    resource: "josi task *"
     effect: deny
   - action: shell
-    resource: "actl task create *"
+    resource: "josi task create *"
     effect: allow
   - action: shell
-    resource: "actl task list *"
+    resource: "josi task list *"
     effect: allow
   - action: shell
-    resource: "actl task show *"
+    resource: "josi task show *"
     effect: allow
   - action: shell
-    resource: "actl task update *"
+    resource: "josi task update *"
     effect: allow
   - action: shell
-    resource: "actl task delete *"
+    resource: "josi task delete *"
     effect: allow
   - action: shell
-    resource: "actl run *"
+    resource: "josi run *"
     effect: deny
   - action: shell
     resource: "*>*"
@@ -224,32 +224,32 @@ actionable plan.
   that affect scope, design, and acceptance criteria before proposing tasks.
 - Never start implementing.
 - Do not modify project code.
-- Do not execute implementation tasks or integrate runs. `actl task run` and
-  `actl run` are denied: task execution and run integration are the user's
+- Do not execute implementation tasks or integrate runs. `josi task run` and
+  `josi run` are denied: task execution and run integration are the user's
   decision, not yours.
-- Do not reset tasks. `actl task reset` is denied: discarding a task's
+- Do not reset tasks. `josi task reset` is denied: discarding a task's
   attempt budget, branch, and worktree is the user's decision, not yours.
 
-## Managing tasks with actl
+## Managing tasks with josi
 
-The project's tasks live in a SQLite database owned by actl. Manage them
-only through the `actl task` commands - never open .actl/tasks.db or any
+The project's tasks live in a SQLite database owned by josi. Manage them
+only through the `josi task` commands - never open .josi/tasks.db or any
 other internal file with sqlite3, cat, or another tool, and never change
 task data by hand. Run the commands from anywhere inside the project; they
 print plain text:
 
-- `actl task create --title "TITLE" --description "TEXT" [--depends-on tN ...]`
+- `josi task create --title "TITLE" --description "TEXT" [--depends-on tN ...]`
   creates a PENDING task. Use `--description-file PATH` instead of
   `--description` to read the text from a file.
-- `actl task list` prints one line per task: id, status, and title.
-- `actl task show tN` prints a task with its description and dependencies.
-- `actl task update tN [--title TITLE] [--description TEXT]
+- `josi task list` prints one line per task: id, status, and title.
+- `josi task show tN` prints a task with its description and dependencies.
+- `josi task update tN [--title TITLE] [--description TEXT]
   [--description-file PATH] [--depends-on tN ...] [--clear-dependencies]`
   changes a task. `--depends-on` replaces the current dependency set and
   `--clear-dependencies` removes it.
-- `actl task delete tN` deletes a task; it fails while other tasks depend
+- `josi task delete tN` deletes a task; it fails while other tasks depend
   on it.
-- `actl task reset tN` is denied to you: it discards a task's attempt
+- `josi task reset tN` is denied to you: it discards a task's attempt
   budget, status, branch, and worktree so the user can execute it from
   scratch. Only the user resets tasks.
 
@@ -257,7 +257,7 @@ Ids are printed as `t1`, `t2`, ... and commands also accept the bare number
 (`1`). `--depends-on` may be repeated or comma-separated; a dependency must
 reference an existing task, must not be the task itself, and must not create
 a dependency cycle. These commands never change a task's status: new tasks
-are PENDING, and only the user executes tasks (`actl task run`, which is
+are PENDING, and only the user executes tasks (`josi task run`, which is
 denied to you).
 
 Plan with the user before writing tasks:
@@ -278,14 +278,14 @@ Plan with the user before writing tasks:
 ## Permissions
 
 Read-only repository inspection (read, glob, grep) and user questions are
-allowed. The `actl task create`, `actl task list`, `actl task show`,
-`actl task update`, and `actl task delete` subcommands are the only
+allowed. The `josi task create`, `josi task list`, `josi task show`,
+`josi task update`, and `josi task delete` subcommands are the only
 pre-approved shell commands; write them with single spaces between the
 command words. Every other shell command asks for
 confirmation, and each command in a compound call is checked separately - run
 one command per shell call instead of chaining them with && or echo
-separators. `actl task run` and `actl run` are denied outright: never execute
-tasks, launch coding workers, or integrate a run into the base branch. `actl
+separators. `josi task run` and `josi run` are denied outright: never execute
+tasks, launch coding workers, or integrate a run into the base branch. `josi
 task reset` is denied as well: never discard a task's attempt budget, branch,
 or worktree. Shell
 redirection is denied outright: never redirect command
@@ -302,7 +302,7 @@ class ProjectError(Exception):
 
 
 class MetadataError(ProjectError):
-    """Raised when actl metadata cannot be read or does not validate."""
+    """Raised when josi metadata cannot be read or does not validate."""
 
 
 def git_toplevel(start: Path) -> Path:
@@ -310,7 +310,7 @@ def git_toplevel(start: Path) -> Path:
 
     Git prints the path followed by a single newline. Only that terminator is
     removed, so repository names that end in whitespace survive intact;
-    stripping all whitespace here would silently redirect actl to a sibling
+    stripping all whitespace here would silently redirect josi to a sibling
     directory.
     """
     try:
@@ -332,7 +332,7 @@ def git_toplevel(start: Path) -> Path:
 
 
 def load_project_metadata(root: Path) -> dict:
-    """Load and validate ``.actl/project.json``."""
+    """Load and validate ``.josi/project.json``."""
     path = root / PROJECT_DIR / PROJECT_METADATA
     if not path.is_file():
         raise MetadataError("missing " + str(path))
@@ -409,7 +409,7 @@ def _model_setting(metadata: dict, key: str, role: str, flag: str) -> str:
     if value is None:
         raise ProjectError(
             "no " + role + " model is configured for this project; run"
-            " 'actl init --" + flag + " MODEL' first"
+            " 'josi init --" + flag + " MODEL' first"
         )
     if isinstance(value, dict):
         name, effort = value.get("model"), value.get("effort")
@@ -436,7 +436,7 @@ def _worker_model(metadata: dict) -> str:
 def _reviewer_model(metadata: dict) -> str:
     """Return the project's reviewer model or raise :class:`ProjectError`.
 
-    Review is a required part of ``actl task run``: without a reviewer model
+    Review is a required part of ``josi task run``: without a reviewer model
     the command refuses before launching anything instead of silently
     skipping the independent review.
     """
@@ -447,7 +447,7 @@ def _escalation_worker_model(metadata: dict) -> str:
     """Return the project's escalation worker model or raise.
 
     The third (final) worker attempt of every repair cycle uses this model.
-    It is required by ``actl task run`` from the start, exactly like the
+    It is required by ``josi task run`` from the start, exactly like the
     reviewer model: escalation is part of the design, so a project defines it
     before a task runs instead of discovering that it is missing when the
     final attempt is due. Without it the run refuses before any lock,
@@ -462,7 +462,7 @@ def _escalation_worker_model(metadata: dict) -> str:
 def _test_writer_model(metadata: dict) -> str:
     """Return the project's test-writer model or raise.
 
-    Required by ``actl task run`` from the start, exactly like the reviewer
+    Required by ``josi task run`` from the start, exactly like the reviewer
     and escalation models: without it the run refuses before any lock,
     worktree, or task change.
     """
@@ -500,7 +500,7 @@ def _prompt_for_base_branch(root: Path) -> str:
     if not branches:
         raise ProjectError(
             "cannot determine the base branch: the repository has no branches;"
-            " run 'actl init --base <branch>'"
+            " run 'josi init --base <branch>'"
         )
     print("The base branch could not be determined automatically.")
     print("Existing branches:")
@@ -512,7 +512,7 @@ def _prompt_for_base_branch(root: Path) -> str:
         except EOFError:
             raise ProjectError(
                 "cannot determine the base branch; select one with"
-                " 'actl init --base <branch>'"
+                " 'josi init --base <branch>'"
             )
         if answer.isdigit() and 1 <= int(answer) <= len(branches):
             return branches[int(answer) - 1]
@@ -539,7 +539,7 @@ def _resolve_new_base_branch(root: Path, requested) -> str:
         if unborn is None:
             raise ProjectError(
                 "cannot determine the base branch of a repository without"
-                " commits (HEAD is not on a branch); run 'actl init --base"
+                " commits (HEAD is not on a branch); run 'josi init --base"
                 " <branch>'"
             )
         return unborn
@@ -550,7 +550,7 @@ def _resolve_new_base_branch(root: Path, requested) -> str:
 
 
 def _run_base_branch(root: Path, metadata: dict) -> str:
-    """Return the base branch for ``actl task run``.
+    """Return the base branch for ``josi task run``.
 
     A project may predate the stored ``base_branch`` field; such a project
     keeps working by detecting the branch, without silently writing metadata.
@@ -567,17 +567,17 @@ def _run_base_branch(root: Path, metadata: dict) -> str:
     if detected is None:
         raise ProjectError(
             "no base branch is configured for this project and none could be"
-            " detected; run 'actl init --base <branch>'"
+            " detected; run 'josi init --base <branch>'"
         )
     print(
         "Using detected base branch '" + detected
-        + "' (run 'actl init --base <branch>' to configure it)"
+        + "' (run 'josi init --base <branch>' to configure it)"
     )
     return detected
 
 
 def ensure_gitignore(root: Path) -> None:
-    """Make sure ``.actl/`` is ignored, preserving existing bytes exactly."""
+    """Make sure ``.josi/`` is ignored, preserving existing bytes exactly."""
     path = root / ".gitignore"
     entry = GITIGNORE_ENTRY.encode("utf-8")
     try:
@@ -595,9 +595,9 @@ def ensure_gitignore(root: Path) -> None:
 
 
 def ensure_planner_agent(root: Path) -> str:
-    """Make the planner agent file match actl's current definition.
+    """Make the planner agent file match josi's current definition.
 
-    The file is managed by actl: it is written when missing and rewritten
+    The file is managed by josi: it is written when missing and rewritten
     when its content differs from :data:`PLANNER_AGENT_DOC`, so definition
     updates (for example new permissions) apply on the next plan.
     Returns ``"installed"``, ``"updated"`` or ``"unchanged"``.
@@ -621,16 +621,16 @@ def cmd_init(args) -> int:
         root = git_toplevel(Path.cwd())
     except ProjectError as exc:
         return _fail(str(exc))
-    actl_dir = root / PROJECT_DIR
-    metadata_path = actl_dir / PROJECT_METADATA
+    josi_dir = root / PROJECT_DIR
+    metadata_path = josi_dir / PROJECT_METADATA
     metadata = None
     if metadata_path.exists():
         try:
             metadata = load_project_metadata(root)
         except MetadataError as exc:
             return _fail(
-                "existing actl metadata is invalid (" + str(exc) + "); "
-                "remove '" + str(actl_dir) + "' and re-run 'actl init'"
+                "existing josi metadata is invalid (" + str(exc) + "); "
+                "remove '" + str(josi_dir) + "' and re-run 'josi init'"
             )
     stored_agent = project_agent(metadata) if metadata is not None else None
     agent = args.agent or stored_agent or agents.DEFAULT_AGENT
@@ -720,7 +720,7 @@ def cmd_init(args) -> int:
             if "base_branch" in updates:
                 print("Updated the base branch to " + updates["base_branch"])
         else:
-            print("actl is already initialized in " + str(root))
+            print("Josi is already initialized in " + str(root))
     else:
         try:
             base_branch = _resolve_new_base_branch(root, args.base)
@@ -740,13 +740,13 @@ def cmd_init(args) -> int:
         for key, setting in settings.items():
             metadata[key] = _stored_model(setting)
         try:
-            actl_dir.mkdir(parents=True, exist_ok=True)
+            josi_dir.mkdir(parents=True, exist_ok=True)
             _write_metadata(metadata_path, metadata)
         except OSError as exc:
             return _fail(
                 "could not write " + str(metadata_path) + " (" + str(exc) + ")"
             )
-        print("Initialized actl in " + str(root))
+        print("Initialized Josi in " + str(root))
         print("Base branch: " + base_branch)
         print("Agent: " + agent)
         print("Worker model: " + settings["worker_model"])
@@ -758,7 +758,7 @@ def cmd_init(args) -> int:
     # command) is safe: the schema uses CREATE TABLE IF NOT EXISTS, so
     # existing tasks survive repeated initialization.
     try:
-        conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+        conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
         conn.close()
     except tasks.TaskError as exc:
         return _fail(str(exc))
@@ -767,7 +767,7 @@ def cmd_init(args) -> int:
         ensure_gitignore(root)
     except ProjectError as exc:
         return _fail(str(exc))
-    print("Next step: run 'actl plan' to start a planning session.")
+    print("Next step: run 'josi plan' to start a planning session.")
     return 0
 
 
@@ -788,22 +788,22 @@ def _select_planner_agent(binary: str, root: Path, session: opencode.Session) ->
 
 
 def _project_root() -> Path:
-    """Return the project root, requiring a valid initialized actl project.
+    """Return the project root, requiring a valid initialized Josi project.
 
     The Git repository root is resolved first and must contain a valid
-    ``.actl/project.json``, so no command can read or write another project's
+    ``.josi/project.json``, so no command can read or write another project's
     state - not even from a nested repository.
     """
     root = git_toplevel(Path.cwd())
     if not (root / PROJECT_DIR).is_dir():
         raise ProjectError(
-            "no actl project found at the Git repository root " + str(root)
-            + "; run 'actl init' first"
+            "no Josi project found at the Git repository root " + str(root)
+            + "; run 'josi init' first"
         )
     try:
         load_project_metadata(root)
     except MetadataError as exc:
-        raise ProjectError("invalid actl project metadata: " + str(exc))
+        raise ProjectError("invalid Josi project metadata: " + str(exc))
     return root
 
 
@@ -828,7 +828,7 @@ def cmd_plan(args) -> int:
             return _fail(str(exc))
         if returncode != 0:
             print(
-                "actl: error: Claude Code exited with status " + str(returncode),
+                "josi: error: Claude Code exited with status " + str(returncode),
                 file=sys.stderr,
             )
         return returncode
@@ -869,7 +869,7 @@ def _launch_tui(binary: str, root: Path, session_id: str) -> int:
     except agents.AgentError as exc:
         return _fail(str(exc))
     if returncode != 0:
-        print("actl: error: OpenCode exited with status " + str(returncode), file=sys.stderr)
+        print("josi: error: OpenCode exited with status " + str(returncode), file=sys.stderr)
         return returncode
     return 0
 
@@ -965,28 +965,28 @@ def cmd_task_reset(args) -> int:
     try:
         task_id = _parse_task_id(args.id)
         root = _project_root()
-        actl_dir = root / PROJECT_DIR
+        josi_dir = root / PROJECT_DIR
     except (ProjectError, tasks.TaskError) as exc:
         return _fail(str(exc))
     try:
         # The reset discards the task's branch and worktree, so it must not
         # race a running execution: the project-wide lock is taken for the
         # whole operation and an active execution is refused immediately.
-        with execution.lock(actl_dir):
-            return _reset_task(root, actl_dir, task_id)
+        with execution.lock(josi_dir):
+            return _reset_task(root, josi_dir, task_id)
     except (
         ProjectError, tasks.TaskError, sqlite3.Error, execution.ExecutionError,
     ) as exc:
         return _fail(str(exc))
 
 
-def _reset_task(root: Path, actl_dir: Path, task_id: int) -> int:
+def _reset_task(root: Path, josi_dir: Path, task_id: int) -> int:
     """Clear a task's budget and state while the execution lock is held.
 
     A STAGED task is refused: its approved commit is already part of a run
     branch that cannot be rewritten, so the run must be integrated first.
     """
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         task = tasks.get_task(conn, task_id)
         if task.status == tasks.STATUS_STAGED:
@@ -994,16 +994,16 @@ def _reset_task(root: Path, actl_dir: Path, task_id: int) -> int:
             raise tasks.TaskError(
                 "cannot reset task t" + str(task_id) + ": it is STAGED in "
                 + run + " and its approved commit is already part of that run"
-                " branch; integrate the run with 'actl run merge "
+                " branch; integrate the run with 'josi run merge "
                 + (run if task.run_id is not None else "rN") + "' first"
             )
         # Discard the implementation first: the worktree cleanup runs before
         # anything else is thrown away, so when it fails the attempt budget,
         # the test-generation outcome, and the database state are all left
         # untouched and the reset can simply be retried.
-        execution.reset_task_worktree(root, actl_dir, task_id)
-        execution.clear_attempt_state(actl_dir, task_id)
-        execution.clear_testgen_outcome(actl_dir, task_id)
+        execution.reset_task_worktree(root, josi_dir, task_id)
+        execution.clear_attempt_state(josi_dir, task_id)
+        execution.clear_testgen_outcome(josi_dir, task_id)
         tasks.reset_task(conn, task_id)
     finally:
         conn.close()
@@ -1065,12 +1065,12 @@ def cmd_run_merge(args) -> int:
         root = _project_root()
         metadata = load_project_metadata(root)
         base_branch = _run_base_branch(root, metadata)
-        actl_dir = root / PROJECT_DIR
+        josi_dir = root / PROJECT_DIR
     except (ProjectError, tasks.TaskError) as exc:
         return _fail(str(exc))
     try:
-        with execution.lock(actl_dir):
-            return _merge_run(root, actl_dir, run_id, base_branch)
+        with execution.lock(josi_dir):
+            return _merge_run(root, josi_dir, run_id, base_branch)
     except (
         ProjectError, tasks.TaskError, sqlite3.Error,
         execution.ExecutionError,
@@ -1089,7 +1089,7 @@ def _run_database():
         conn.close()
 
 
-def _merge_run(root: Path, actl_dir: Path, run_id: int, base_branch: str) -> int:
+def _merge_run(root: Path, josi_dir: Path, run_id: int, base_branch: str) -> int:
     """Fast-forward a COMPLETE run into the base branch; idempotent.
 
     Three cases keep the command safe to repeat:
@@ -1106,9 +1106,9 @@ def _merge_run(root: Path, actl_dir: Path, run_id: int, base_branch: str) -> int
 
     STAGED tasks of the run become DONE only here, never during execution.
     """
-    run = _load_run(actl_dir, run_id)
+    run = _load_run(josi_dir, run_id)
     if run.status == tasks.RUN_INTEGRATED:
-        done = _finish_run_tasks(actl_dir, run)
+        done = _finish_run_tasks(josi_dir, run)
         print(
             "Run r" + str(run.id) + " is already integrated into " + base_branch
             + (("; marked " + ", ".join("t" + str(i) for i in done) + " DONE")
@@ -1119,7 +1119,7 @@ def _merge_run(root: Path, actl_dir: Path, run_id: int, base_branch: str) -> int
         raise tasks.TaskError(
             "cannot integrate run r" + str(run.id) + ": its execution is still"
             " marked " + run.status + " and not every selected task is staged;"
-            " resume it with 'actl task run ...' and finish it first"
+            " resume it with 'josi task run ...' and finish it first"
         )
     if not run.final_commit:
         raise tasks.TaskError(
@@ -1159,7 +1159,7 @@ def _merge_run(root: Path, actl_dir: Path, run_id: int, base_branch: str) -> int
         _event("Fast-forward merging run r" + str(run.id) + "...")
         try:
             execution.integrate_commit(
-                root, actl_dir, base_branch, run.branch, run.final_commit,
+                root, josi_dir, base_branch, run.branch, run.final_commit,
             )
         except execution.ExecutionError as exc:
             print("")
@@ -1167,7 +1167,7 @@ def _merge_run(root: Path, actl_dir: Path, run_id: int, base_branch: str) -> int
             print("  " + str(exc))
             print("")
             print("Integrate the run branch by hand and commit the result, then")
-            print("run 'actl run merge r" + str(run.id) + "' again to finalize"
+            print("run 'josi run merge r" + str(run.id) + "' again to finalize"
                   " its status:")
             print(
                 "    git checkout " + base_branch + " && git merge " + run.branch
@@ -1180,8 +1180,8 @@ def _merge_run(root: Path, actl_dir: Path, run_id: int, base_branch: str) -> int
         print(
             "Fast-forwarded run r" + str(run.id) + " into " + base_branch + "."
         )
-    done = _finish_run_tasks(actl_dir, run)
-    _set_run_status(actl_dir, run.id, tasks.RUN_INTEGRATED)
+    done = _finish_run_tasks(josi_dir, run)
+    _set_run_status(josi_dir, run.id, tasks.RUN_INTEGRATED)
     print(
         "Run r" + str(run.id) + " integrated into " + base_branch
         + ("; " + ", ".join("t" + str(i) for i in done) + " \u2192 DONE"
@@ -1190,9 +1190,9 @@ def _merge_run(root: Path, actl_dir: Path, run_id: int, base_branch: str) -> int
     return 0
 
 
-def _finish_run_tasks(actl_dir: Path, run) -> list:
+def _finish_run_tasks(josi_dir: Path, run) -> list:
     """Mark every STAGED task of ``run`` DONE; return the task ids."""
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         done = []
         for task in tasks.run_tasks(conn, run.id):
@@ -1204,7 +1204,7 @@ def _finish_run_tasks(actl_dir: Path, run) -> list:
         conn.close()
 
 
-#: Statuses ``actl task run --all`` selects for execution. STAGED tasks are
+#: Statuses ``josi task run --all`` selects for execution. STAGED tasks are
 #: already in a run branch, DONE tasks are already integrated, and NEEDS_HUMAN
 #: tasks need a human, so none is selected automatically; every other status
 #: the single-task lifecycle accepts stays eligible.
@@ -1247,39 +1247,39 @@ def cmd_task_run(args) -> int:
         validation_commands = validation.commands_from_metadata(metadata)
         base_branch = _run_base_branch(root, metadata)
         backend = agents.create(project_agent(metadata))
-        actl_dir = root / PROJECT_DIR
-        _preflight_tasks(actl_dir, requested)
+        josi_dir = root / PROJECT_DIR
+        _preflight_tasks(josi_dir, requested)
     except (
         ProjectError, tasks.TaskError, execution.ExecutionError,
         agents.AgentError, validation.ValidationError,
     ) as exc:
         return _fail(str(exc))
     try:
-        with execution.lock(actl_dir) as lock_fd:
+        with execution.lock(josi_dir) as lock_fd:
             # An interrupted execution leaves its run RUNNING; the batch
             # resumes that run instead of opening a second one, so staged
             # tasks stay in the same run and keep satisfying their
             # dependents (only one run executes at a time).
-            run = _running_run(actl_dir)
+            run = _running_run(josi_dir)
             if run is None:
                 # Only one unfinished, unmerged run may exist: a completed
                 # run that still holds staged tasks must be integrated before
                 # a new run starts (a run stopped before staging anything
                 # does not block). Dependency problems in the requested tasks
                 # are reported first, with the exact command that fixes them.
-                blocker = _staged_unmerged_run(actl_dir)
+                blocker = _staged_unmerged_run(josi_dir)
                 if blocker is not None:
                     return _fail(
-                        _new_run_refusal(actl_dir, blocker, requested)
+                        _new_run_refusal(josi_dir, blocker, requested)
                     )
             if requested is None:
                 return _run_all(
-                    backend, root, actl_dir, lock_fd, metadata, base_branch,
+                    backend, root, josi_dir, lock_fd, metadata, base_branch,
                     reviewer_model, escalation_worker_model,
                     test_writer_model, validation_commands, run,
                 )
             return _run_explicit(
-                backend, root, actl_dir, lock_fd, requested, metadata,
+                backend, root, josi_dir, lock_fd, requested, metadata,
                 base_branch, reviewer_model, escalation_worker_model,
                 test_writer_model, validation_commands, run,
             )
@@ -1297,7 +1297,7 @@ def cmd_task_review(args) -> int:
     This is the way back after a human fixed a NEEDS_HUMAN task by hand: no
     test generation and no worker run, only validation and review of the
     commit already on the task branch. An approval stages the task exactly
-    like ``actl task run``; a rejection ends it NEEDS_HUMAN again.
+    like ``josi task run``; a rejection ends it NEEDS_HUMAN again.
     """
     try:
         task_id = _parse_task_id(args.id)
@@ -1307,32 +1307,32 @@ def cmd_task_review(args) -> int:
         validation_commands = validation.commands_from_metadata(metadata)
         base_branch = _run_base_branch(root, metadata)
         backend = agents.create(project_agent(metadata))
-        actl_dir = root / PROJECT_DIR
-        _preflight_tasks(actl_dir, [task_id])
+        josi_dir = root / PROJECT_DIR
+        _preflight_tasks(josi_dir, [task_id])
     except (
         ProjectError, tasks.TaskError, execution.ExecutionError,
         agents.AgentError, validation.ValidationError,
     ) as exc:
         return _fail(str(exc))
     try:
-        with execution.lock(actl_dir) as lock_fd:
-            run = _running_run(actl_dir)
+        with execution.lock(josi_dir) as lock_fd:
+            run = _running_run(josi_dir)
             if run is None:
-                blocker = _staged_unmerged_run(actl_dir)
+                blocker = _staged_unmerged_run(josi_dir)
                 if blocker is not None:
                     return _fail(
-                        _new_run_refusal(actl_dir, blocker, [task_id])
+                        _new_run_refusal(josi_dir, blocker, [task_id])
                     )
             else:
-                _select_run_tasks(actl_dir, run.id, [task_id])
+                _select_run_tasks(josi_dir, run.id, [task_id])
             code, _detail, run = _review_task(
-                backend, root, actl_dir, task_id, lock_fd, base_branch,
+                backend, root, josi_dir, task_id, lock_fd, base_branch,
                 reviewer_model, validation_commands, run,
             )
             if code != 0:
                 _leave_run_open(run)
                 return code
-            return _finish_run(actl_dir, root, run)
+            return _finish_run(josi_dir, root, run)
     except (
         ProjectError, tasks.TaskError, sqlite3.Error,
         execution.ExecutionError, agents.AgentError,
@@ -1341,7 +1341,7 @@ def cmd_task_review(args) -> int:
         return _fail(str(exc))
 
 
-#: Statuses ``actl task review`` accepts: an implementation exists on the task
+#: Statuses ``josi task review`` accepts: an implementation exists on the task
 #: branch and is not yet approved or integrated.
 _REVIEWABLE_STATUSES = (
     tasks.STATUS_NEEDS_HUMAN, tasks.STATUS_FAILED, tasks.STATUS_IMPLEMENTED,
@@ -1349,7 +1349,7 @@ _REVIEWABLE_STATUSES = (
 
 
 def _review_task(
-    backend, root, actl_dir, task_id, lock_fd, base_branch, reviewer_model,
+    backend, root, josi_dir, task_id, lock_fd, base_branch, reviewer_model,
     validation_commands, run,
 ) -> tuple:
     """Validate and review one task's existing implementation.
@@ -1359,25 +1359,25 @@ def _review_task(
     worker attempts.
     """
     try:
-        task = _load_task(actl_dir, task_id)
+        task = _load_task(josi_dir, task_id)
         if task.status not in _REVIEWABLE_STATUSES:
             raise tasks.TaskError(
                 "cannot review task t" + str(task.id) + ": it is "
                 + task.status + "; only NEEDS_HUMAN, FAILED, or IMPLEMENTED"
                 " tasks have an implementation to review"
             )
-        _require_dependencies(task, actl_dir, run)
+        _require_dependencies(task, josi_dir, run)
     except tasks.TaskError as exc:
         _fail(str(exc))
         return 1, str(exc), run
     if run is None:
         try:
-            run = _create_run(actl_dir, root, base_branch, [task_id])
+            run = _create_run(josi_dir, root, base_branch, [task_id])
         except (execution.ExecutionError, tasks.TaskError, sqlite3.Error) as exc:
             _fail("cannot start a run: " + str(exc))
             return 1, "cannot start a run", None
     try:
-        worktree = execution.ensure_run_worktree(root, actl_dir, run)
+        worktree = execution.ensure_run_worktree(root, josi_dir, run)
     except execution.ExecutionError as exc:
         _fail("cannot prepare run r" + str(run.id) + ": " + str(exc))
         return 1, "cannot prepare the run", run
@@ -1387,26 +1387,26 @@ def _review_task(
             + ", worktree " + str(worktree.path) + ")"
         )
     try:
-        state = execution.attempt_state(actl_dir, task.id)
+        state = execution.attempt_state(josi_dir, task.id)
     except execution.ExecutionError as exc:
-        return _verification_failed(actl_dir, task.id, str(exc), run)
+        return _verification_failed(josi_dir, task.id, str(exc), run)
     attempt = max(state[0], 1) if state is not None else 1
 
     print("task t" + str(task.id) + ": " + task.title)
     print("reviewer model: " + reviewer_model)
     verification = _validate_and_review(
-        backend, root, actl_dir, task, run.branch, reviewer_model,
+        backend, root, josi_dir, task, run.branch, reviewer_model,
         validation_commands, lock_fd, attempt=attempt,
         announce_worktree=True, run_id=run.id,
     )
     if verification.outcome == "approved":
-        return _complete_task(actl_dir, root, task, verification.commit, run)
+        return _complete_task(josi_dir, root, task, verification.commit, run)
     if verification.outcome == "failed":
         return _verification_failed(
-            actl_dir, task.id, verification.reason, run,
+            josi_dir, task.id, verification.reason, run,
             log_hint=verification.log_hint,
         )
-    _set_task_status(actl_dir, task.id, tasks.STATUS_NEEDS_HUMAN)
+    _set_task_status(josi_dir, task.id, tasks.STATUS_NEEDS_HUMAN)
     print("")
     print("Task t" + str(task.id) + " \u2192 NEEDS_HUMAN")
     message = (
@@ -1415,20 +1415,20 @@ def _review_task(
     if verification.log_hint is not None:
         message += " (log: " + str(verification.log_hint) + ")"
     message += (
-        "; fix it and run 'actl task review t" + str(task.id) + "' again"
+        "; fix it and run 'josi task review t" + str(task.id) + "' again"
     )
     _fail(message)
     return 1, "needs human intervention", run
 
 
-def _preflight_tasks(actl_dir: Path, requested) -> None:
+def _preflight_tasks(josi_dir: Path, requested) -> None:
     """Validate the requested tasks before the execution lock is taken.
 
     Explicit ids must exist, so a typo is reported before anything runs or
     changes. ``--all`` (``requested`` is None) refuses an unexpected status
     outright instead of silently skipping a task it cannot classify.
     """
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         if requested is not None:
             for task_id in requested:
@@ -1450,7 +1450,7 @@ def _preflight_tasks(actl_dir: Path, requested) -> None:
 
 
 def _run_explicit(
-    backend, root, actl_dir, lock_fd, requested, metadata, base_branch,
+    backend, root, josi_dir, lock_fd, requested, metadata, base_branch,
     reviewer_model, escalation_worker_model, test_writer_model,
     validation_commands, run,
 ) -> int:
@@ -1464,11 +1464,11 @@ def _run_explicit(
     batch = len(requested) > 1
     selection = list(requested)
     if run is not None:
-        _select_run_tasks(actl_dir, run.id, selection)
+        _select_run_tasks(josi_dir, run.id, selection)
     completed = []
     for task_id in requested:
         code, detail, run = _execute_task(
-            backend, root, actl_dir, task_id, metadata, lock_fd, base_branch,
+            backend, root, josi_dir, task_id, metadata, lock_fd, base_branch,
             reviewer_model, escalation_worker_model, test_writer_model,
             validation_commands, run, selection,
         )
@@ -1480,7 +1480,7 @@ def _run_explicit(
         completed.append(task_id)
     if batch:
         _print_summary(completed)
-    return _finish_run(actl_dir, root, run)
+    return _finish_run(josi_dir, root, run)
 
 
 def _dependency_satisfied(dep_id, state, run) -> bool:
@@ -1489,7 +1489,7 @@ def _dependency_satisfied(dep_id, state, run) -> bool:
     DONE always satisfies. STAGED satisfies only when it belongs to the run
     the dependent is currently executing in: work staged in another run is
     not part of this run branch and must first be marked DONE by
-    ``actl run merge``.
+    ``josi run merge``.
     """
     status, dep_run = state.get(dep_id, ("missing", None))
     if status == tasks.STATUS_DONE:
@@ -1498,7 +1498,7 @@ def _dependency_satisfied(dep_id, state, run) -> bool:
 
 
 def _run_all(
-    backend, root, actl_dir, lock_fd, metadata, base_branch,
+    backend, root, josi_dir, lock_fd, metadata, base_branch,
     reviewer_model, escalation_worker_model, test_writer_model,
     validation_commands, run,
 ) -> int:
@@ -1513,13 +1513,13 @@ def _run_all(
     """
     completed = []
     selection = [
-        task.id for task in _list_tasks(actl_dir)
+        task.id for task in _list_tasks(josi_dir)
         if task.status in _RUNNABLE_STATUSES
     ]
     if run is not None and selection:
-        _select_run_tasks(actl_dir, run.id, selection)
+        _select_run_tasks(josi_dir, run.id, selection)
     while True:
-        all_tasks = _list_tasks(actl_dir)
+        all_tasks = _list_tasks(josi_dir)
         state = {task.id: (task.status, task.run_id) for task in all_tasks}
         candidates = [
             task for task in all_tasks if task.status in _RUNNABLE_STATUSES
@@ -1567,11 +1567,11 @@ def _run_all(
                 return _fail(staged)
             return _fail(
                 "progress is blocked: " + "; ".join(blocked)
-                + "; resolve the unfinished dependencies and run 'actl task"
+                + "; resolve the unfinished dependencies and run 'josi task"
                 " run --all' again"
             )
         code, detail, run = _execute_task(
-            backend, root, actl_dir, ready.id, metadata, lock_fd, base_branch,
+            backend, root, josi_dir, ready.id, metadata, lock_fd, base_branch,
             reviewer_model, escalation_worker_model, test_writer_model,
             validation_commands, run, selection,
         )
@@ -1581,24 +1581,24 @@ def _run_all(
             return code
         completed.append(ready.id)
     skipped = [
-        task.id for task in _list_tasks(actl_dir)
+        task.id for task in _list_tasks(josi_dir)
         if task.status == tasks.STATUS_NEEDS_HUMAN
     ]
     _print_summary(completed, needs_human=skipped)
-    return _finish_run(actl_dir, root, run)
+    return _finish_run(josi_dir, root, run)
 
 
-def _recover_staged_task(actl_dir: Path, root: Path, task, run):
+def _recover_staged_task(josi_dir: Path, root: Path, task, run):
     """Record a staging that crashed between the merge and the status update.
 
     The only run-branch tip that may differ from the expected commit is the
     task's own recorded approved commit, reached as a fast-forward from the
-    expected commit: that is actl's own unrecorded staging. Every other tip
+    expected commit: that is josi's own unrecorded staging. Every other tip
     is left to the usual verification, which refuses it. Returns the
     refreshed run when the staging was recovered, or None.
     """
     try:
-        approved = _approved_commit(actl_dir, task)
+        approved = _approved_commit(josi_dir, task)
     except tasks.TaskError:
         return None
     expected = run.expected_commit
@@ -1612,12 +1612,12 @@ def _recover_staged_task(actl_dir: Path, root: Path, task, run):
             return None
     except execution.ExecutionError:
         return None
-    _stage_task(actl_dir, task.id, run.id, approved)
+    _stage_task(josi_dir, task.id, run.id, approved)
     _event(
         "Task t" + str(task.id) + " was already fast-forwarded into run r"
         + str(run.id) + "; recording STAGED"
     )
-    return _load_run(actl_dir, run.id)
+    return _load_run(josi_dir, run.id)
 
 
 def _leave_run_open(run) -> None:
@@ -1625,12 +1625,12 @@ def _leave_run_open(run) -> None:
     if run is None:
         return
     _event(
-        "Run r" + str(run.id) + " is still open; re-run 'actl task run'"
+        "Run r" + str(run.id) + " is still open; re-run 'josi task run'"
         " to resume and finish it"
     )
 
 
-def _finish_run(actl_dir: Path, root: Path, run) -> int:
+def _finish_run(josi_dir: Path, root: Path, run) -> int:
     """Complete the batch's run, or leave it open for an explicit resume.
 
     A run is marked COMPLETE only when every selected task is STAGED (or
@@ -1639,7 +1639,7 @@ def _finish_run(actl_dir: Path, root: Path, run) -> int:
     never whatever the branch happens to point at when execution stops - and
     the run is never marked as integrated here. A batch stopped by a failed
     task, a blocked batch, and a batch whose selection is not finished all
-    leave the run RUNNING, so the next ``actl task run`` resumes it.
+    leave the run RUNNING, so the next ``josi task run`` resumes it.
 
     Returns the exit code of the batch: 0 normally, 1 when the run branch
     moved unexpectedly (the run is left RUNNING for human intervention).
@@ -1651,7 +1651,7 @@ def _finish_run(actl_dir: Path, root: Path, run) -> int:
     except execution.ExecutionError as exc:
         _fail("cannot finish run r" + str(run.id) + ": " + str(exc))
         return 1
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         pending = [
             task.id for task in tasks.selected_tasks(conn, run.id)
@@ -1662,7 +1662,7 @@ def _finish_run(actl_dir: Path, root: Path, run) -> int:
                 "Run r" + str(run.id) + " is still open: selected task"
                 + ("s" if len(pending) != 1 else "") + " not staged: "
                 + ", ".join("t" + str(i) for i in pending)
-                + "; re-run 'actl task run' to continue it"
+                + "; re-run 'josi task run' to continue it"
             )
             return 0
         staged = [
@@ -1686,7 +1686,7 @@ def _finish_run(actl_dir: Path, root: Path, run) -> int:
         detail = "no staged tasks"
     _event(
         "Run r" + str(run.id) + " finished with " + detail
-        + "; integrate it with 'actl run merge r" + str(run.id) + "'"
+        + "; integrate it with 'josi run merge r" + str(run.id) + "'"
     )
     return 0
 
@@ -1716,7 +1716,7 @@ def _print_summary(
 
 
 def _execute_task(
-    backend, root, actl_dir, task_id, metadata, lock_fd, base_branch,
+    backend, root, josi_dir, task_id, metadata, lock_fd, base_branch,
     reviewer_model, escalation_worker_model, test_writer_model,
     validation_commands, run, selection,
 ) -> tuple:
@@ -1739,7 +1739,7 @@ def _execute_task(
     with the project's escalation model. A failed validation command or a
     reviewer rejection with critical or major findings feeds the next
     attempt; the attempt count and the feedback are persisted per task so
-    restarting actl never resets the budget. An interrupted attempt does not
+    restarting josi never resets the budget. An interrupted attempt does not
     count: a retry resumes the same attempt number. Exhausting the attempts
     marks the task NEEDS_HUMAN.
 
@@ -1756,11 +1756,11 @@ def _execute_task(
     for a multi-task summary, while the full error is printed here or in the
     helper that returned it.
 
-    The terminal shows only actl's own timestamped events; transcripts and
+    The terminal shows only josi's own timestamped events; transcripts and
     validation output go straight into their log files while they run.
     """
     try:
-        task = _load_task(actl_dir, task_id)
+        task = _load_task(josi_dir, task_id)
     except tasks.TaskError as exc:
         _fail(str(exc))
         return 1, str(exc), run
@@ -1776,14 +1776,14 @@ def _execute_task(
         return 1, "already staged", run
 
     try:
-        _require_runnable(task, actl_dir, run)
+        _require_runnable(task, josi_dir, run)
     except tasks.TaskError as exc:
         _fail(str(exc))
         return 1, str(exc), run
 
     if run is None:
         try:
-            run = _create_run(actl_dir, root, base_branch, selection)
+            run = _create_run(josi_dir, root, base_branch, selection)
         except (execution.ExecutionError, tasks.TaskError, sqlite3.Error) as exc:
             _fail("cannot start a run: " + str(exc))
             return 1, "cannot start a run", None
@@ -1792,7 +1792,7 @@ def _execute_task(
         # run branch exactly at this task's approved commit: recognize and
         # record that staging before the usual tip verification refuses it.
         try:
-            recovered = _recover_staged_task(actl_dir, root, task, run)
+            recovered = _recover_staged_task(josi_dir, root, task, run)
         except (tasks.TaskError, sqlite3.Error) as exc:
             _fail(
                 "cannot check the staging of task t" + str(task.id)
@@ -1802,7 +1802,7 @@ def _execute_task(
         if recovered is not None:
             return 0, "", recovered
     try:
-        worktree = execution.ensure_run_worktree(root, actl_dir, run)
+        worktree = execution.ensure_run_worktree(root, josi_dir, run)
     except execution.ExecutionError as exc:
         _fail("cannot prepare run r" + str(run.id) + ": " + str(exc))
         return 1, "cannot prepare the run", run
@@ -1814,23 +1814,23 @@ def _execute_task(
 
     if task.status == tasks.STATUS_APPROVED:
         # The implementation was validated and approved by an earlier run
-        # (or an earlier actl version): stage the exact approved commit
+        # (or an earlier josi version): stage the exact approved commit
         # without rerunning the worker, validation, or review. The repair
         # budget is irrelevant here.
         print("task t" + str(task.id) + ": " + task.title)
         try:
-            approved = _approved_commit(actl_dir, task)
+            approved = _approved_commit(josi_dir, task)
         except tasks.TaskError as exc:
             _fail(str(exc))
             return 1, str(exc), run
-        return _complete_task(actl_dir, root, task, approved, run)
+        return _complete_task(josi_dir, root, task, approved, run)
 
     try:
-        attempts, feedback = _attempt_baseline(actl_dir, task)
+        attempts, feedback = _attempt_baseline(josi_dir, task)
     except execution.ExecutionError as exc:
         # A corrupt or unreadable attempt record is an infrastructure
         # failure: fail the task instead of silently resetting its budget.
-        return _verification_failed(actl_dir, task.id, str(exc), run)
+        return _verification_failed(josi_dir, task.id, str(exc), run)
 
     print("task t" + str(task.id) + ": " + task.title)
     # Validate and review the existing committed implementation first when
@@ -1862,27 +1862,27 @@ def _execute_task(
 
     if review_first:
         verification = _validate_and_review(
-            backend, root, actl_dir, task, run.branch, reviewer_model,
+            backend, root, josi_dir, task, run.branch, reviewer_model,
             validation_commands, lock_fd, attempt=max(attempts, 1),
             announce_worktree=True, run_id=run.id,
         )
         if verification.outcome == "approved":
             return _complete_task(
-                actl_dir, root, task, verification.commit, run,
+                josi_dir, root, task, verification.commit, run,
             )
         if verification.outcome == "failed":
             return _verification_failed(
-                actl_dir, task.id, verification.reason, run,
+                josi_dir, task.id, verification.reason, run,
                 log_hint=verification.log_hint,
             )
         # The existing implementation spends one worker attempt: it was
         # produced by an earlier worker run, even if none was recorded.
         attempts = max(attempts, 1)
         feedback = verification.feedback
-        execution.record_attempt_state(actl_dir, task.id, attempts, feedback)
+        execution.record_attempt_state(josi_dir, task.id, attempts, feedback)
         if attempts >= execution.MAX_WORKER_ATTEMPTS:
-            return _needs_human(actl_dir, task, verification, attempts, run)
-        _set_task_status(actl_dir, task.id, tasks.STATUS_RUNNING)
+            return _needs_human(josi_dir, task, verification, attempts, run)
+        _set_task_status(josi_dir, task.id, tasks.STATUS_RUNNING)
 
     worktree = None
     while attempts < execution.MAX_WORKER_ATTEMPTS:
@@ -1897,7 +1897,7 @@ def _execute_task(
                 if announce:
                     _event("Preparing worktree")
                 worktree = execution.ensure_worktree(
-                    root, actl_dir, task,
+                    root, josi_dir, task,
                     retry=not (
                         task.status == tasks.STATUS_PENDING and attempts == 0
                     ),
@@ -1905,7 +1905,7 @@ def _execute_task(
                 )
             except execution.ExecutionError as exc:
                 reason = str(exc)
-                _set_task_status(actl_dir, task.id, tasks.STATUS_FAILED)
+                _set_task_status(josi_dir, task.id, tasks.STATUS_FAILED)
                 _event("Task status: FAILED")
                 _fail("task t" + str(task.id) + " failed: " + reason)
                 return 1, "worktree preparation failed", run
@@ -1925,18 +1925,18 @@ def _execute_task(
             # attempt, so the worker starts from the tests it left behind.
             try:
                 generate_tests = _needs_test_generation(
-                    actl_dir, task, worktree, run.branch,
+                    josi_dir, task, worktree, run.branch,
                 )
             except execution.ExecutionError as exc:
-                return _verification_failed(actl_dir, task.id, str(exc), run)
+                return _verification_failed(josi_dir, task.id, str(exc), run)
             if generate_tests:
                 outcome, reason, tests_log = _run_test_generation(
-                    backend, actl_dir, task, lock_fd, run.branch,
+                    backend, josi_dir, task, lock_fd, run.branch,
                     test_writer_model, run.id, worktree,
                 )
                 if outcome == tasks.STATUS_FAILED:
                     _event("Test generation failed")
-                    _set_task_status(actl_dir, task.id, tasks.STATUS_FAILED)
+                    _set_task_status(josi_dir, task.id, tasks.STATUS_FAILED)
                     _event("Task status: FAILED")
                     _fail(
                         "task t" + str(task.id)
@@ -1944,19 +1944,19 @@ def _execute_task(
                         + " (log: " + str(tests_log) + ")"
                     )
                     return 1, "test generation failed", run
-                execution.record_testgen_outcome(actl_dir, task.id, outcome)
+                execution.record_testgen_outcome(josi_dir, task.id, outcome)
         model = _attempt_model(metadata, attempt, escalation_worker_model)
         _event(
             "Worker attempt " + str(attempt) + "/"
             + str(execution.MAX_WORKER_ATTEMPTS) + " (" + model + ")"
         )
         status, reason, log_path = _run_worker_attempt(
-            backend, actl_dir, task, lock_fd, run.branch,
+            backend, josi_dir, task, lock_fd, run.branch,
             attempt=attempt, model=model, feedback=feedback,
             run_id=run.id, worktree=worktree,
         )
         if status != tasks.STATUS_IMPLEMENTED:
-            _set_task_status(actl_dir, task.id, status)
+            _set_task_status(josi_dir, task.id, status)
             _event("Task status: " + status)
             message = (
                 "task t" + str(task.id) + " failed: " + reason
@@ -1970,36 +1970,36 @@ def _execute_task(
         # consume the budget. The feedback was handed to the worker that just
         # ran, so clear it: an interruption during validation or review
         # re-verifies this commit instead of launching another worker.
-        execution.record_attempt_state(actl_dir, task.id, attempts, "")
-        _set_task_status(actl_dir, task.id, tasks.STATUS_IMPLEMENTED)
+        execution.record_attempt_state(josi_dir, task.id, attempts, "")
+        _set_task_status(josi_dir, task.id, tasks.STATUS_IMPLEMENTED)
         _event("Task status: IMPLEMENTED")
 
         verification = _validate_and_review(
-            backend, root, actl_dir, task, run.branch, reviewer_model,
+            backend, root, josi_dir, task, run.branch, reviewer_model,
             validation_commands, lock_fd, attempt=attempt, run_id=run.id,
         )
         if verification.outcome == "approved":
             return _complete_task(
-                actl_dir, root, task, verification.commit, run,
+                josi_dir, root, task, verification.commit, run,
             )
         if verification.outcome == "failed":
             return _verification_failed(
-                actl_dir, task.id, verification.reason, run,
+                josi_dir, task.id, verification.reason, run,
                 log_hint=verification.log_hint,
             )
         feedback = verification.feedback
-        execution.record_attempt_state(actl_dir, task.id, attempts, feedback)
+        execution.record_attempt_state(josi_dir, task.id, attempts, feedback)
         if attempts >= execution.MAX_WORKER_ATTEMPTS:
-            return _needs_human(actl_dir, task, verification, attempts, run)
-        _set_task_status(actl_dir, task.id, tasks.STATUS_RUNNING)
+            return _needs_human(josi_dir, task, verification, attempts, run)
+        _set_task_status(josi_dir, task.id, tasks.STATUS_RUNNING)
 
     # The budget was already exhausted by an earlier attempt (for example a
     # reviewer execution error after the third worker attempt).
-    return _needs_human(actl_dir, task, None, attempts, run)
+    return _needs_human(josi_dir, task, None, attempts, run)
 
 
 def _run_worker_attempt(
-    backend, actl_dir, task, lock_fd, base_branch, attempt, model, feedback,
+    backend, josi_dir, task, lock_fd, base_branch, attempt, model, feedback,
     run_id, worktree,
 ):
     """Run one worker attempt in the prepared task worktree.
@@ -2012,9 +2012,9 @@ def _run_worker_attempt(
     After the turn, the attempt's model usage is captured into its own log
     and stored with the task and run it belongs to.
     """
-    log_path, log = execution.open_run_log(actl_dir, task.id)
+    log_path, log = execution.open_run_log(josi_dir, task.id)
     with log:
-        log.write("actl task run\n")
+        log.write("josi task run\n")
         log.write("task: t" + str(task.id) + " - " + task.title + "\n")
         log.write(
             "attempt: " + str(attempt) + " of "
@@ -2023,7 +2023,7 @@ def _run_worker_attempt(
         log.write("model: " + model + "\n")
         log.write("started_at: " + _utc_now() + "\n")
 
-        _set_task_status(actl_dir, task.id, tasks.STATUS_RUNNING)
+        _set_task_status(josi_dir, task.id, tasks.STATUS_RUNNING)
         status = tasks.STATUS_FAILED
         reason = ""
         exit_code = None
@@ -2034,7 +2034,7 @@ def _run_worker_attempt(
             log.write("worktree: " + str(worktree.path) + "\n")
             session = backend.create_session(
                 worktree.path,
-                title="actl task t" + str(task.id) + ": " + task.title,
+                title="josi task t" + str(task.id) + ": " + task.title,
                 role=agents.ROLE_WORKER,
             )
             log.write("session: " + session.id + "\n")
@@ -2064,7 +2064,7 @@ def _run_worker_attempt(
         if session is not None:
             _capture_usage(
                 backend, worktree.path, session, model, task, run_id,
-                usage.STAGE_WORKER, attempt, log, actl_dir,
+                usage.STAGE_WORKER, attempt, log, josi_dir,
                 turn_output=_read_turn(log, turn_start),
             )
 
@@ -2079,7 +2079,7 @@ def _run_worker_attempt(
 
 
 def _needs_test_generation(
-    actl_dir: Path, task, worktree, base_branch: str,
+    josi_dir: Path, task, worktree, base_branch: str,
 ) -> bool:
     """Whether the test-generation stage still has to run for ``task``.
 
@@ -2087,10 +2087,10 @@ def _needs_test_generation(
     means it already completed - even when it decided that no tests are
     needed and committed nothing. Committed changes on the task branch mean
     an earlier execution already produced work there (an interrupted test
-    writer, or an implementation left by an older actl version), and a fresh
+    writer, or an implementation left by an older josi version), and a fresh
     test-writing turn must never run after it.
     """
-    if execution.testgen_outcome(actl_dir, task.id) is not None:
+    if execution.testgen_outcome(josi_dir, task.id) is not None:
         return False
     return not execution.worktree_has_committed_changes(
         worktree.path, base_branch
@@ -2098,13 +2098,13 @@ def _needs_test_generation(
 
 
 def _run_test_generation(
-    backend, actl_dir, task, lock_fd, base_branch, model, run_id, worktree,
+    backend, josi_dir, task, lock_fd, base_branch, model, run_id, worktree,
 ):
     """Run the test-generation stage in the prepared task worktree.
 
     The test writer receives the task title and description with the
     project's test-writer model and answers with one JSON decision (see
-    :mod:`actl.testgen`). Returns ``(status, reason, log_path)`` like
+    :mod:`josi.testgen`). Returns ``(status, reason, log_path)`` like
     :func:`_run_worker_attempt`: the parsed decision with an empty reason
     when the stage succeeded, and ``FAILED`` with a reason for an execution
     error, an invalid outcome, uncommitted changes, or a dirty worktree.
@@ -2115,14 +2115,14 @@ def _run_test_generation(
     stage's transcript goes into its own timestamped log and its model
     usage is recorded under the distinct test-writer stages.
     """
-    log_path, log = execution.open_stage_log(actl_dir, task.id, "tests")
+    log_path, log = execution.open_stage_log(josi_dir, task.id, "tests")
     with log:
-        log.write("actl test generation\n")
+        log.write("josi test generation\n")
         log.write("task: t" + str(task.id) + " - " + task.title + "\n")
         log.write("model: " + model + "\n")
         log.write("started_at: " + _utc_now() + "\n")
 
-        _set_task_status(actl_dir, task.id, tasks.STATUS_RUNNING)
+        _set_task_status(josi_dir, task.id, tasks.STATUS_RUNNING)
         status = tasks.STATUS_FAILED
         reason = ""
         exit_code = None
@@ -2132,7 +2132,7 @@ def _run_test_generation(
             log.write("worktree: " + str(worktree.path) + "\n")
             session = backend.create_session(
                 worktree.path,
-                title="actl test writer t" + str(task.id) + ": " + task.title,
+                title="josi test writer t" + str(task.id) + ": " + task.title,
                 role=agents.ROLE_WORKER,
             )
             log.write("session: " + session.id + "\n")
@@ -2173,7 +2173,7 @@ def _run_test_generation(
                     backend, worktree.path, session, model, task, run_id,
                     usage.STAGE_TEST_WRITER if format_attempt == 0
                     else usage.STAGE_TEST_WRITER_FORMAT_RETRY,
-                    1, log, actl_dir, turn_output=output, previous=previous,
+                    1, log, josi_dir, turn_output=output, previous=previous,
                 )
                 try:
                     status, reason = _evaluate_test_generation(
@@ -2268,10 +2268,10 @@ def _evaluate_test_generation(
 
 
 def _record_usage(
-    actl_dir, task_id, run_id, stage, attempt, model, session_id, record,
+    josi_dir, task_id, run_id, stage, attempt, model, session_id, record,
 ):
     """Persist one invocation's usage in the project database."""
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         tasks.record_usage(
             conn, task_id, run_id, stage, attempt, model, session_id, record,
@@ -2292,7 +2292,7 @@ def _read_turn(log, start) -> str:
 
 def _capture_usage(
     backend, directory, session, model, task, run_id, stage, attempt, log,
-    actl_dir, turn_output="", previous=None,
+    josi_dir, turn_output="", previous=None,
 ):
     """Capture, log, and persist one invocation's model usage.
 
@@ -2319,7 +2319,7 @@ def _capture_usage(
     log.flush()
     try:
         _record_usage(
-            actl_dir, task.id, run_id, stage, attempt, model, session.id,
+            josi_dir, task.id, run_id, stage, attempt, model, session.id,
             record,
         )
     except (tasks.TaskError, sqlite3.Error) as exc:
@@ -2342,7 +2342,7 @@ class _Verification:
 
 
 def _validate_and_review(
-    backend, root, actl_dir, task, base_branch, reviewer_model,
+    backend, root, josi_dir, task, base_branch, reviewer_model,
     validation_commands, lock_fd, attempt, announce_worktree=False, run_id=None,
 ) -> _Verification:
     """Validate and review one implemented commit.
@@ -2361,7 +2361,7 @@ def _validate_and_review(
     """
     try:
         worktree = execution.ensure_worktree(
-            root, actl_dir, task, retry=True, base_branch=base_branch,
+            root, josi_dir, task, retry=True, base_branch=base_branch,
         )
         if announce_worktree:
             if worktree.created:
@@ -2382,13 +2382,13 @@ def _validate_and_review(
     validation_log_path = None
     if validation_commands:
         validation_log_path, log = execution.open_stage_log(
-            actl_dir, task.id, "validation",
+            josi_dir, task.id, "validation",
         )
         _event("Validation started (" + str(len(validation_commands)) + " commands)")
         _event("validation log: " + str(validation_log_path))
         try:
             with log:
-                log.write("actl validation\n")
+                log.write("josi validation\n")
                 log.write("task: t" + str(task.id) + " - " + task.title + "\n")
                 log.write("attempt: " + str(attempt) + "\n")
                 log.write("branch: " + worktree.branch + "\n")
@@ -2450,14 +2450,14 @@ def _validate_and_review(
         _event("Validation skipped (no validation commands configured)")
 
     review_log_path, review_log = execution.open_stage_log(
-        actl_dir, task.id, "review",
+        josi_dir, task.id, "review",
     )
     _event("Reviewer started (model " + reviewer_model + ")")
     _event("review log: " + str(review_log_path))
     try:
         try:
             verdict = _run_reviewer(
-                backend, root, actl_dir, task, worktree, commit, base_branch,
+                backend, root, josi_dir, task, worktree, commit, base_branch,
                 reviewer_model, validation_result, lock_fd, review_log,
                 attempt, run_id=run_id,
             )
@@ -2481,7 +2481,7 @@ def _validate_and_review(
             "failed", reason=str(exc), log_hint=review_log_path,
         )
 
-    _record_review(actl_dir, task.id, commit, verdict)
+    _record_review(josi_dir, task.id, commit, verdict)
     if verdict.decision == review.DECISION_APPROVED:
         _event(
             "Review approved ("
@@ -2506,7 +2506,7 @@ def _validate_and_review(
 
 
 def _run_reviewer(
-    backend, root, actl_dir, task, worktree, commit, base_branch,
+    backend, root, josi_dir, task, worktree, commit, base_branch,
     reviewer_model, validation_result, lock_fd, log, attempt=None, run_id=None,
 ) -> review.Verdict:
     """Run the reviewer in a temporary worktree at ``commit``.
@@ -2518,7 +2518,7 @@ def _run_reviewer(
     the same session without consuming a worker attempt. Each reviewer turn
     records its own usage, so a format retry is attributed separately.
     """
-    base_commit = execution.branch_base(actl_dir, task.id)
+    base_commit = execution.branch_base(josi_dir, task.id)
     if base_commit is None:
         base_commit = execution.merge_base(
             root, "refs/heads/" + base_branch, commit,
@@ -2531,12 +2531,12 @@ def _run_reviewer(
     )
 
     review_path = (
-        actl_dir / execution.REVIEW_DIR
+        josi_dir / execution.REVIEW_DIR
         / ("t" + str(task.id) + "-" + execution.timestamp())
     )
     execution.add_review_worktree(root, review_path, commit)
     try:
-        log.write("actl review\n")
+        log.write("josi review\n")
         log.write("task: t" + str(task.id) + " - " + task.title + "\n")
         if attempt is not None:
             log.write("attempt: " + str(attempt) + "\n")
@@ -2547,7 +2547,7 @@ def _run_reviewer(
         log.write("started_at: " + _utc_now() + "\n---\n")
         session = backend.create_session(
             review_path,
-            title="actl review t" + str(task.id) + ": " + task.title,
+            title="josi review t" + str(task.id) + ": " + task.title,
             role=agents.ROLE_REVIEWER,
         )
         log.write("session: " + session.id + "\n")
@@ -2576,7 +2576,7 @@ def _run_reviewer(
                 backend, review_path, session, reviewer_model, task, run_id,
                 usage.STAGE_REVIEW if format_attempt == 0
                 else usage.STAGE_REVIEW_FORMAT_RETRY,
-                attempt, log, actl_dir, turn_output=output, previous=previous,
+                attempt, log, josi_dir, turn_output=output, previous=previous,
             )
             if exit_code != 0:
                 _log_review_failure(
@@ -2719,10 +2719,10 @@ def _log_review_failure(log, reason: str) -> None:
 
 
 def _verification_failed(
-    actl_dir, task_id, reason, run, log_hint=None,
+    josi_dir, task_id, reason, run, log_hint=None,
 ) -> tuple:
     """Mark a task FAILED after validation, review, or state loading failed."""
-    _set_task_status(actl_dir, task_id, tasks.STATUS_FAILED)
+    _set_task_status(josi_dir, task_id, tasks.STATUS_FAILED)
     print("")
     print("Task t" + str(task_id) + " \u2192 FAILED")
     message = "task t" + str(task_id) + " failed: " + reason
@@ -2732,9 +2732,9 @@ def _verification_failed(
     return 1, "verification failed", run
 
 
-def _record_review(actl_dir: Path, task_id: int, commit: str, verdict) -> None:
+def _record_review(josi_dir: Path, task_id: int, commit: str, verdict) -> None:
     """Store the verdict (and its findings) for later stages."""
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         tasks.record_review(
             conn, task_id, commit, verdict.decision,
@@ -2744,7 +2744,7 @@ def _record_review(actl_dir: Path, task_id: int, commit: str, verdict) -> None:
         conn.close()
 
 
-def _attempt_baseline(actl_dir: Path, task):
+def _attempt_baseline(josi_dir: Path, task):
     """Return the task's recorded ``(attempts, feedback)`` for this run.
 
     A Stage 5 task that ended NEEDS_CHANGES continues from its remaining
@@ -2754,15 +2754,15 @@ def _attempt_baseline(actl_dir: Path, task):
     counted - the status itself proves that a rejection happened - but no
     feedback can be reconstructed.
     """
-    state = execution.attempt_state(actl_dir, task.id)
+    state = execution.attempt_state(josi_dir, task.id)
     if state is not None:
         return state
     if task.status == tasks.STATUS_NEEDS_CHANGES:
-        feedback = _legacy_review_feedback(actl_dir, task.id)
+        feedback = _legacy_review_feedback(josi_dir, task.id)
         # Persist the derived baseline immediately: a later worker execution
         # error changes the status to FAILED, and the spent attempt must not
         # be forgotten when the task is retried.
-        execution.record_attempt_state(actl_dir, task.id, 1, feedback)
+        execution.record_attempt_state(josi_dir, task.id, 1, feedback)
         return 1, feedback
     return 0, ""
 
@@ -2780,9 +2780,9 @@ def _attempt_model(
     return _worker_model(metadata)
 
 
-def _legacy_review_feedback(actl_dir: Path, task_id: int) -> str:
+def _legacy_review_feedback(josi_dir: Path, task_id: int) -> str:
     """Rebuild repair feedback from the newest stored review, if any."""
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         stored = tasks.latest_review(conn, task_id)
     finally:
@@ -2853,7 +2853,7 @@ def _file_tail(path, limit: int = 4000) -> str:
     return text.rstrip()
 
 
-def _approved_commit(actl_dir: Path, task) -> str:
+def _approved_commit(josi_dir: Path, task) -> str:
     """Return the commit the task's stored approval refers to, or raise.
 
     The approved commit comes from the recorded reviewer verdict, so staging
@@ -2862,7 +2862,7 @@ def _approved_commit(actl_dir: Path, task) -> str:
     without a recorded approval is an inconsistent state and is reported
     instead of staged.
     """
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         stored = tasks.latest_review(conn, task.id)
     finally:
@@ -2875,12 +2875,12 @@ def _approved_commit(actl_dir: Path, task) -> str:
         raise tasks.TaskError(
             "cannot integrate task t" + str(task.id) + ": no approved review"
             " is recorded for it, so its approved commit cannot be verified;"
-            " inspect the task branch and .actl/tasks.db and intervene by hand"
+            " inspect the task branch and .josi/tasks.db and intervene by hand"
         )
     return stored["commit_sha"]
 
 
-def _complete_task(actl_dir, root, task, commit, run) -> tuple:
+def _complete_task(josi_dir, root, task, commit, run) -> tuple:
     """Persist APPROVED, fast-forward into the run branch, then mark STAGED.
 
     The approval is recorded before Git is touched: when staging is
@@ -2891,10 +2891,10 @@ def _complete_task(actl_dir, root, task, commit, run) -> tuple:
     failure between the two Git/SQLite steps leaves the exact approved commit
     ready for a safe repeat.
 
-    The base branch is never touched here: only ``actl run merge`` integrates
+    The base branch is never touched here: only ``josi run merge`` integrates
     a run branch into the configured base branch.
     """
-    _set_task_status(actl_dir, task.id, tasks.STATUS_APPROVED)
+    _set_task_status(josi_dir, task.id, tasks.STATUS_APPROVED)
     try:
         execution.require_expected_run_tip(root, run)
     except execution.ExecutionError as exc:
@@ -2908,7 +2908,7 @@ def _complete_task(actl_dir, root, task, commit, run) -> tuple:
     _event("Fast-forward merging into run r" + str(run.id) + "...")
     try:
         execution.integrate_commit(
-            root, actl_dir, run.branch, execution.branch_name(task.id),
+            root, josi_dir, run.branch, execution.branch_name(task.id),
             commit,
         )
     except execution.ExecutionError as exc:
@@ -2920,8 +2920,8 @@ def _complete_task(actl_dir, root, task, commit, run) -> tuple:
         )
         return 1, "staging failed", run
     try:
-        _stage_task(actl_dir, task.id, run.id, commit)
-        run = _load_run(actl_dir, run.id)
+        _stage_task(josi_dir, task.id, run.id, commit)
+        run = _load_run(josi_dir, run.id)
     except (tasks.TaskError, sqlite3.Error) as exc:
         # The commit is already in the run branch; a rerun detects that and
         # records STAGED without rerunning the worker, validation, or review.
@@ -2938,9 +2938,9 @@ def _complete_task(actl_dir, root, task, commit, run) -> tuple:
     return 0, "", run
 
 
-def _needs_human(actl_dir, task, verification, attempts, run) -> tuple:
+def _needs_human(josi_dir, task, verification, attempts, run) -> tuple:
     """Mark the task NEEDS_HUMAN after its three attempts are exhausted."""
-    _set_task_status(actl_dir, task.id, tasks.STATUS_NEEDS_HUMAN)
+    _set_task_status(josi_dir, task.id, tasks.STATUS_NEEDS_HUMAN)
     print("")
     print("Task t" + str(task.id) + " \u2192 NEEDS_HUMAN")
     if verification is not None and verification.outcome == "rejected":
@@ -2968,7 +2968,7 @@ def _needs_human(actl_dir, task, verification, attempts, run) -> tuple:
         message += " (log: " + str(verification.log_hint) + ")"
     message += (
         "; inspect the task branch, worktree, and logs and intervene by hand"
-        " (removing .actl/attempts/t" + str(task.id) + " grants a deliberate"
+        " (removing .josi/attempts/t" + str(task.id) + " grants a deliberate"
         " fresh three-attempt budget)"
     )
     _fail(message)
@@ -3051,7 +3051,7 @@ def _dependency_staged_message(task_id: int, dep_id: int, run_id) -> str:
         "marked DONE before this task can execute.\n"
         "\n"
         "Run:\n"
-        "    actl run merge " + run + "\n"
+        "    josi run merge " + run + "\n"
         "\n"
         "If you already merged " + run + " manually, execute the\n"
         "same command to finalize its status."
@@ -3069,7 +3069,7 @@ def _staged_block_message(task) -> str:
         "marked DONE before it can execute.\n"
         "\n"
         "Run:\n"
-        "    actl run merge " + run + "\n"
+        "    josi run merge " + run + "\n"
         "\n"
         "If you already merged " + run + " manually, execute the\n"
         "same command to finalize its status."
@@ -3084,16 +3084,16 @@ def _staged_run_message(run) -> str:
         "tasks and must be integrated first.\n"
         "\n"
         "Run:\n"
-        "    actl run merge " + name + "\n"
+        "    josi run merge " + name + "\n"
         "\n"
         "If you already merged " + name + " manually, execute the\n"
         "same command to finalize its status."
     )
 
 
-def _staged_unmerged_run(actl_dir: Path):
+def _staged_unmerged_run(josi_dir: Path):
     """Return the oldest non-integrated run that still holds STAGED tasks."""
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         for run in tasks.list_runs(conn):
             if run.status == tasks.RUN_INTEGRATED:
@@ -3109,7 +3109,7 @@ def _staged_unmerged_run(actl_dir: Path):
         conn.close()
 
 
-def _new_run_refusal(actl_dir: Path, blocker, requested) -> str:
+def _new_run_refusal(josi_dir: Path, blocker, requested) -> str:
     """Explain what blocks a new run, task by task first.
 
     The requested tasks (or every eligible task for ``--all``) are inspected
@@ -3117,7 +3117,7 @@ def _new_run_refusal(actl_dir: Path, blocker, requested) -> str:
     dependency is staged in another run gets the exact, actionable message
     that names the dependency and the run to merge.
     """
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         if requested is not None:
             candidates = [tasks.get_task(conn, task_id) for task_id in requested]
@@ -3139,11 +3139,11 @@ def _new_run_refusal(actl_dir: Path, blocker, requested) -> str:
         conn.close()
 
 
-def _require_dependencies(task, actl_dir: Path, run) -> None:
+def _require_dependencies(task, josi_dir: Path, run) -> None:
     """Refuse a task whose dependencies are not DONE or STAGED in ``run``."""
     if not task.depends_on:
         return
-    unfinished = _unfinished_dependencies(actl_dir, task, run)
+    unfinished = _unfinished_dependencies(josi_dir, task, run)
     if not unfinished:
         return
     for dep, status, dep_run in unfinished:
@@ -3162,7 +3162,7 @@ def _require_dependencies(task, actl_dir: Path, run) -> None:
     )
 
 
-def _require_runnable(task, actl_dir: Path, run) -> None:
+def _require_runnable(task, josi_dir: Path, run) -> None:
     """Refuse tasks that may not be executed.
 
     A task is eligible only when every dependency is satisfied: DONE (its
@@ -3174,11 +3174,11 @@ def _require_runnable(task, actl_dir: Path, run) -> None:
     its approved commit. A NEEDS_CHANGES task from Stage 5 continues from its
     remaining attempts. A NEEDS_HUMAN task refuses to run while its exhausted
     attempt record exists: another automatic cycle would silently restart the
-    budget, so the human must intervene (removing ``.actl/attempts/tN``
+    budget, so the human must intervene (removing ``.josi/attempts/tN``
     deliberately grants a fresh one). A DONE task already finished
     successfully and is never executed again.
     """
-    _require_dependencies(task, actl_dir, run)
+    _require_dependencies(task, josi_dir, run)
     if task.status == tasks.STATUS_DONE:
         raise tasks.TaskError(
             "cannot run task t" + str(task.id) + ": it is already DONE"
@@ -3186,13 +3186,13 @@ def _require_runnable(task, actl_dir: Path, run) -> None:
     if task.status == tasks.STATUS_STAGED:
         raise tasks.TaskError(_staged_block_message(task))
     if task.status == tasks.STATUS_NEEDS_HUMAN:
-        if execution.attempt_state(actl_dir, task.id) is None:
+        if execution.attempt_state(josi_dir, task.id) is None:
             return
         raise tasks.TaskError(
             "cannot run task t" + str(task.id) + ": it is NEEDS_HUMAN after"
             " its " + str(execution.MAX_WORKER_ATTEMPTS) + " worker attempts;"
             " inspect the task branch, worktree, and logs and intervene by"
-            " hand (removing .actl/attempts/t" + str(task.id) + " grants a"
+            " hand (removing .josi/attempts/t" + str(task.id) + " grants a"
             " deliberate fresh three-attempt budget)"
         )
     if task.status not in (
@@ -3206,9 +3206,9 @@ def _require_runnable(task, actl_dir: Path, run) -> None:
         )
 
 
-def _unfinished_dependencies(actl_dir: Path, task, run):
+def _unfinished_dependencies(josi_dir: Path, task, run):
     """Return the ``(id, status, run_id)`` triples of unsatisfied dependencies."""
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         return tasks.unfinished_dependencies(
             conn, task.id, run.id if run is not None else None
@@ -3217,16 +3217,16 @@ def _unfinished_dependencies(actl_dir: Path, task, run):
         conn.close()
 
 
-def _running_run(actl_dir: Path):
+def _running_run(josi_dir: Path):
     """Return the project's RUNNING run, or None."""
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         return tasks.running_run(conn)
     finally:
         conn.close()
 
 
-def _create_run(actl_dir: Path, root: Path, base_branch: str, task_ids):
+def _create_run(josi_dir: Path, root: Path, base_branch: str, task_ids):
     """Create a new RUNNING run starting at the current base branch commit.
 
     ``task_ids`` is the selection the run is responsible for: it may only be
@@ -3234,67 +3234,67 @@ def _create_run(actl_dir: Path, root: Path, base_branch: str, task_ids):
     """
     execution.require_base(root, base_branch)
     start = execution.ref_commit(root, "refs/heads/" + base_branch)
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         return tasks.create_run(conn, base_branch, start, task_ids)
     finally:
         conn.close()
 
 
-def _select_run_tasks(actl_dir: Path, run_id: int, task_ids) -> None:
+def _select_run_tasks(josi_dir: Path, run_id: int, task_ids) -> None:
     """Add this batch's tasks to the run's selection."""
     if not task_ids:
         return
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         tasks.select_run_tasks(conn, run_id, task_ids)
     finally:
         conn.close()
 
 
-def _load_run(actl_dir: Path, run_id: int):
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+def _load_run(josi_dir: Path, run_id: int):
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         return tasks.get_run(conn, run_id)
     finally:
         conn.close()
 
 
-def _stage_task(actl_dir: Path, task_id: int, run_id: int, commit: str) -> None:
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+def _stage_task(josi_dir: Path, task_id: int, run_id: int, commit: str) -> None:
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         tasks.stage_task(conn, task_id, run_id, commit)
     finally:
         conn.close()
 
 
-def _set_run_status(actl_dir: Path, run_id: int, status: str) -> None:
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+def _set_run_status(josi_dir: Path, run_id: int, status: str) -> None:
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         tasks.set_run_status(conn, run_id, status)
     finally:
         conn.close()
 
 
-def _list_tasks(actl_dir: Path):
+def _list_tasks(josi_dir: Path):
     """Return every task of the project, ordered by id."""
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         return tasks.list_tasks(conn)
     finally:
         conn.close()
 
 
-def _load_task(actl_dir: Path, task_id: int):
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+def _load_task(josi_dir: Path, task_id: int):
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         return tasks.get_task(conn, task_id)
     finally:
         conn.close()
 
 
-def _set_task_status(actl_dir: Path, task_id: int, status: str) -> None:
-    conn = tasks.connect(actl_dir / tasks.DATABASE_NAME)
+def _set_task_status(josi_dir: Path, task_id: int, status: str) -> None:
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
     try:
         tasks.set_task_status(conn, task_id, status)
     finally:
@@ -3383,16 +3383,16 @@ def _print_costs(totals) -> None:
 
 
 def _event(message: str) -> None:
-    """Print one timestamped orchestration event of ``actl task run``.
+    """Print one timestamped orchestration event of ``josi task run``.
 
     Events are flushed immediately so they appear as they happen even when
-    actl's own output is redirected to a pipe or a file.
+    josi's own output is redirected to a pipe or a file.
     """
     print("[" + _utc_now() + "] " + message, flush=True)
 
 
 def _fail(message: str) -> int:
-    print("actl: error: " + message, file=sys.stderr)
+    print("josi: error: " + message, file=sys.stderr)
     return 1
 
 
@@ -3402,14 +3402,14 @@ def _utc_now() -> str:
 
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        prog="actl",
+        prog="josi",
         description="Orchestrate AI coding agents (OpenCode or Claude Code).",
     )
-    parser.add_argument("--version", action="version", version="actl " + __version__)
+    parser.add_argument("--version", action="version", version="josi " + __version__)
     subparsers = parser.add_subparsers(dest="command", required=True)
 
     init = subparsers.add_parser(
-        "init", help="register the current Git repository as an actl project"
+        "init", help="register the current Git repository as a Josi project"
     )
     init.add_argument(
         "--agent", choices=agents.AGENTS,
@@ -3421,22 +3421,22 @@ def build_parser() -> argparse.ArgumentParser:
         "--worker-model", metavar="MODEL",
         help="set the project's worker model (name[#effort], e.g."
              " provider/model#variant for OpenCode or sonnet#low for Claude);"
-             " required by 'actl task run' whenever the worker runs",
+             " required by 'josi task run' whenever the worker runs",
     )
     init.add_argument(
         "--reviewer-model", metavar="MODEL",
         help="set the project's reviewer model (name[#effort]); required by"
-             " 'actl task run'",
+             " 'josi task run'",
     )
     init.add_argument(
         "--escalation-worker-model", metavar="MODEL",
         help="set the model for the third and final worker attempt of a"
-             " repair cycle (name[#effort]); required by 'actl task run'",
+             " repair cycle (name[#effort]); required by 'josi task run'",
     )
     init.add_argument(
         "--test-writer-model", metavar="MODEL",
         help="set the project's test-writer model (name[#effort]); required"
-             " by 'actl task run'",
+             " by 'josi task run'",
     )
     init.add_argument(
         "--base", metavar="BRANCH",

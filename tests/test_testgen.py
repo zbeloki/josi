@@ -1,6 +1,6 @@
 """End-to-end tests for the test-generation stage.
 
-Before the first worker attempt, ``actl task run`` launches a noninteractive
+Before the first worker attempt, ``josi task run`` launches a noninteractive
 OpenCode test writer in the task worktree with the project's test-writer
 model. The fake test writer either decides that no tests are needed (the
 default; it changes nothing) or commits test changes; the stage has its own
@@ -31,7 +31,7 @@ import unittest
 
 from test_verification import VerificationTestCase
 
-from actl import tasks
+from josi import tasks
 
 TESTS_WRITTEN = {"decision": "tests_written", "summary": "added tests"}
 
@@ -42,7 +42,7 @@ class TestGenTestCase(VerificationTestCase):
 
     def setUp(self):
         super().setUp()
-        result = self.run_actl("init", "--test-writer-model", "writer/model")
+        result = self.run_josi("init", "--test-writer-model", "writer/model")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     # -- helpers ---------------------------------------------------------
@@ -53,7 +53,7 @@ class TestGenTestCase(VerificationTestCase):
         return calls[-1]["argv"][-1]
 
     def outcome_record(self, task_id=1):
-        path = self.repo / ".actl" / "testgen" / ("t" + str(task_id))
+        path = self.repo / ".josi" / "testgen" / ("t" + str(task_id))
         self.assertTrue(path.is_file(), "no test-generation outcome record")
         return json.loads(path.read_text(encoding="utf-8"))
 
@@ -70,7 +70,7 @@ class TestGenTestCase(VerificationTestCase):
 class TestGenerationStageTests(TestGenTestCase):
     def test_test_writer_runs_before_the_worker_with_model_and_task(self):
         self.make_task("Add the login form")
-        self.run_actl(
+        self.run_josi(
             "task", "update", "t1", "--description",
             "First line.\nSecond line.",
         )
@@ -92,8 +92,8 @@ class TestGenerationStageTests(TestGenTestCase):
         self.assertIn("Task t1: Add the login form", prompt)
         self.assertIn("First line.", prompt)
         self.assertIn("Second line.", prompt)
-        self.assertIn("(branch actl/t1)", prompt)
-        self.assertIn("Never merge into actl/run/r1.", prompt)
+        self.assertIn("(branch josi/t1)", prompt)
+        self.assertIn("Never merge into josi/run/r1.", prompt)
 
         # The test writer runs before the worker, in the same worktree.
         self.assertLess(
@@ -118,9 +118,9 @@ class TestGenerationStageTests(TestGenTestCase):
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "STAGED")
-        self.assertEqual(self.rev("actl/t1~1"), self.base_sha)
+        self.assertEqual(self.rev("josi/t1~1"), self.base_sha)
         subjects = self.git(
-            "log", "--format=%s", "actl/t1"
+            "log", "--format=%s", "josi/t1"
         ).stdout.splitlines()
         self.assertEqual(subjects[0], "worker: implement task")
         self.assertEqual(
@@ -130,15 +130,15 @@ class TestGenerationStageTests(TestGenTestCase):
             self.outcome_record(), {"decision": "no_tests_needed"}
         )
         log = self.latest_generation_log()
-        self.assertTrue(log.startswith("actl test generation\n"), log[:80])
+        self.assertTrue(log.startswith("josi test generation\n"), log[:80])
         self.assertIn("model: writer/model\n", log)
-        self.assertIn("branch: actl/t1\n", log)
+        self.assertIn("branch: josi/t1\n", log)
         self.assertIn("exit_code: 0\n", log)
         self.assertIn("result: no_tests_needed\n", log)
 
     def test_committed_test_changes_succeed(self):
-        self.env["ACTL_FAKE_TESTS"] = "commit"
-        self.env["ACTL_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
+        self.env["JOSI_FAKE_TESTS"] = "commit"
+        self.env["JOSI_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
         self.make_task()
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -148,7 +148,7 @@ class TestGenerationStageTests(TestGenTestCase):
         )
         # The worker started from the committed tests.
         subjects = self.git(
-            "log", "--format=%s", "actl/t1"
+            "log", "--format=%s", "josi/t1"
         ).stdout.splitlines()
         self.assertEqual(subjects[0], "worker: implement task")
         self.assertEqual(subjects[1], "test writer: add tests")
@@ -164,7 +164,7 @@ class TestGenerationStageTests(TestGenTestCase):
     def test_tests_written_without_a_commit_fails_the_stage(self):
         # The default test writer changes nothing; claiming tests_written
         # anyway is an invalid outcome, and the worker must not start.
-        self.env["ACTL_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
+        self.env["JOSI_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
         self.make_task()
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
@@ -176,13 +176,13 @@ class TestGenerationStageTests(TestGenTestCase):
         self.assertEqual(self.reviewer_calls(), [])
         self.assertIn("result: FAILED\n", self.latest_generation_log())
         self.assertFalse(
-            (self.repo / ".actl" / "testgen" / "t1").exists(),
+            (self.repo / ".josi" / "testgen" / "t1").exists(),
             "a failed stage must not be recorded as completed",
         )
 
     def test_uncommitted_changes_fail_the_stage(self):
-        self.env["ACTL_FAKE_TESTS"] = "dirty"
-        self.env["ACTL_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
+        self.env["JOSI_FAKE_TESTS"] = "dirty"
+        self.env["JOSI_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
         self.make_task()
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
@@ -192,8 +192,8 @@ class TestGenerationStageTests(TestGenTestCase):
         self.assertIn("result: FAILED\n", self.latest_generation_log())
 
     def test_untracked_files_fail_the_stage(self):
-        self.env["ACTL_FAKE_TESTS"] = "untracked"
-        self.env["ACTL_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
+        self.env["JOSI_FAKE_TESTS"] = "untracked"
+        self.env["JOSI_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
         self.make_task()
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
@@ -202,7 +202,7 @@ class TestGenerationStageTests(TestGenTestCase):
         self.assertEqual(self.worker_calls(), [], "the worker must not start")
 
     def test_test_writer_execution_error_fails_the_stage(self):
-        self.env["ACTL_FAKE_TESTS_EXIT"] = "3"
+        self.env["JOSI_FAKE_TESTS_EXIT"] = "3"
         self.make_task()
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
@@ -222,7 +222,7 @@ class TestGenerationStageTests(TestGenTestCase):
             ("[1, 2, 3]", "not a JSON object"),
         ):
             with self.subTest(message=message):
-                self.env["ACTL_FAKE_TESTS_JSON"] = message
+                self.env["JOSI_FAKE_TESTS_JSON"] = message
                 result = self.run_task("t1")
                 self.assertNotEqual(result.returncode, 0)
                 self.assertEqual(self.task_status(), "FAILED")
@@ -230,7 +230,7 @@ class TestGenerationStageTests(TestGenTestCase):
         self.assertEqual(self.worker_calls(), [], "the worker must not start")
 
     def test_a_fenced_decision_is_accepted(self):
-        self.env["ACTL_FAKE_TESTS_JSON"] = (
+        self.env["JOSI_FAKE_TESTS_JSON"] = (
             '```json\n{"decision":"no_tests_needed","reason":"none"}\n```'
         )
         self.make_task()
@@ -241,8 +241,8 @@ class TestGenerationStageTests(TestGenTestCase):
     def test_empty_commit_with_tests_written_fails_the_stage(self):
         # An empty commit is not a test change: the branch still has no
         # committed changes relative to the run branch.
-        self.env["ACTL_FAKE_TESTS"] = "empty"
-        self.env["ACTL_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
+        self.env["JOSI_FAKE_TESTS"] = "empty"
+        self.env["JOSI_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
         self.make_task()
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
@@ -252,13 +252,13 @@ class TestGenerationStageTests(TestGenTestCase):
     def test_completed_stage_is_not_repeated_on_retry(self):
         # The worker fails after the test-generation stage completed; the
         # recorded outcome keeps the retry from running the stage again.
-        self.env["ACTL_FAKE_RUN_EXIT"] = "1"
+        self.env["JOSI_FAKE_RUN_EXIT"] = "1"
         self.make_task()
         self.assertNotEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(self.task_status(), "FAILED")
         self.assertEqual(len(self.generation_calls()), 1)
 
-        self.env["ACTL_FAKE_RUN_EXIT"] = "0"
+        self.env["JOSI_FAKE_RUN_EXIT"] = "0"
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "STAGED")
@@ -270,14 +270,14 @@ class TestGenerationStageTests(TestGenTestCase):
     def test_failed_stage_reruns_on_retry(self):
         # A failed stage is never recorded as completed: the retry runs it
         # again before the worker.
-        self.env["ACTL_FAKE_TESTS_EXIT"] = "1"
+        self.env["JOSI_FAKE_TESTS_EXIT"] = "1"
         self.make_task()
         self.assertNotEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(self.task_status(), "FAILED")
         self.assertEqual(len(self.generation_calls()), 1)
         self.assertEqual(self.worker_calls(), [])
 
-        self.env["ACTL_FAKE_TESTS_EXIT"] = "0"
+        self.env["JOSI_FAKE_TESTS_EXIT"] = "0"
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "STAGED")
@@ -286,16 +286,16 @@ class TestGenerationStageTests(TestGenTestCase):
 
     def test_committed_work_skips_the_stage_without_a_record(self):
         # The outcome record can be lost (a crash between the test writer's
-        # commit and the record, or an implementation left by an older actl):
+        # commit and the record, or an implementation left by an older josi):
         # a branch that already carries committed changes never gets a fresh
         # test-writing turn.
-        self.env["ACTL_FAKE_RUN_EXIT"] = "1"
+        self.env["JOSI_FAKE_RUN_EXIT"] = "1"
         self.make_task()
         self.assertNotEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(len(self.generation_calls()), 1)
-        (self.repo / ".actl" / "testgen" / "t1").unlink()
+        (self.repo / ".josi" / "testgen" / "t1").unlink()
 
-        del self.env["ACTL_FAKE_RUN_EXIT"]
+        del self.env["JOSI_FAKE_RUN_EXIT"]
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "STAGED")
@@ -306,7 +306,7 @@ class TestGenerationStageTests(TestGenTestCase):
 
     def test_each_task_of_a_batch_gets_its_own_stage(self):
         self.make_task("First")
-        created = self.run_actl("task", "create", "--title", "Second")
+        created = self.run_josi("task", "create", "--title", "Second")
         self.assertEqual(created.returncode, 0, created.stderr)
 
         result = self.run_task("t1", "t2")
@@ -345,11 +345,11 @@ class TestGenerationStageTests(TestGenTestCase):
         marker = self.base / "worker.pid"
         release = self.base / "worker.release"
         self.addCleanup(self.kill_pid, marker)
-        self.env["ACTL_FAKE_RUN_MARKER"] = str(marker)
-        self.env["ACTL_FAKE_RUN_WAIT_FOR"] = str(release)
+        self.env["JOSI_FAKE_RUN_MARKER"] = str(marker)
+        self.env["JOSI_FAKE_RUN_WAIT_FOR"] = str(release)
 
         parent = subprocess.Popen(
-            [sys.executable, "-m", "actl", "task", "run", "t1"],
+            [sys.executable, "-m", "josi", "task", "run", "t1"],
             cwd=str(self.repo), env=self.env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
@@ -377,8 +377,8 @@ class TestGenerationStageTests(TestGenTestCase):
         self.assertEqual(self.task_status(), "RUNNING")
         workers = len(self.worker_calls())
 
-        del self.env["ACTL_FAKE_RUN_MARKER"]
-        del self.env["ACTL_FAKE_RUN_WAIT_FOR"]
+        del self.env["JOSI_FAKE_RUN_MARKER"]
+        del self.env["JOSI_FAKE_RUN_WAIT_FOR"]
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("left RUNNING", result.stdout)
@@ -391,24 +391,24 @@ class TestGenerationStageTests(TestGenTestCase):
     def test_failed_stage_leaves_the_attempt_budget_unused(self):
         # A failed stage stops before the worker: no worker attempt is
         # consumed, and the retry starts the worker at attempt 1 of 3.
-        self.env["ACTL_FAKE_TESTS_EXIT"] = "3"
+        self.env["JOSI_FAKE_TESTS_EXIT"] = "3"
         self.make_task()
         self.assertNotEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(self.task_status(), "FAILED")
         self.assertEqual(self.worker_calls(), [])
         self.assertFalse(
-            (self.repo / ".actl" / "attempts" / "t1").exists(),
+            (self.repo / ".josi" / "attempts" / "t1").exists(),
             "a failed test-generation stage must not consume an attempt",
         )
 
-        del self.env["ACTL_FAKE_TESTS_EXIT"]
+        del self.env["JOSI_FAKE_TESTS_EXIT"]
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "STAGED")
         self.assertIn("Worker attempt 1/3", result.stdout)
         self.assertEqual(len(self.worker_calls()), 1)
         record = json.loads(
-            (self.repo / ".actl" / "attempts" / "t1").read_text(
+            (self.repo / ".josi" / "attempts" / "t1").read_text(
                 encoding="utf-8"
             )
         )
@@ -430,8 +430,8 @@ class TestGenerationStageTests(TestGenTestCase):
         # The test-writer commit stays on the task branch: validation can
         # run the generated tests in the task worktree, and the reviewer
         # evaluates the cumulative diff that includes them.
-        self.env["ACTL_FAKE_TESTS"] = "commit"
-        self.env["ACTL_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
+        self.env["JOSI_FAKE_TESTS"] = "commit"
+        self.env["JOSI_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
         self.set_validation("cat test-output.txt")
         self.make_task()
         result = self.run_task("t1")
@@ -440,7 +440,7 @@ class TestGenerationStageTests(TestGenTestCase):
         self.assertIn("Validation passed", result.stdout)
 
         subjects = self.git(
-            "log", "--format=%s", "actl/t1"
+            "log", "--format=%s", "josi/t1"
         ).stdout.splitlines()
         self.assertEqual(subjects[0], "worker: implement task")
         self.assertEqual(subjects[1], "test writer: add tests")
@@ -455,8 +455,8 @@ class TestGenerationStageTests(TestGenTestCase):
         # the project's own validation commands run in the task worktree,
         # where they see the test writer's committed tests and the worker's
         # implementation.
-        self.env["ACTL_FAKE_TESTS"] = "commit"
-        self.env["ACTL_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
+        self.env["JOSI_FAKE_TESTS"] = "commit"
+        self.env["JOSI_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
         self.set_validation("cat worker-output.txt test-output.txt")
         self.make_task()
         result = self.run_task("t1")
@@ -471,9 +471,9 @@ class TestGenerationStageTests(TestGenTestCase):
         self.assertIn("result: PASSED", log)
         # The validated commit is the worker's commit on top of the
         # test-writer commit, so the command ran on the generated tests.
-        self.assertIn("commit: " + self.rev("actl/t1"), log)
+        self.assertIn("commit: " + self.rev("josi/t1"), log)
         subjects = self.git(
-            "log", "--format=%s", "actl/t1"
+            "log", "--format=%s", "josi/t1"
         ).stdout.splitlines()
         self.assertEqual(subjects[0], "worker: implement task")
         self.assertEqual(subjects[1], "test writer: add tests")
@@ -481,9 +481,9 @@ class TestGenerationStageTests(TestGenTestCase):
     def test_validation_stays_optional_for_generated_tests(self):
         # Without configured validation commands nothing runs the generated
         # tests, and the run still succeeds: validation is the project's
-        # choice, never something actl adds.
-        self.env["ACTL_FAKE_TESTS"] = "commit"
-        self.env["ACTL_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
+        # choice, never something josi adds.
+        self.env["JOSI_FAKE_TESTS"] = "commit"
+        self.env["JOSI_FAKE_TESTS_JSON"] = json.dumps(TESTS_WRITTEN)
         self.make_task()
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -495,7 +495,7 @@ class TestGenerationStageTests(TestGenTestCase):
         self.assertEqual(self.validation_logs(), [])
         # The generated tests are still committed on the task branch.
         subjects = self.git(
-            "log", "--format=%s", "actl/t1"
+            "log", "--format=%s", "josi/t1"
         ).stdout.splitlines()
         self.assertEqual(subjects[1], "test writer: add tests")
 
@@ -503,7 +503,7 @@ class TestGenerationStageTests(TestGenTestCase):
         # The test-generation stage's usage goes into its own -tests.log and
         # is stored under the distinct test_writer stage, separate from the
         # worker's and reviewer's records.
-        self.env["ACTL_FAKE_SESSION_USAGE"] = json.dumps({
+        self.env["JOSI_FAKE_SESSION_USAGE"] = json.dumps({
             "cost": 0.004,
             "tokens": {"input": 400, "output": 40,
                        "cache": {"read": 0, "write": 0}},
@@ -522,7 +522,7 @@ class TestGenerationStageTests(TestGenTestCase):
         self.assertIn("cost: total=0.004000", log)
         self.assertIn("usage_status: available", log)
 
-        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
         try:
             rows = tasks.task_usage(conn, 1)
         finally:
@@ -589,8 +589,8 @@ class TestGenerationFormatRetryTests(TestGenTestCase):
     """A malformed final message is reformatted once, like a verdict."""
 
     def set_tests_sequence(self, entries, name="tests-count"):
-        self.env["ACTL_FAKE_TESTS_SEQUENCE"] = json.dumps(entries)
-        self.env["ACTL_FAKE_TESTS_COUNT_FILE"] = str(self.base / name)
+        self.env["JOSI_FAKE_TESTS_SEQUENCE"] = json.dumps(entries)
+        self.env["JOSI_FAKE_TESTS_COUNT_FILE"] = str(self.base / name)
 
     def test_prose_before_the_decision_is_reformatted(self):
         # The test writer commits tests but wraps its decision in prose: the
@@ -633,7 +633,7 @@ class TestGenerationFormatRetryTests(TestGenTestCase):
         # The committed tests survive the reformatting turn, and the worker
         # implements the task on top of them.
         subjects = self.git(
-            "log", "--format=%s", "actl/t1"
+            "log", "--format=%s", "josi/t1"
         ).stdout.splitlines()
         self.assertEqual(subjects[0], "worker: implement task")
         self.assertEqual(subjects[1], "test writer: add tests")
@@ -658,7 +658,7 @@ class TestGenerationFormatRetryTests(TestGenTestCase):
     def test_unusable_decision_is_not_reformatted(self):
         # An unknown decision is unusable, not badly formatted: it fails the
         # stage without spending a reformatting turn.
-        self.env["ACTL_FAKE_TESTS_JSON"] = '{"decision": "maybe"}'
+        self.env["JOSI_FAKE_TESTS_JSON"] = '{"decision": "maybe"}'
         self.make_task()
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)

@@ -1,9 +1,9 @@
-"""End-to-end tests for actl Stage 7: run-level integration.
+"""End-to-end tests for josi Stage 7: run-level integration.
 
 Every test runs the CLI against a disposable Git repository and the fake
-``opencode`` executable. Execution is grouped into runs: ``actl task run``
-creates the run branch ``actl/run/rN`` from the configured base branch, stages
-every approved task into it, and never touches the base branch. ``actl run
+``opencode`` executable. Execution is grouped into runs: ``josi task run``
+creates the run branch ``josi/run/rN`` from the configured base branch, stages
+every approved task into it, and never touches the base branch. ``josi run
 merge rN`` integrates a completed run into the base branch exactly once and
 turns its STAGED tasks DONE; the tests cover fast-forward integration, a
 manual merge (plain or merge commit), a non-fast-forward that needs human
@@ -24,7 +24,7 @@ from pathlib import Path
 
 from test_runs import TaskRunTestCase
 
-from actl import tasks
+from josi import tasks
 
 MAJOR = {
     "decision": "changes_requested",
@@ -46,7 +46,7 @@ class IntegrationTestCase(TaskRunTestCase):
 
     def create(self, title, *extra):
         """Create a task and return its id (for example ``"t2"``)."""
-        result = self.run_actl("task", "create", "--title", title, *extra)
+        result = self.run_josi("task", "create", "--title", title, *extra)
         self.assertEqual(result.returncode, 0, result.stderr)
         return result.stdout.split()[-1]
 
@@ -64,21 +64,21 @@ class IntegrationTestCase(TaskRunTestCase):
         ]
 
     def latest_review(self, task_id=1):
-        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
         try:
             return tasks.latest_review(conn, task_id)
         finally:
             conn.close()
 
     def set_task_status(self, status, task_id=1):
-        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
         try:
             tasks.set_task_status(conn, task_id, status)
         finally:
             conn.close()
 
     def run_show(self, run_id="r1"):
-        result = self.run_actl("run", "show", run_id)
+        result = self.run_josi("run", "show", run_id)
         self.assertEqual(result.returncode, 0, result.stderr)
         fields = {"output": result.stdout}
         for line in result.stdout.splitlines():
@@ -95,11 +95,11 @@ class RunBranchTests(IntegrationTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Created run r1", result.stdout)
 
-        worktree = self.repo / ".actl" / "run-worktrees" / "r1"
+        worktree = self.repo / ".josi" / "run-worktrees" / "r1"
         self.assertTrue(worktree.is_dir())
         self.assertEqual(
             self.git("rev-parse", "--abbrev-ref", "HEAD", cwd=worktree).stdout.strip(),
-            "actl/run/r1",
+            "josi/run/r1",
         )
         listed = self.git("worktree", "list", "--porcelain").stdout
         self.assertIn(str(worktree), listed)
@@ -108,30 +108,30 @@ class RunBranchTests(IntegrationTestCase):
         # approved task commit; the base branch never moved.
         shown = self.run_show()
         self.assertEqual(shown["status"], "COMPLETE")
-        self.assertEqual(shown["branch"], "actl/run/r1")
+        self.assertEqual(shown["branch"], "josi/run/r1")
         self.assertEqual(shown["base_branch"], "main")
         self.assertEqual(shown["start_commit"], self.base_sha)
-        self.assertEqual(shown["final_commit"], self.rev("actl/t1"))
-        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t1"))
+        self.assertEqual(shown["final_commit"], self.rev("josi/t1"))
+        self.assertEqual(self.rev("josi/run/r1"), self.rev("josi/t1"))
         self.assertEqual(self.rev("main"), self.base_sha)
 
     def test_run_list_shows_status_branch_and_tasks(self):
         self.create("First")
         self.assertEqual(self.run_task("t1").returncode, 0)
-        result = self.run_actl("run", "list")
+        result = self.run_josi("run", "list")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
-            result.stdout.strip(), "r1  COMPLETE  actl/run/r1  t1"
+            result.stdout.strip(), "r1  COMPLETE  josi/run/r1  t1"
         )
 
-        empty = self.run_actl("run", "list")
+        empty = self.run_josi("run", "list")
         self.assertEqual(empty.returncode, 0)
 
     def test_run_show_refuses_an_unknown_run(self):
-        result = self.run_actl("run", "show", "r9")
+        result = self.run_josi("run", "show", "r9")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("run r9 does not exist", result.stderr)
-        result = self.run_actl("run", "merge", "r9")
+        result = self.run_josi("run", "merge", "r9")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("run r9 does not exist", result.stderr)
 
@@ -147,9 +147,9 @@ class RunBranchTests(IntegrationTestCase):
 
         # One run holds all three tasks; the run branch advanced with every
         # staged task and the base branch stayed put.
-        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t3"))
-        self.assertEqual(self.rev("actl/t2~1"), self.rev("actl/t1"))
-        self.assertEqual(self.rev("actl/t3~1"), self.rev("actl/t2"))
+        self.assertEqual(self.rev("josi/run/r1"), self.rev("josi/t3"))
+        self.assertEqual(self.rev("josi/t2~1"), self.rev("josi/t1"))
+        self.assertEqual(self.rev("josi/t3~1"), self.rev("josi/t2"))
         self.assertEqual(self.rev("main"), self.base_sha)
         shown = self.run_show()
         self.assertIn("tasks:\nt1  STAGED  First", shown["output"])
@@ -165,7 +165,7 @@ class RunBranchTests(IntegrationTestCase):
             encoding="utf-8"
         )
         self.assertIn("worker change", content)
-        self.assertEqual(self.rev("actl/t2~1"), self.rev("actl/t1"))
+        self.assertEqual(self.rev("josi/t2~1"), self.rev("josi/t1"))
 
     def test_base_branch_remains_unchanged_during_execution(self):
         self.create("First")
@@ -179,10 +179,10 @@ class RunBranchTests(IntegrationTestCase):
         self.assertEqual(self.git("status", "--porcelain").stdout, "")
 
     def test_failed_batch_preserves_staged_work_and_stays_resumable(self):
-        self.env["ACTL_FAKE_RUN_SEQUENCE"] = json.dumps(
+        self.env["JOSI_FAKE_RUN_SEQUENCE"] = json.dumps(
             [{"behavior": "commit"}, {"behavior": "commit", "exit": 1}]
         )
-        self.env["ACTL_FAKE_RUN_COUNT_FILE"] = str(self.base / "worker-count")
+        self.env["JOSI_FAKE_RUN_COUNT_FILE"] = str(self.base / "worker-count")
         t1 = self.create("First")
         t2 = self.create("Second", "--depends-on", t1)
         result = self.run_task(t1, t2)
@@ -193,7 +193,7 @@ class RunBranchTests(IntegrationTestCase):
         # resumable - a partial plan is never integrated.
         self.assertEqual(self.task_status(t1), "STAGED")
         self.assertEqual(self.task_status(t2), "FAILED")
-        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t1"))
+        self.assertEqual(self.rev("josi/run/r1"), self.rev("josi/t1"))
         self.assertEqual(self.rev("main"), self.base_sha)
         self.assertEqual(self.run_status("r1"), "RUNNING")
         self.assertTrue(self.worktree("t2").is_dir(), "worktree preserved")
@@ -227,12 +227,12 @@ class RunBranchTests(IntegrationTestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(
             result.stderr,
-            "actl: error: "
+            "josi: error: "
             "Cannot start a new run: run r1 still holds staged\n"
             "tasks and must be integrated first.\n"
             "\n"
             "Run:\n"
-            "    actl run merge r1\n"
+            "    josi run merge r1\n"
             "\n"
             "If you already merged r1 manually, execute the\n"
             "same command to finalize its status.\n",
@@ -251,18 +251,18 @@ class RunBranchTests(IntegrationTestCase):
         # A run stopped before staging anything also stays open: the retry
         # resumes the same run instead of starting a second one.
         self.create("First")
-        self.env["ACTL_FAKE_RUN_EXIT"] = "1"
+        self.env["JOSI_FAKE_RUN_EXIT"] = "1"
         self.assertNotEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(self.task_status(), "FAILED")
         self.assertEqual(self.run_status("r1"), "RUNNING")
 
-        self.env["ACTL_FAKE_RUN_EXIT"] = "0"
+        self.env["JOSI_FAKE_RUN_EXIT"] = "0"
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "STAGED")
         self.assertEqual(self.run_status("r1"), "COMPLETE")
         self.assertEqual(self.rev("main"), self.base_sha)
-        listing = self.run_actl("run", "list")
+        listing = self.run_josi("run", "list")
         self.assertEqual(len(listing.stdout.strip().splitlines()), 1)
 
     def test_run_branch_movement_refuses_resumption(self):
@@ -271,7 +271,7 @@ class RunBranchTests(IntegrationTestCase):
         self.create("First")
         self.create("Second", "--depends-on", "t1")
         self.assertEqual(self.run_task("t1").returncode, 0)
-        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
         try:
             tasks.set_run_status(conn, 1, tasks.RUN_RUNNING)
         finally:
@@ -279,14 +279,14 @@ class RunBranchTests(IntegrationTestCase):
         run_worktree = self.run_worktree()
         (run_worktree / "human.txt").write_text("human\n", encoding="utf-8")
         self.commit("human change on the run branch", cwd=run_worktree)
-        human = self.rev("actl/run/r1")
+        human = self.rev("josi/run/r1")
 
         result = self.run_task("t2")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("moved unexpectedly", result.stderr)
         self.assertEqual(self.task_status("t2"), "PENDING")
         self.assertNotIn("t2", self.worker_cwds())
-        self.assertEqual(self.rev("actl/run/r1"), human, "never reset")
+        self.assertEqual(self.rev("josi/run/r1"), human, "never reset")
         self.assertEqual(self.rev("main"), self.base_sha)
         self.assertEqual(self.run_status("r1"), "RUNNING")
         refused = self.integrate()
@@ -299,17 +299,17 @@ class RunBranchTests(IntegrationTestCase):
         # executes must never become the recorded final commit or reach the
         # base branch.
         release = self.base / "worker.release"
-        self.env["ACTL_FAKE_RUN_SEQUENCE"] = json.dumps(
+        self.env["JOSI_FAKE_RUN_SEQUENCE"] = json.dumps(
             [{"behavior": "commit"},
              {"behavior": "commit", "wait_for": str(release)}]
         )
         count = self.base / "worker-count"
-        self.env["ACTL_FAKE_RUN_COUNT_FILE"] = str(count)
+        self.env["JOSI_FAKE_RUN_COUNT_FILE"] = str(count)
         t1 = self.create("First")
         t2 = self.create("Second", "--depends-on", t1)
 
         parent = subprocess.Popen(
-            [sys.executable, "-m", "actl", "task", "run", t1, t2],
+            [sys.executable, "-m", "josi", "task", "run", t1, t2],
             cwd=str(self.repo), env=self.env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
@@ -332,7 +332,7 @@ class RunBranchTests(IntegrationTestCase):
                 "unreviewed change on the run branch",
                 cwd=self.run_worktree(),
             )
-            human = self.rev("actl/run/r1")
+            human = self.rev("josi/run/r1")
         finally:
             release.write_text("go", encoding="utf-8")
             try:
@@ -345,7 +345,7 @@ class RunBranchTests(IntegrationTestCase):
         self.assertIn("staging failed", err)
         self.assertEqual(self.task_status(t1), "STAGED")
         self.assertEqual(self.task_status(t2), "APPROVED")
-        self.assertEqual(self.rev("actl/run/r1"), human)
+        self.assertEqual(self.rev("josi/run/r1"), human)
         self.assertEqual(self.rev("main"), self.base_sha)
         self.assertEqual(self.run_status("r1"), "RUNNING")
         self.assertNotEqual(self.latest_review(2)["commit_sha"], human)
@@ -366,7 +366,7 @@ class RunMergeTests(IntegrationTestCase):
         result = self.integrate()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("integrated into main", result.stdout)
-        self.assertEqual(self.rev("main"), self.rev("actl/run/r1"))
+        self.assertEqual(self.rev("main"), self.rev("josi/run/r1"))
         self.assertEqual(self.task_status(t1), "DONE")
         self.assertEqual(self.task_status(t2), "DONE")
         self.assertEqual(self.run_status(), "INTEGRATED")
@@ -393,8 +393,8 @@ class RunMergeTests(IntegrationTestCase):
         # statuses without repeating the merge.
         self.create("Add the feature")
         self.assertEqual(self.run_task("t1").returncode, 0)
-        self.git("merge", "--ff-only", "actl/run/r1")
-        self.assertEqual(self.rev("main"), self.rev("actl/run/r1"))
+        self.git("merge", "--ff-only", "josi/run/r1")
+        self.assertEqual(self.rev("main"), self.rev("josi/run/r1"))
 
         result = self.integrate()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -409,9 +409,9 @@ class RunMergeTests(IntegrationTestCase):
         # from the recorded, verified final commit.
         self.create("Add the feature")
         self.assertEqual(self.run_task("t1").returncode, 0)
-        self.git("merge", "--ff-only", "actl/run/r1")
+        self.git("merge", "--ff-only", "josi/run/r1")
         self.git("worktree", "remove", str(self.run_worktree()))
-        self.git("branch", "-d", "actl/run/r1")
+        self.git("branch", "-d", "josi/run/r1")
 
         result = self.integrate()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -428,9 +428,9 @@ class RunMergeTests(IntegrationTestCase):
         self.commit("main moves independently")
         self.git(
             "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-            "merge", "--no-ff", "--no-edit", "actl/run/r1",
+            "merge", "--no-ff", "--no-edit", "josi/run/r1",
         )
-        self.git("merge-base", "--is-ancestor", self.rev("actl/run/r1"), "main")
+        self.git("merge-base", "--is-ancestor", self.rev("josi/run/r1"), "main")
 
         result = self.integrate()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -445,23 +445,23 @@ class RunMergeTests(IntegrationTestCase):
         (self.repo / "base-moves.txt").write_text("base\n", encoding="utf-8")
         self.commit("base moves on")
         base_head = self.rev("main")
-        self.assertNotEqual(base_head, self.rev("actl/run/r1"))
+        self.assertNotEqual(base_head, self.rev("josi/run/r1"))
 
         result = self.integrate()
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("manual Git integration", result.stderr)
-        self.assertIn("git checkout main && git merge actl/run/r1", result.stdout)
+        self.assertIn("git checkout main && git merge josi/run/r1", result.stdout)
         # Nothing changed: statuses, run, and branches are preserved.
         self.assertEqual(self.task_status(), "STAGED")
         self.assertEqual(self.run_status(), "COMPLETE")
         self.assertEqual(self.rev("main"), base_head)
-        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t1"))
+        self.assertEqual(self.rev("josi/run/r1"), self.rev("josi/t1"))
 
         # After the user resolves the integration by hand, the same command
         # detects it and finalizes the statuses.
         self.git(
             "-c", "user.name=Test", "-c", "user.email=test@example.invalid",
-            "merge", "--no-edit", "actl/run/r1",
+            "merge", "--no-edit", "josi/run/r1",
         )
         result = self.integrate()
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -487,27 +487,27 @@ class RunMergeTests(IntegrationTestCase):
 
     def test_run_merge_uses_the_configured_base_branch(self):
         self.git("branch", "develop")
-        result = self.run_actl("init", "--base", "develop")
+        result = self.run_josi("init", "--base", "develop")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.create("Add the feature")
         self.assertEqual(self.run_task("t1").returncode, 0)
 
-        # ``develop`` is not checked out anywhere: actl integrates it through
+        # ``develop`` is not checked out anywhere: josi integrates it through
         # a temporary merge worktree, and ``main`` never moves.
         result = self.integrate()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "DONE")
-        self.assertEqual(self.rev("develop"), self.rev("actl/t1"))
+        self.assertEqual(self.rev("develop"), self.rev("josi/t1"))
         self.assertEqual(self.rev("main"), self.base_sha)
         self.assertEqual(
-            list((self.repo / ".actl" / "integrate").glob("*")), [],
+            list((self.repo / ".josi" / "integrate").glob("*")), [],
             "the temporary merge worktree must be removed",
         )
 
     def test_run_merge_updates_the_worktree_checking_out_the_base(self):
         self.git("branch", "develop")
         self.assertEqual(
-            self.run_actl("init", "--base", "develop").returncode, 0
+            self.run_josi("init", "--base", "develop").returncode, 0
         )
         second = self.base / "develop-worktree"
         self.git("worktree", "add", str(second), "develop")
@@ -518,7 +518,7 @@ class RunMergeTests(IntegrationTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(
             self.rev("HEAD", cwd=second),
-            self.rev("actl/t1"),
+            self.rev("josi/t1"),
             "the worktree with the base branch checked out is updated",
         )
         self.assertEqual(self.rev("main"), self.base_sha)
@@ -529,7 +529,7 @@ class RunMergeTests(IntegrationTestCase):
         run_worktree = self.run_worktree()
         (run_worktree / "human.txt").write_text("human\n", encoding="utf-8")
         self.commit("human change on the run branch", cwd=run_worktree)
-        moved = self.rev("actl/run/r1")
+        moved = self.rev("josi/run/r1")
         final = self.run_show()["final_commit"]
         self.assertNotEqual(moved, final)
 
@@ -539,11 +539,11 @@ class RunMergeTests(IntegrationTestCase):
         self.assertEqual(self.task_status(), "STAGED")
         self.assertEqual(self.run_status(), "COMPLETE")
         self.assertEqual(self.rev("main"), self.base_sha)
-        self.assertEqual(self.rev("actl/run/r1"), moved)
+        self.assertEqual(self.rev("josi/run/r1"), moved)
 
     def test_run_merge_refuses_a_running_run(self):
         self.create("Add the feature")
-        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
         try:
             tasks.create_run(conn, "main", self.base_sha)
         finally:
@@ -560,14 +560,14 @@ class RunMergeTests(IntegrationTestCase):
         # only the merge itself can refuse instead of silently replacing the
         # human's local data.
         (self.repo / ".gitignore").write_text(
-            ".actl/\nlocal-notes.txt\n", encoding="utf-8"
+            ".josi/\nlocal-notes.txt\n", encoding="utf-8"
         )
         self.commit("ignore the local notes")
         human = "local settings\n"
         (self.repo / "local-notes.txt").write_text(human, encoding="utf-8")
         base = self.rev("main")
         self.create("Track the local notes")
-        self.env["ACTL_FAKE_RUN"] = "ignore-collision"
+        self.env["JOSI_FAKE_RUN"] = "ignore-collision"
         self.assertEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(self.task_status(), "STAGED")
 
@@ -590,7 +590,7 @@ class RunMergeTests(IntegrationTestCase):
         (self.repo / "local-notes.txt").unlink()
         self.assertEqual(self.integrate().returncode, 0)
         self.assertEqual(self.task_status(), "DONE")
-        self.assertEqual(self.rev("main"), self.rev("actl/t1"))
+        self.assertEqual(self.rev("main"), self.rev("josi/t1"))
         self.assertEqual(
             (self.repo / "local-notes.txt").read_text(encoding="utf-8"),
             "tracked default\n",
@@ -604,14 +604,14 @@ class RunMergeTests(IntegrationTestCase):
         workers = len(self.worker_calls())
         reviewers = len(self.reviewer_calls())
         # A branch-level option turns a plain merge into a squash that only
-        # stages the changes; actl must still fast-forward and may report DONE
+        # stages the changes; josi must still fast-forward and may report DONE
         # only once the approved commit is really in the base branch.
         self.git("config", "branch.main.mergeOptions", "--squash")
 
         result = self.integrate()
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "DONE")
-        approved = self.rev("actl/t1")
+        approved = self.rev("josi/t1")
         self.assertEqual(self.rev("main"), approved)
         self.git("merge-base", "--is-ancestor", approved, "main")
         self.assertEqual(self.git("status", "--porcelain").stdout, "")
@@ -623,15 +623,15 @@ class RunMergeTests(IntegrationTestCase):
         self.assertEqual(self.run_task("t1").returncode, 0)
         workers = len(self.worker_calls())
         reviewers = len(self.reviewer_calls())
-        head = self.rev("actl/t1")
+        head = self.rev("josi/t1")
 
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Task t1 is STAGED in run r1", result.stderr)
-        self.assertIn("actl run merge r1", result.stderr)
+        self.assertIn("josi run merge r1", result.stderr)
         self.assertEqual(len(self.worker_calls()), workers)
         self.assertEqual(len(self.reviewer_calls()), reviewers)
-        self.assertEqual(self.rev("actl/t1"), head)
+        self.assertEqual(self.rev("josi/t1"), head)
         self.assertEqual(self.rev("main"), self.base_sha)
 
     def test_approved_task_is_staged_without_rerunning_agents(self):
@@ -644,7 +644,7 @@ class RunMergeTests(IntegrationTestCase):
         # status: the run is still RUNNING and the task is APPROVED. The
         # retry resumes the same run and stages the recorded commit.
         self.set_task_status("APPROVED")
-        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
         try:
             tasks.set_run_status(conn, 1, tasks.RUN_RUNNING)
         finally:
@@ -652,7 +652,7 @@ class RunMergeTests(IntegrationTestCase):
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "STAGED")
-        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t1"))
+        self.assertEqual(self.rev("josi/run/r1"), self.rev("josi/t1"))
         self.assertEqual(self.run_status(), "COMPLETE")
         self.assertEqual(len(self.worker_calls()), workers)
         self.assertEqual(len(self.reviewer_calls()), reviewers)
@@ -666,7 +666,7 @@ class RunMergeTests(IntegrationTestCase):
         self.assertEqual(self.run_task("t1").returncode, 0)
         workers = len(self.worker_calls())
         reviewers = len(self.reviewer_calls())
-        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
         try:
             tasks.set_task_status(conn, 1, tasks.STATUS_APPROVED)
             conn.execute(
@@ -676,8 +676,8 @@ class RunMergeTests(IntegrationTestCase):
             conn.commit()
         finally:
             conn.close()
-        approved = self.rev("actl/t1")
-        self.assertEqual(self.rev("actl/run/r1"), approved)
+        approved = self.rev("josi/t1")
+        self.assertEqual(self.rev("josi/run/r1"), approved)
 
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -695,7 +695,7 @@ class RunMergeTests(IntegrationTestCase):
         # staged, and completes the run without touching any agent.
         self.create("First")
         self.assertEqual(self.run_task("t1").returncode, 0)
-        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
         try:
             tasks.set_run_status(conn, 1, tasks.RUN_RUNNING)
         finally:
@@ -723,7 +723,7 @@ class DependencySchedulingTests(IntegrationTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(t1), "STAGED")
         self.assertEqual(self.task_status(t2), "STAGED")
-        self.assertEqual(self.rev("actl/t2~1"), self.rev("actl/t1"))
+        self.assertEqual(self.rev("josi/t2~1"), self.rev("josi/t1"))
         self.assertNotIn("STAGED in run", result.stderr)
 
     def test_staged_dependency_in_another_run_blocks_execution(self):
@@ -738,14 +738,14 @@ class DependencySchedulingTests(IntegrationTestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(
             result.stderr,
-            "actl: error: "
+            "josi: error: "
             "Cannot execute task t2.\n"
             "\n"
             "Dependency t1 is STAGED in run r1 and must be\n"
             "marked DONE before this task can execute.\n"
             "\n"
             "Run:\n"
-            "    actl run merge r1\n"
+            "    josi run merge r1\n"
             "\n"
             "If you already merged r1 manually, execute the\n"
             "same command to finalize its status.\n",
@@ -792,12 +792,12 @@ class DependencySchedulingTests(IntegrationTestCase):
         for task_id in (t1, t2, t3):
             self.assertEqual(self.task_status(task_id), "STAGED")
         self.assertEqual(self.worker_cwds(), [t1, t2, t3])
-        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t3"))
+        self.assertEqual(self.rev("josi/run/r1"), self.rev("josi/t3"))
         self.assertEqual(self.rev("main"), self.base_sha)
         self.assertIn("Summary: completed: t1, t2, t3", result.stdout)
 
     def test_explicit_task_list_stops_at_the_first_failure(self):
-        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(MAJOR)
+        self.env["JOSI_FAKE_REVIEW_JSON"] = json.dumps(MAJOR)
         t1 = self.create("First")
         t2 = self.create("Second")
         result = self.run_task(t1, t2)
@@ -823,7 +823,7 @@ class DependencySchedulingTests(IntegrationTestCase):
         for task_id in (t1, t2, t3):
             self.assertEqual(self.task_status(task_id), "STAGED")
         self.assertEqual(self.worker_cwds(), [t1, t2, t3])
-        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t3"))
+        self.assertEqual(self.rev("josi/run/r1"), self.rev("josi/t3"))
         self.assertEqual(self.rev("main"), self.base_sha)
         self.assertIn("Summary: completed: t1, t2, t3", result.stdout)
 
@@ -836,7 +836,7 @@ class DependencySchedulingTests(IntegrationTestCase):
         self.assertEqual(self.worker_cwds(), ["t1", "t2", "t3"])
 
     def test_all_stops_when_a_task_needs_human(self):
-        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(MAJOR)
+        self.env["JOSI_FAKE_REVIEW_JSON"] = json.dumps(MAJOR)
         t1 = self.create("First")
         t2 = self.create("Second")
         result = self.run_task("--all")
@@ -847,7 +847,7 @@ class DependencySchedulingTests(IntegrationTestCase):
         self.assertIn("stopped at t1", result.stdout)
 
     def test_all_never_executes_tasks_with_unfinished_dependencies(self):
-        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(MAJOR)
+        self.env["JOSI_FAKE_REVIEW_JSON"] = json.dumps(MAJOR)
         t1 = self.create("First")
         t2 = self.create("Second", "--depends-on", t1)
         # t1 already needs a human; t2 can never become ready.
@@ -876,13 +876,13 @@ class DependencySchedulingTests(IntegrationTestCase):
         result = self.run_task("--all")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Dependency t1 is STAGED in run r1", result.stderr)
-        self.assertIn("actl run merge r1", result.stderr)
+        self.assertIn("josi run merge r1", result.stderr)
         self.assertEqual(
             len(self.worker_calls()), workers, "t2 must never execute"
         )
 
     def test_all_reports_tasks_that_already_need_a_human(self):
-        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(MAJOR)
+        self.env["JOSI_FAKE_REVIEW_JSON"] = json.dumps(MAJOR)
         self.create("First")
         self.assertNotEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(self.task_status("t1"), "NEEDS_HUMAN")
@@ -905,7 +905,7 @@ class DependencySchedulingTests(IntegrationTestCase):
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Summary: completed: none", result.stdout)
         self.assertEqual(self.worker_calls(), [])
-        run_list = self.run_actl("run", "list")
+        run_list = self.run_josi("run", "list")
         self.assertEqual(run_list.stdout, "", "no empty run is created")
 
     def test_run_requires_ids_or_all(self):
@@ -937,7 +937,7 @@ class BatchLockTests(IntegrationTestCase):
     def test_batch_refuses_immediately_while_the_lock_is_held(self):
         self.create("First")
         self.create("Second")
-        lock_path = self.repo / ".actl" / "execution.lock"
+        lock_path = self.repo / ".josi" / "execution.lock"
         handle = open(lock_path, "a+b")
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
@@ -956,14 +956,14 @@ class BatchLockTests(IntegrationTestCase):
         self.create("Second")
         release = self.base / "worker.release"
         marker = self.base / "worker.pid"
-        self.env["ACTL_FAKE_RUN_MARKER"] = str(marker)
-        self.env["ACTL_FAKE_RUN_COUNT_FILE"] = str(self.base / "worker-count")
-        self.env["ACTL_FAKE_RUN_SEQUENCE"] = json.dumps(
+        self.env["JOSI_FAKE_RUN_MARKER"] = str(marker)
+        self.env["JOSI_FAKE_RUN_COUNT_FILE"] = str(self.base / "worker-count")
+        self.env["JOSI_FAKE_RUN_SEQUENCE"] = json.dumps(
             [{"wait_for": str(release)}]
         )
 
         parent = subprocess.Popen(
-            [sys.executable, "-m", "actl", "task", "run", "--all"],
+            [sys.executable, "-m", "josi", "task", "run", "--all"],
             cwd=str(self.repo), env=self.env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
@@ -984,7 +984,7 @@ class BatchLockTests(IntegrationTestCase):
         self.assertEqual(parent.returncode, 0, err)
         self.assertEqual(self.task_status("t1"), "STAGED")
         self.assertEqual(self.task_status("t2"), "STAGED")
-        self.assertEqual(self.rev("actl/run/r1"), self.rev("actl/t2"))
+        self.assertEqual(self.rev("josi/run/r1"), self.rev("josi/t2"))
         self.assertEqual(self.rev("main"), self.base_sha)
         self.assertIn("Summary: completed: t1, t2", out)
 
@@ -1009,7 +1009,7 @@ class IntegrationOutputTests(IntegrationTestCase):
             stdout.index("task t2:"),
         )
         self.assertIn("Summary: completed: t1, t2", stdout)
-        self.assertIn("integrate it with 'actl run merge r1'", stdout)
+        self.assertIn("integrate it with 'josi run merge r1'", stdout)
         self.assertNotIn("fake opencode:", stdout)
         self.assertNotIn("fake opencode:", result.stderr)
 

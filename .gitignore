@@ -4,6 +4,8 @@ __pycache__/
 build/
 dist/
 .pytest_cache/
+# Existing local data stays ignored; Josi only uses .josi/.
 .actl/
+.josi/
 /venv/
 /.opencode/

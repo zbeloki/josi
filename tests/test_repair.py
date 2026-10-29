@@ -1,8 +1,8 @@
-"""End-to-end tests for actl Stage 6: automatic repair and model escalation.
+"""End-to-end tests for josi Stage 6: automatic repair and model escalation.
 
 Every test runs the CLI against a disposable Git repository and the fake
 ``opencode`` executable. The fake supports per-invocation sequences
-(``ACTL_FAKE_REVIEW_SEQUENCE`` and ``ACTL_FAKE_RUN_SEQUENCE`` with a count
+(``JOSI_FAKE_REVIEW_SEQUENCE`` and ``JOSI_FAKE_RUN_SEQUENCE`` with a count
 file), so the suite can reject the first attempt, accept the second, and
 inspect the feedback the worker received - no real OpenCode process and no
 model call.
@@ -20,9 +20,9 @@ import unittest
 from pathlib import Path
 
 from test_verification import VerificationTestCase
-from test_actl import model_setting
+from test_josi import model_setting
 
-from actl import tasks
+from josi import tasks
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
@@ -54,13 +54,13 @@ class RepairTestCase(VerificationTestCase):
 
     def set_reviewer(self, *verdicts):
         """Give the fake reviewer one verdict per invocation."""
-        self.env["ACTL_FAKE_REVIEW_SEQUENCE"] = json.dumps(list(verdicts))
-        self.env["ACTL_FAKE_REVIEW_COUNT_FILE"] = str(self.base / "review-count")
+        self.env["JOSI_FAKE_REVIEW_SEQUENCE"] = json.dumps(list(verdicts))
+        self.env["JOSI_FAKE_REVIEW_COUNT_FILE"] = str(self.base / "review-count")
 
     def set_worker(self, *behaviors):
         """Give the fake worker one behavior per invocation."""
-        self.env["ACTL_FAKE_RUN_SEQUENCE"] = json.dumps(list(behaviors))
-        self.env["ACTL_FAKE_RUN_COUNT_FILE"] = str(self.base / "worker-count")
+        self.env["JOSI_FAKE_RUN_SEQUENCE"] = json.dumps(list(behaviors))
+        self.env["JOSI_FAKE_RUN_COUNT_FILE"] = str(self.base / "worker-count")
 
     def worker_models(self):
         return [
@@ -69,7 +69,7 @@ class RepairTestCase(VerificationTestCase):
         ]
 
     def attempt_record(self):
-        path = self.repo / ".actl" / "attempts" / "t1"
+        path = self.repo / ".josi" / "attempts" / "t1"
         self.assertTrue(path.is_file(), "no attempt record was written")
         return json.loads(path.read_text(encoding="utf-8"))
 
@@ -167,7 +167,7 @@ class BasicRepairTests(RepairTestCase):
         self.assertEqual(
             self.git("status", "--porcelain", cwd=self.worktree()).stdout, ""
         )
-        subjects = self.git("log", "--format=%s", "actl/t1").stdout.splitlines()
+        subjects = self.git("log", "--format=%s", "josi/t1").stdout.splitlines()
         self.assertEqual(subjects.count("worker: implement task"), 3)
 
         # The final review saw the complete cumulative implementation.
@@ -178,7 +178,7 @@ class BasicRepairTests(RepairTestCase):
             self.assertIn(name, final_prompt)
 
     def test_third_rejection_needs_human_and_stops(self):
-        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.major("Still broken."))
+        self.env["JOSI_FAKE_REVIEW_JSON"] = json.dumps(self.major("Still broken."))
         self.make_task()
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
@@ -193,7 +193,7 @@ class BasicRepairTests(RepairTestCase):
         self.assertIn("Still broken.", record["feedback"])
 
         # Every verdict is stored for the human looking at the task.
-        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
         try:
             decisions = [
                 row["decision"]
@@ -205,7 +205,7 @@ class BasicRepairTests(RepairTestCase):
             conn.close()
         self.assertEqual(decisions, ["changes_requested"] * 3)
 
-        # Restarting actl never restarts the budget automatically.
+        # Restarting josi never restarts the budget automatically.
         again = self.run_task("t1")
         self.assertNotEqual(again.returncode, 0)
         self.assertIn("NEEDS_HUMAN", again.stderr)
@@ -218,24 +218,24 @@ class BasicRepairTests(RepairTestCase):
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("no escalation worker model", result.stderr)
-        self.assertIn("actl init --escalation-worker-model", result.stderr)
+        self.assertIn("josi init --escalation-worker-model", result.stderr)
         self.assertEqual(self.task_status(), "PENDING")
         self.assertEqual(self.worker_calls(), [], "no worker may start")
         self.assertEqual(self.reviewer_calls(), [], "no reviewer may start")
-        self.assertFalse((self.repo / ".actl" / "worktrees").exists())
+        self.assertFalse((self.repo / ".josi" / "worktrees").exists())
         self.assertEqual(
-            list((self.repo / ".actl" / "runs").glob("t1-*.log")), [],
+            list((self.repo / ".josi" / "runs").glob("t1-*.log")), [],
             "no stage may start without an escalation model",
         )
         self.assertFalse(
-            (self.repo / ".actl" / "execution.lock").exists(),
+            (self.repo / ".josi" / "execution.lock").exists(),
             "the lock must not be taken",
         )
 
     def test_missing_escalation_model_precedes_the_execution_lock(self):
         self.remove_escalation_model()
         self.make_task()
-        lock_path = self.repo / ".actl" / "execution.lock"
+        lock_path = self.repo / ".josi" / "execution.lock"
         handle = open(lock_path, "a+b")
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
@@ -250,17 +250,17 @@ class BasicRepairTests(RepairTestCase):
         self.assertEqual(self.calls(), [])
 
     def test_worker_error_stops_without_a_repair(self):
-        self.env["ACTL_FAKE_RUN_EXIT"] = "1"
+        self.env["JOSI_FAKE_RUN_EXIT"] = "1"
         self.make_task()
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.task_status(), "FAILED")
         self.assertEqual(len(self.worker_calls()), 1)
         self.assertEqual(self.reviewer_calls(), [])
-        self.assertFalse((self.repo / ".actl" / "attempts" / "t1").exists())
+        self.assertFalse((self.repo / ".josi" / "attempts" / "t1").exists())
 
     def test_reviewer_error_stops_without_a_repair(self):
-        self.env["ACTL_FAKE_REVIEW_EXIT"] = "2"
+        self.env["JOSI_FAKE_REVIEW_EXIT"] = "2"
         self.make_task()
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
@@ -391,7 +391,7 @@ class InfrastructureRetryTests(RepairTestCase):
         self.assertEqual(self.latest_review()["findings"], [])
 
     def test_format_retry_is_bounded(self):
-        self.env["ACTL_FAKE_REVIEW_JSON"] = "not a JSON verdict"
+        self.env["JOSI_FAKE_REVIEW_JSON"] = "not a JSON verdict"
         self.make_task()
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
@@ -439,7 +439,7 @@ class InfrastructureRetryTests(RepairTestCase):
         self.assertIsNone(self.latest_review())
 
     def test_reviewer_error_retry_does_not_spend_a_worker_attempt(self):
-        self.env["ACTL_FAKE_REVIEW_JSON"] = "not a JSON verdict"
+        self.env["JOSI_FAKE_REVIEW_JSON"] = "not a JSON verdict"
         self.make_task()
         first = self.run_task("t1")
         self.assertNotEqual(first.returncode, 0)
@@ -462,13 +462,13 @@ class InfrastructureRetryTests(RepairTestCase):
 
     def test_reviewer_error_retry_repeats_validation(self):
         self.set_validation("echo check")
-        self.env["ACTL_FAKE_REVIEW_EXIT"] = "2"
+        self.env["JOSI_FAKE_REVIEW_EXIT"] = "2"
         self.make_task()
         self.assertNotEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(len(self.validation_logs()), 1)
         self.assertEqual(self.task_status(), "FAILED")
 
-        self.env["ACTL_FAKE_REVIEW_EXIT"] = "0"
+        self.env["JOSI_FAKE_REVIEW_EXIT"] = "0"
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(len(self.validation_logs()), 2, "validation must rerun")
@@ -509,7 +509,7 @@ class PersistenceTests(RepairTestCase):
         self.make_task()
         # Simulate an interrupted repair: one attempt and its rejection were
         # already recorded, and the task was left RUNNING before attempt 2.
-        attempts_dir = self.repo / ".actl" / "attempts"
+        attempts_dir = self.repo / ".josi" / "attempts"
         attempts_dir.mkdir(parents=True)
         (attempts_dir / "t1").write_text(
             json.dumps({
@@ -541,7 +541,7 @@ class PersistenceTests(RepairTestCase):
         self.make_task()
 
         parent = subprocess.Popen(
-            [sys.executable, "-m", "actl", "task", "run", "t1"],
+            [sys.executable, "-m", "josi", "task", "run", "t1"],
             cwd=str(self.repo), env=self.env,
             stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
         )
@@ -581,12 +581,12 @@ class PersistenceTests(RepairTestCase):
         self.assertIn("Persisted finding.", self.worker_calls()[-1]["argv"][-1])
         # The interrupted worker's commit was preserved and the retry
         # continued on top of it.
-        subjects = self.git("log", "--format=%s", "actl/t1").stdout.splitlines()
+        subjects = self.git("log", "--format=%s", "josi/t1").stdout.splitlines()
         self.assertEqual(subjects.count("worker: implement task"), 3)
         self.assertEqual(self.attempt_record()["attempts"], 2)
 
     def test_needs_human_restarts_only_after_the_record_is_removed(self):
-        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
+        self.env["JOSI_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
         self.make_task()
         self.assertNotEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(self.task_status(), "NEEDS_HUMAN")
@@ -594,8 +594,8 @@ class PersistenceTests(RepairTestCase):
 
         # Deleting the attempt record is the explicit human intervention
         # that grants a fresh budget; the existing commits are reused.
-        (self.repo / ".actl" / "attempts" / "t1").unlink()
-        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.approved())
+        (self.repo / ".josi" / "attempts" / "t1").unlink()
+        self.env["JOSI_FAKE_REVIEW_JSON"] = json.dumps(self.approved())
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "STAGED")
@@ -604,7 +604,7 @@ class PersistenceTests(RepairTestCase):
 
     def test_corrupt_attempt_record_fails_instead_of_resetting(self):
         self.make_task()
-        attempts_dir = self.repo / ".actl" / "attempts"
+        attempts_dir = self.repo / ".josi" / "attempts"
         attempts_dir.mkdir(parents=True)
         (attempts_dir / "t1").write_text("{not json", encoding="utf-8")
         result = self.run_task("t1")
@@ -619,7 +619,7 @@ class PersistenceTests(RepairTestCase):
         # A Stage 5 task: one worker attempt was rejected by review and the
         # task was left NEEDS_CHANGES with the findings stored.
         self.set_task_status("NEEDS_CHANGES")
-        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
         try:
             tasks.record_review(conn, 1, self.base_sha, "changes_requested", [{
                 "severity": "major",
@@ -644,7 +644,7 @@ class PersistenceTests(RepairTestCase):
     def test_stage5_needs_changes_worker_failure_keeps_the_spent_attempt(self):
         self.make_task()
         self.set_task_status("NEEDS_CHANGES")
-        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
         try:
             tasks.record_review(conn, 1, self.base_sha, "changes_requested", [{
                 "severity": "major",
@@ -658,7 +658,7 @@ class PersistenceTests(RepairTestCase):
 
         # The first run fails at the worker: the derived attempt baseline is
         # recorded before the worker starts and survives the failure.
-        self.env["ACTL_FAKE_RUN_EXIT"] = "1"
+        self.env["JOSI_FAKE_RUN_EXIT"] = "1"
         self.assertNotEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(self.task_status(), "FAILED")
         record = self.attempt_record()
@@ -666,7 +666,7 @@ class PersistenceTests(RepairTestCase):
         self.assertIn("Legacy finding.", record["feedback"])
 
         # The retry stays at attempt 2 instead of restarting the budget.
-        self.env["ACTL_FAKE_RUN_EXIT"] = "0"
+        self.env["JOSI_FAKE_RUN_EXIT"] = "0"
         self.set_reviewer(self.approved())
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -677,7 +677,7 @@ class PersistenceTests(RepairTestCase):
 class RepairLogTests(RepairTestCase):
     def test_every_attempt_keeps_its_own_logs(self):
         self.set_validation("echo check")
-        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
+        self.env["JOSI_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
         self.make_task()
         result = self.run_task("t1")
         self.assertNotEqual(result.returncode, 0)
@@ -716,7 +716,7 @@ class EscalationModelConfigTests(RepairTestCase):
         self.assertEqual(
             model_setting(self.metadata()["escalation_worker_model"]), "escalation/model"
         )
-        result = self.run_actl(
+        result = self.run_josi(
             "init", "--escalation-worker-model", "other/stronger#high"
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -726,7 +726,7 @@ class EscalationModelConfigTests(RepairTestCase):
         )
 
         # A plain init never removes the configured escalation model.
-        self.assertEqual(self.run_actl("init").returncode, 0)
+        self.assertEqual(self.run_josi("init").returncode, 0)
         self.assertEqual(
             model_setting(self.metadata()["escalation_worker_model"]), "other/stronger#high"
         )
@@ -744,7 +744,7 @@ class EscalationModelConfigTests(RepairTestCase):
     def test_invalid_escalation_model_is_rejected(self):
         for value in ("", "model", "provider/", "/model", "two words/model"):
             with self.subTest(value=value):
-                result = self.run_actl(
+                result = self.run_josi(
                     "init", "--escalation-worker-model", value
                 )
                 self.assertNotEqual(result.returncode, 0)
@@ -755,54 +755,54 @@ class EscalationModelConfigTests(RepairTestCase):
 
 
 class TaskResetTests(RepairTestCase):
-    """``actl task reset`` discards the implementation and the budget."""
+    """``josi task reset`` discards the implementation and the budget."""
 
     def task_branch_exists(self, task_id="t1") -> bool:
         return (
             self.git(
-                "show-ref", "--verify", "refs/heads/actl/" + task_id, check=False
+                "show-ref", "--verify", "refs/heads/josi/" + task_id, check=False
             ).returncode
             == 0
         )
 
     def test_reset_discards_branch_worktree_and_budget(self):
-        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
+        self.env["JOSI_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
         self.make_task()
         self.assertNotEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(self.task_status(), "NEEDS_HUMAN")
         self.assertTrue(self.worktree().is_dir())
         self.assertTrue(self.task_branch_exists())
-        self.assertTrue((self.repo / ".actl" / "base" / "t1").is_file())
+        self.assertTrue((self.repo / ".josi" / "base" / "t1").is_file())
 
-        result = self.run_actl("task", "reset", "t1")
+        result = self.run_josi("task", "reset", "t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Reset task t1", result.stdout)
         self.assertEqual(self.task_status(), "PENDING")
         self.assertFalse(self.worktree().exists())
-        self.assertFalse((self.repo / ".actl" / "attempts" / "t1").exists())
-        self.assertFalse((self.repo / ".actl" / "base" / "t1").exists())
+        self.assertFalse((self.repo / ".josi" / "attempts" / "t1").exists())
+        self.assertFalse((self.repo / ".josi" / "base" / "t1").exists())
         self.assertFalse(self.task_branch_exists())
         # The run branch and the base branch are untouched.
         self.assertEqual(
-            self.rev("actl/run/r1"), self.base_sha, "the run branch is untouched"
+            self.rev("josi/run/r1"), self.base_sha, "the run branch is untouched"
         )
         self.assertEqual(self.rev("main"), self.base_sha)
 
         # A fresh execution starts over from attempt 1 on a new branch.
-        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.approved())
+        self.env["JOSI_FAKE_REVIEW_JSON"] = json.dumps(self.approved())
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "STAGED")
         self.assertIn("Worker attempt 1/3 (provider/model)", result.stdout)
 
     def test_reset_discards_the_recorded_test_generation_outcome(self):
-        # The test-generation outcome record (.actl/testgen/tN) belongs to
+        # The test-generation outcome record (.josi/testgen/tN) belongs to
         # the branch and worktree a reset discards: the recorded decision
         # is stale on a fresh branch, so it goes with them, and the next
         # execution runs test generation again instead of skipping a stage
         # that never ran there.
-        marker = self.repo / ".actl" / "testgen" / "t1"
-        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
+        marker = self.repo / ".josi" / "testgen" / "t1"
+        self.env["JOSI_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
         self.make_task()
         self.assertNotEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(self.task_status(), "NEEDS_HUMAN")
@@ -812,8 +812,8 @@ class TaskResetTests(RepairTestCase):
         )
         generations = len(self.generation_calls())
 
-        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.approved())
-        result = self.run_actl("task", "reset", "t1")
+        self.env["JOSI_FAKE_REVIEW_JSON"] = json.dumps(self.approved())
+        result = self.run_josi("task", "reset", "t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Reset task t1", result.stdout)
         self.assertFalse(marker.exists())
@@ -836,7 +836,7 @@ class TaskResetTests(RepairTestCase):
         # cleanup. No task state may be discarded before that succeeds: the
         # budget, the stored state, the branch, and the worktree all survive
         # a failed reset, so it can only be retried, never half-done.
-        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
+        self.env["JOSI_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
         self.make_task()
         self.assertNotEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(self.task_status(), "NEEDS_HUMAN")
@@ -845,7 +845,7 @@ class TaskResetTests(RepairTestCase):
         review = self.latest_review()
 
         self.git("worktree", "lock", str(self.worktree()))
-        result = self.run_actl("task", "reset", "t1")
+        result = self.run_josi("task", "reset", "t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cannot remove the task worktree", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
@@ -857,24 +857,24 @@ class TaskResetTests(RepairTestCase):
         self.assertEqual(self.latest_review(), review)
         self.assertTrue(self.task_branch_exists())
         self.assertTrue(self.worktree().is_dir())
-        self.assertTrue((self.repo / ".actl" / "base" / "t1").is_file())
+        self.assertTrue((self.repo / ".josi" / "base" / "t1").is_file())
 
         # With the worktree removable again, the retry succeeds as before.
         self.git("worktree", "unlock", str(self.worktree()))
-        result = self.run_actl("task", "reset", "t1")
+        result = self.run_josi("task", "reset", "t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "PENDING")
-        self.assertFalse((self.repo / ".actl" / "attempts" / "t1").exists())
+        self.assertFalse((self.repo / ".josi" / "attempts" / "t1").exists())
 
     def test_reset_of_a_staged_task_is_refused(self):
         self.make_task()
         self.assertEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(self.task_status(), "STAGED")
 
-        result = self.run_actl("task", "reset", "t1")
+        result = self.run_josi("task", "reset", "t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("STAGED", result.stderr)
-        self.assertIn("actl run merge", result.stderr)
+        self.assertIn("josi run merge", result.stderr)
         # Nothing was discarded.
         self.assertEqual(self.task_status(), "STAGED")
         self.assertTrue(self.worktree().is_dir())
@@ -882,12 +882,12 @@ class TaskResetTests(RepairTestCase):
 
     def test_reset_refuses_while_an_execution_holds_the_lock(self):
         self.make_task()
-        lock_path = self.repo / ".actl" / "execution.lock"
+        lock_path = self.repo / ".josi" / "execution.lock"
         handle = open(lock_path, "a+b")
         self.addCleanup(handle.close)
         fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         try:
-            result = self.run_actl("task", "reset", "t1")
+            result = self.run_josi("task", "reset", "t1")
         finally:
             fcntl.flock(handle.fileno(), fcntl.LOCK_UN)
         self.assertNotEqual(result.returncode, 0)
@@ -895,27 +895,27 @@ class TaskResetTests(RepairTestCase):
         self.assertEqual(self.task_status(), "PENDING")
 
     def test_reset_never_touches_another_task(self):
-        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
+        self.env["JOSI_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
         self.make_task("First")
         self.assertEqual(
-            self.run_actl("task", "create", "--title", "Second").returncode, 0
+            self.run_josi("task", "create", "--title", "Second").returncode, 0
         )
         self.set_task_status("NEEDS_CHANGES", task_id=2)
         self.assertNotEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(self.task_status("t1"), "NEEDS_HUMAN")
         self.assertEqual(self.task_status("t2"), "NEEDS_CHANGES")
 
-        result = self.run_actl("task", "reset", "t1")
+        result = self.run_josi("task", "reset", "t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status("t1"), "PENDING")
         self.assertEqual(self.task_status("t2"), "NEEDS_CHANGES")
 
 
 class TaskReviewTests(RepairTestCase):
-    """``actl task review`` re-verifies a hand-fixed NEEDS_HUMAN task."""
+    """``josi task review`` re-verifies a hand-fixed NEEDS_HUMAN task."""
 
     def exhaust(self):
-        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
+        self.env["JOSI_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
         self.make_task()
         self.assertNotEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(self.task_status(), "NEEDS_HUMAN")
@@ -925,8 +925,8 @@ class TaskReviewTests(RepairTestCase):
 
     def test_approval_stages_the_task_without_a_worker(self):
         workers, reviews = self.exhaust()
-        self.env["ACTL_FAKE_REVIEW_JSON"] = json.dumps(self.approved())
-        result = self.run_actl("task", "review", "t1")
+        self.env["JOSI_FAKE_REVIEW_JSON"] = json.dumps(self.approved())
+        result = self.run_josi("task", "review", "t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "STAGED")
         self.assertIn("Task t1 \u2192 STAGED", result.stdout)
@@ -935,7 +935,7 @@ class TaskReviewTests(RepairTestCase):
 
     def test_rejection_leaves_the_task_needs_human(self):
         workers, reviews = self.exhaust()
-        result = self.run_actl("task", "review", "t1")
+        result = self.run_josi("task", "review", "t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.task_status(), "NEEDS_HUMAN")
         self.assertIn("Task t1 \u2192 NEEDS_HUMAN", result.stdout)
@@ -945,7 +945,7 @@ class TaskReviewTests(RepairTestCase):
 
     def test_pending_task_is_refused(self):
         self.make_task()
-        result = self.run_actl("task", "review", "t1")
+        result = self.run_josi("task", "review", "t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cannot review task t1", result.stderr)
         self.assertEqual(self.task_status(), "PENDING")

@@ -1,8 +1,8 @@
-# actl Review Policy
+# Josi Review Policy
 
 ## Project context
 
-actl is a lightweight CLI for personal use on trusted Linux
+Josi is a lightweight CLI for personal use on trusted Linux
 development environments.
 
 It is not a security sandbox, multi-user service, or

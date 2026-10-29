@@ -1,32 +1,32 @@
 """Task execution: the project lock, run and task worktrees, and logs.
 
-``actl task run`` executes one task at a time inside a run:
+``josi task run`` executes one task at a time inside a run:
 
-* A project-wide ``fcntl.flock`` lock (``.actl/execution.lock``) is taken
+* A project-wide ``fcntl.flock`` lock (``.josi/execution.lock``) is taken
   before any work starts. The locked file descriptor is inherited by the
-  OpenCode processes, so the lock stays held if actl crashes while a worker
+  OpenCode processes, so the lock stays held if josi crashes while a worker
   or reviewer is still running.
-* Each run gets one branch (``actl/run/rN``) and worktree
-  (``.actl/run-worktrees/rN``), created at the run's recorded start commit
+* Each run gets one branch (``josi/run/rN``) and worktree
+  (``.josi/run-worktrees/rN``), created at the run's recorded start commit
   the first time a task of the run starts and reused while the run is active
   (see ``ensure_run_worktree``). The branch is verified against the run's
   expected commit (see ``require_expected_run_tip``) before any task
   continues, so a commit made by hand in the run worktree is refused instead
   of trusted.
-* Each task gets one branch (``actl/tN``) and worktree
-  (``.actl/worktrees/tN``), created from the run branch - never directly from
+* Each task gets one branch (``josi/tN``) and worktree
+  (``.josi/worktrees/tN``), created from the run branch - never directly from
   the base branch - the first time the task runs and reused by later explicit
   runs, so a task starts from the previous staged task's result.
 * One noninteractive OpenCode turn runs inside the worktree and its output is
-  streamed into a log file under ``.actl/runs/``. Validation and review get
+  streamed into a log file under ``.josi/runs/``. Validation and review get
   their own logs in the same directory.
 * Before the first worker attempt, a test-generation turn runs in the same
-  worktree with the project's test-writer model (see :mod:`actl.testgen`):
+  worktree with the project's test-writer model (see :mod:`josi.testgen`):
   it writes and commits the task's tests, or explicitly decides that the
-  task needs none. Its outcome is recorded in ``.actl/testgen/tN`` so a
+  task needs none. Its outcome is recorded in ``.josi/testgen/tN`` so a
   retry never repeats a completed stage, and the worker prompt instructs
   the worker to keep the generated tests unchanged.
-* The reviewer gets a temporary detached worktree under ``.actl/review/``
+* The reviewer gets a temporary detached worktree under ``.josi/review/``
   (see ``add_review_worktree``), so its checkout can never touch the task
   worktree.
 * An approved task is staged into its run branch and, later, the completed
@@ -34,12 +34,12 @@
   ``integrate_commit``): the target branch is fast-forwarded to the exact
   approved commit in the worktree that has it checked out, or - when no
   worktree has it checked out - in a temporary worktree under
-  ``.actl/integrate/``. No branch is ever reset, rebased, or forced; the
+  ``.josi/integrate/``. No branch is ever reset, rebased, or forced; the
   merge runs with ``--no-squash`` and ``--no-overwrite-ignore``, so
   inherited branch configuration cannot stage a squash instead, and an
   ignored local file is never silently overwritten.
 * Each task records how many worker attempts it has used in
-  ``.actl/attempts/tN``, together with the feedback for the next attempt, so
+  ``.josi/attempts/tN``, together with the feedback for the next attempt, so
   the three-attempt repair budget survives CLI invocations and an interrupted
   run never silently resets it.
 
@@ -88,18 +88,18 @@ class Worktree:
 
 def branch_name(task_id: int) -> str:
     """The branch a task's worktree is created on."""
-    return "actl/t" + str(task_id)
+    return "josi/t" + str(task_id)
 
 
 @contextmanager
-def lock(actl_dir: Path):
+def lock(josi_dir: Path):
     """Hold the project-wide execution lock, yielding its file descriptor.
 
-    The lock is exclusive and nonblocking: a second ``actl task run`` fails
+    The lock is exclusive and nonblocking: a second ``josi task run`` fails
     immediately while another execution holds it. The descriptor is kept open
     (and inherited by the OpenCode subprocess) until the context exits.
     """
-    path = actl_dir / LOCK_NAME
+    path = josi_dir / LOCK_NAME
     try:
         handle = open(path, "a+b")
     except OSError as exc:
@@ -111,7 +111,7 @@ def lock(actl_dir: Path):
             fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
         except OSError:
             raise ExecutionError(
-                "another actl task execution is already running in this project"
+                "another josi task execution is already running in this project"
             )
         yield handle.fileno()
     finally:
@@ -119,7 +119,7 @@ def lock(actl_dir: Path):
 
 
 def ensure_worktree(
-    root: Path, actl_dir: Path, task, retry: bool, base_branch: str
+    root: Path, josi_dir: Path, task, retry: bool, base_branch: str
 ) -> Worktree:
     """Create or reuse the task's branch and worktree.
 
@@ -139,7 +139,7 @@ def ensure_worktree(
     """
     require_base(root, base_branch)
     branch = branch_name(task.id)
-    path = actl_dir / WORKTREES_DIR / ("t" + str(task.id))
+    path = josi_dir / WORKTREES_DIR / ("t" + str(task.id))
     registered = _registered_worktrees(root)
     key = os.path.realpath(str(path))
 
@@ -165,7 +165,7 @@ def ensure_worktree(
     if branch_exists(root, branch):
         if not retry:
             raise ExecutionError(
-                "branch " + branch + " already exists; delete it to let actl"
+                "branch " + branch + " already exists; delete it to let josi"
                 " create a fresh branch from " + base_branch
             )
         _git(root, "worktree", "add", str(path), branch)
@@ -174,7 +174,7 @@ def ensure_worktree(
         root, "worktree", "add", "-b", branch, str(path),
         "refs/heads/" + base_branch,
     )
-    record_branch_base(actl_dir, task.id, ref_commit(root, "refs/heads/" + branch))
+    record_branch_base(josi_dir, task.id, ref_commit(root, "refs/heads/" + branch))
     return Worktree(branch=branch, path=path, created=True)
 
 
@@ -200,12 +200,12 @@ def require_expected_run_tip(root: Path, run) -> None:
         )
 
 
-def ensure_run_worktree(root: Path, actl_dir: Path, run) -> Worktree:
+def ensure_run_worktree(root: Path, josi_dir: Path, run) -> Worktree:
     """Create or reuse the run's branch and worktree.
 
     The run branch is created at the run's recorded start commit the first
     time a task of the run starts, and its worktree lives under
-    ``.actl/run-worktrees/rN``. An interrupted run reuses both as they are -
+    ``.josi/run-worktrees/rN``. An interrupted run reuses both as they are -
     never resetting, cleaning, or checking out anything - after verifying
     that the branch still points at the commit the run recorded. A run whose
     worktree directory was removed re-attaches the existing branch, and a
@@ -215,7 +215,7 @@ def ensure_run_worktree(root: Path, actl_dir: Path, run) -> Worktree:
     """
     require_base(root, run.base_branch)
     branch = run.branch
-    path = actl_dir / RUN_WORKTREES_DIR / ("r" + str(run.id))
+    path = josi_dir / RUN_WORKTREES_DIR / ("r" + str(run.id))
     registered = _registered_worktrees(root)
     key = os.path.realpath(str(path))
 
@@ -456,9 +456,9 @@ def add_review_worktree(root: Path, path: Path, commit: str) -> None:
     _git(root, "worktree", "add", "--detach", str(path), commit)
 
 
-def record_branch_base(actl_dir: Path, task_id: int, commit: str) -> None:
+def record_branch_base(josi_dir: Path, task_id: int, commit: str) -> None:
     """Record the commit a task branch was created from."""
-    path = actl_dir / BASE_DIR / ("t" + str(task_id))
+    path = josi_dir / BASE_DIR / ("t" + str(task_id))
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         path.write_text(commit + "\n", encoding="utf-8")
@@ -468,14 +468,14 @@ def record_branch_base(actl_dir: Path, task_id: int, commit: str) -> None:
         )
 
 
-def branch_base(actl_dir: Path, task_id: int):
+def branch_base(josi_dir: Path, task_id: int):
     """Return the recorded branch-creation commit, or None.
 
-    Branches created before actl recorded this (Stage 4 projects) have no
+    Branches created before josi recorded this (Stage 4 projects) have no
     record; the caller falls back to the merge base with the configured base
     branch.
     """
-    path = actl_dir / BASE_DIR / ("t" + str(task_id))
+    path = josi_dir / BASE_DIR / ("t" + str(task_id))
     try:
         commit = path.read_text(encoding="utf-8").strip()
     except (OSError, UnicodeDecodeError):
@@ -483,13 +483,13 @@ def branch_base(actl_dir: Path, task_id: int):
     return commit or None
 
 
-def record_testgen_outcome(actl_dir: Path, task_id: int, decision: str) -> None:
+def record_testgen_outcome(josi_dir: Path, task_id: int, decision: str) -> None:
     """Record that the test-generation stage completed with ``decision``.
 
     The record is written only after the stage succeeded, so an interrupted
     or failed stage never suppresses a later one.
     """
-    path = actl_dir / TESTGEN_DIR / ("t" + str(task_id))
+    path = josi_dir / TESTGEN_DIR / ("t" + str(task_id))
     payload = {"decision": decision}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -501,14 +501,14 @@ def record_testgen_outcome(actl_dir: Path, task_id: int, decision: str) -> None:
         )
 
 
-def testgen_outcome(actl_dir: Path, task_id: int):
+def testgen_outcome(josi_dir: Path, task_id: int):
     """Return the recorded test-generation decision, or None.
 
     A missing record means the stage has not completed yet. A record that
     cannot be read or parsed is ignored rather than fatal: the stage would
     simply run again, which a broken marker must never silently prevent.
     """
-    path = actl_dir / TESTGEN_DIR / ("t" + str(task_id))
+    path = josi_dir / TESTGEN_DIR / ("t" + str(task_id))
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, ValueError):
@@ -519,15 +519,15 @@ def testgen_outcome(actl_dir: Path, task_id: int):
     return decision if isinstance(decision, str) else None
 
 
-def clear_testgen_outcome(actl_dir: Path, task_id: int) -> None:
+def clear_testgen_outcome(josi_dir: Path, task_id: int) -> None:
     """Delete the task's recorded test-generation outcome.
 
-    Used only by the explicit ``actl task reset`` intervention: the record
+    Used only by the explicit ``josi task reset`` intervention: the record
     belongs to the branch and worktree the reset discards, so keeping it
     would make the next execution skip a stage that never ran on the fresh
     branch. A missing record is not an error.
     """
-    path = actl_dir / TESTGEN_DIR / ("t" + str(task_id))
+    path = josi_dir / TESTGEN_DIR / ("t" + str(task_id))
     try:
         path.unlink()
     except FileNotFoundError:
@@ -568,7 +568,7 @@ def worktree_for_branch(root: Path, branch: str):
 
 
 def integrate_commit(
-    root: Path, actl_dir: Path, base_branch: str, branch: str, commit: str
+    root: Path, josi_dir: Path, base_branch: str, branch: str, commit: str
 ) -> Path:
     """Fast-forward ``base_branch`` to ``commit``; return the merge worktree.
 
@@ -583,7 +583,7 @@ def integrate_commit(
     worktree has it checked out) must be clean before ``git merge --ff-only``
     runs. A non-fast-forward merge, a moved source branch, a missing target
     branch, and a dirty target worktree all raise :class:`ExecutionError`
-    without changing anything: actl never resets, rebases, force-pushes, or
+    without changing anything: josi never resets, rebases, force-pushes, or
     resolves conflicts, so the caller can keep the task APPROVED (or the run
     COMPLETE) for a deliberate retry.
 
@@ -613,7 +613,7 @@ def integrate_commit(
     temporary = None
     if worktree is None:
         temporary = (
-            actl_dir / INTEGRATE_DIR
+            josi_dir / INTEGRATE_DIR
             / (branch.replace("/", "-") + "-" + timestamp())
         )
         try:
@@ -669,7 +669,7 @@ def integrate_commit(
     return worktree
 
 
-def attempt_state(actl_dir: Path, task_id: int):
+def attempt_state(josi_dir: Path, task_id: int):
     """Return the task's recorded ``(attempts, feedback)``, or None.
 
     ``attempts`` counts the worker attempts the task has used in its current
@@ -677,10 +677,10 @@ def attempt_state(actl_dir: Path, task_id: int):
     (a failed validation or reviewer rejection), or "".
 
     A missing record means no attempt was recorded yet. A corrupt record is
-    an error instead of an implicit reset: restarting actl must never hand a
+    an error instead of an implicit reset: restarting josi must never hand a
     task a fresh attempt budget by accident.
     """
-    path = actl_dir / ATTEMPTS_DIR / ("t" + str(task_id))
+    path = josi_dir / ATTEMPTS_DIR / ("t" + str(task_id))
     try:
         text = path.read_text(encoding="utf-8")
     except FileNotFoundError:
@@ -715,10 +715,10 @@ def attempt_state(actl_dir: Path, task_id: int):
 
 
 def record_attempt_state(
-    actl_dir: Path, task_id: int, attempts: int, feedback: str,
+    josi_dir: Path, task_id: int, attempts: int, feedback: str,
 ) -> None:
     """Persist the task's ``attempts`` count and next-attempt ``feedback``."""
-    path = actl_dir / ATTEMPTS_DIR / ("t" + str(task_id))
+    path = josi_dir / ATTEMPTS_DIR / ("t" + str(task_id))
     payload = {"attempts": attempts, "feedback": feedback or ""}
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
@@ -729,13 +729,13 @@ def record_attempt_state(
         )
 
 
-def clear_attempt_state(actl_dir: Path, task_id: int) -> None:
+def clear_attempt_state(josi_dir: Path, task_id: int) -> None:
     """Delete the task's attempt record, granting a fresh attempt budget.
 
-    Used only by the explicit ``actl task reset`` intervention. A missing
+    Used only by the explicit ``josi task reset`` intervention. A missing
     record is not an error: the task never spent an attempt.
     """
-    path = actl_dir / ATTEMPTS_DIR / ("t" + str(task_id))
+    path = josi_dir / ATTEMPTS_DIR / ("t" + str(task_id))
     try:
         path.unlink()
     except FileNotFoundError:
@@ -746,10 +746,10 @@ def clear_attempt_state(actl_dir: Path, task_id: int) -> None:
         )
 
 
-def reset_task_worktree(root: Path, actl_dir: Path, task_id: int) -> None:
+def reset_task_worktree(root: Path, josi_dir: Path, task_id: int) -> None:
     """Discard a task's branch, worktree, and recorded base for a reset.
 
-    ``actl task reset`` is the explicit human intervention that starts a task
+    ``josi task reset`` is the explicit human intervention that starts a task
     over: the registered worktree is force-removed (any uncommitted work goes
     with it), the task branch is deleted, and the recorded branch base is
     dropped, so the next execution creates a fresh branch from the run branch.
@@ -758,7 +758,7 @@ def reset_task_worktree(root: Path, actl_dir: Path, task_id: int) -> None:
     the call is a no-op.
     """
     branch = branch_name(task_id)
-    path = actl_dir / WORKTREES_DIR / ("t" + str(task_id))
+    path = josi_dir / WORKTREES_DIR / ("t" + str(task_id))
     registered = _registered_worktrees(root)
     key = os.path.realpath(str(path))
     if key in registered:
@@ -774,7 +774,7 @@ def reset_task_worktree(root: Path, actl_dir: Path, task_id: int) -> None:
         )
     if branch_exists(root, branch):
         _git(root, "branch", "-D", branch)
-    base = actl_dir / BASE_DIR / ("t" + str(task_id))
+    base = josi_dir / BASE_DIR / ("t" + str(task_id))
     try:
         base.unlink()
     except FileNotFoundError:
@@ -791,7 +791,7 @@ def timestamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%S%fZ")
 
 
-def open_stage_log(actl_dir: Path, task_id: int, stage):
+def open_stage_log(josi_dir: Path, task_id: int, stage):
     """Open a new log file for one execution stage and return ``(path, file)``.
 
     The name carries a microsecond timestamp and is created exclusively, so a
@@ -802,7 +802,7 @@ def open_stage_log(actl_dir: Path, task_id: int, stage):
     name = "t" + str(task_id) + "-" + timestamp()
     if stage:
         name += "-" + stage
-    path = actl_dir / RUNS_DIR / (name + ".log")
+    path = josi_dir / RUNS_DIR / (name + ".log")
     try:
         path.parent.mkdir(parents=True, exist_ok=True)
         return path, path.open("x", encoding="utf-8")
@@ -813,9 +813,9 @@ def open_stage_log(actl_dir: Path, task_id: int, stage):
         )
 
 
-def open_run_log(actl_dir: Path, task_id: int):
+def open_run_log(josi_dir: Path, task_id: int):
     """Open a new log file for one worker execution and return ``(path, file)``."""
-    return open_stage_log(actl_dir, task_id, None)
+    return open_stage_log(josi_dir, task_id, None)
 
 
 def worker_prompt(
@@ -900,7 +900,7 @@ def require_base(root: Path, base_branch: str) -> None:
     raise ExecutionError(
         "branch '" + base_branch + "' does not exist in " + str(root)
         + "; create it first (for example: git branch " + base_branch
-        + ") or run 'actl init --base <branch>' to choose another base branch"
+        + ") or run 'josi init --base <branch>' to choose another base branch"
     )
 
 

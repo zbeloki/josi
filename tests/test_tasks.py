@@ -1,8 +1,8 @@
-"""End-to-end tests for actl Stage 2 task management.
+"""End-to-end tests for josi Stage 2 task management.
 
 Every test runs the CLI as a subprocess, so data persistence between
 invocations is exercised implicitly. The Stage 1 fixtures (temporary Git
-repository, fake opencode executable, environment) come from ``test_actl``.
+repository, fake opencode executable, environment) come from ``test_josi``.
 """
 
 from __future__ import annotations
@@ -15,13 +15,13 @@ import time
 import unittest
 from pathlib import Path
 
-from test_actl import MINIMAL_PATH, ActlTestCase
+from test_josi import MINIMAL_PATH, JosiTestCase
 
-from actl import tasks
+from josi import tasks
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
-class TaskTestCase(ActlTestCase):
+class TaskTestCase(JosiTestCase):
     """Base fixture: an initialized project with a fake opencode on PATH."""
 
     def setUp(self):
@@ -31,10 +31,10 @@ class TaskTestCase(ActlTestCase):
     # -- helpers ---------------------------------------------------------
 
     def task_db(self) -> Path:
-        return self.repo / ".actl" / "tasks.db"
+        return self.repo / ".josi" / "tasks.db"
 
     def create_task(self, *args):
-        return self.run_actl("task", "create", *args)
+        return self.run_josi("task", "create", *args)
 
     def created_id(self, result) -> str:
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -42,7 +42,7 @@ class TaskTestCase(ActlTestCase):
         return result.stdout.split()[-1]
 
     def show(self, task_id):
-        return self.run_actl("task", "show", str(task_id))
+        return self.run_josi("task", "show", str(task_id))
 
     def make_tasks(self, *titles):
         ids = []
@@ -59,7 +59,7 @@ class TaskCrudTests(TaskTestCase):
         self.assertEqual(self.created_id(self.create_task("--title", "Ship it")), "t2")
         self.assertTrue(self.task_db().is_file())
 
-        listing = self.run_actl("task", "list")
+        listing = self.run_josi("task", "list")
         self.assertEqual(listing.returncode, 0, listing.stderr)
         lines = listing.stdout.splitlines()
         self.assertEqual(len(lines), 2)
@@ -84,7 +84,7 @@ class TaskCrudTests(TaskTestCase):
         self.assertIn("description:\n(none)", empty.stdout)
 
     def test_empty_task_list(self):
-        result = self.run_actl("task", "list")
+        result = self.run_josi("task", "list")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")
 
@@ -97,10 +97,10 @@ class TaskCrudTests(TaskTestCase):
 
     def test_update_title_and_description(self):
         self.make_tasks("Old title")
-        self.run_actl("task", "update", "t1", "--description", "old body")
+        self.run_josi("task", "update", "t1", "--description", "old body")
         before = self.show("t1").stdout
 
-        result = self.run_actl(
+        result = self.run_josi(
             "task", "update", "t1", "--title", "New title",
             "--description", "new body",
         )
@@ -116,7 +116,7 @@ class TaskCrudTests(TaskTestCase):
 
     def test_update_requires_a_change(self):
         self.make_tasks("One")
-        result = self.run_actl("task", "update", "t1")
+        result = self.run_josi("task", "update", "t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("no changes", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
@@ -126,11 +126,11 @@ class TaskCrudTests(TaskTestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must not be empty", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
-        self.assertEqual(self.run_actl("task", "list").stdout, "")
+        self.assertEqual(self.run_josi("task", "list").stdout, "")
 
     def test_update_rejects_blank_title(self):
         self.make_tasks("One")
-        result = self.run_actl("task", "update", "t1", "--title", "   ")
+        result = self.run_josi("task", "update", "t1", "--title", "   ")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("must not be empty", result.stderr)
         self.assertIn("title: One", self.show("t1").stdout)
@@ -147,7 +147,7 @@ class TaskCrudTests(TaskTestCase):
         self.assertIn("description:\nFirst line\nSecond line\n", shown.stdout)
 
         (self.repo / "updated.txt").write_text("Replaced\n", encoding="utf-8")
-        result = self.run_actl(
+        result = self.run_josi(
             "task", "update", "t1", "--description-file", "updated.txt"
         )
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -177,11 +177,11 @@ class TaskCrudTests(TaskTestCase):
 
     def test_delete_task(self):
         self.make_tasks("Gone")
-        result = self.run_actl("task", "delete", "t1")
+        result = self.run_josi("task", "delete", "t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Deleted task t1", result.stdout)
         self.assertNotEqual(self.show("t1").returncode, 0)
-        self.assertEqual(self.run_actl("task", "list").stdout, "")
+        self.assertEqual(self.run_josi("task", "list").stdout, "")
 
     def test_unknown_tasks_are_reported(self):
         cases = (
@@ -191,7 +191,7 @@ class TaskCrudTests(TaskTestCase):
         )
         for args in cases:
             with self.subTest(args=args):
-                result = self.run_actl(*args)
+                result = self.run_josi(*args)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("task t5 does not exist", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
@@ -246,7 +246,7 @@ class TaskDependencyTests(TaskTestCase):
 
     def test_self_dependency_is_rejected(self):
         self.make_tasks("One")
-        result = self.run_actl("task", "update", "t1", "--depends-on", "t1")
+        result = self.run_josi("task", "update", "t1", "--depends-on", "t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cannot depend on itself", result.stderr)
         self.assertIn("depends_on: (none)", self.show("t1").stdout)
@@ -259,17 +259,17 @@ class TaskDependencyTests(TaskTestCase):
         )
         for args in cases:
             with self.subTest(args=args):
-                result = self.run_actl(*args)
+                result = self.run_josi(*args)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("task t9 does not exist", result.stderr)
         # The failed create must not have stored a task.
-        self.assertEqual(len(self.run_actl("task", "list").stdout.splitlines()), 1)
+        self.assertEqual(len(self.run_josi("task", "list").stdout.splitlines()), 1)
 
     def test_direct_cycle_is_rejected(self):
         self.make_tasks("One", "Two")
-        self.run_actl("task", "update", "t2", "--depends-on", "t1")
+        self.run_josi("task", "update", "t2", "--depends-on", "t1")
 
-        result = self.run_actl("task", "update", "t1", "--depends-on", "t2")
+        result = self.run_josi("task", "update", "t1", "--depends-on", "t2")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cycle", result.stderr)
         self.assertIn("depends_on: (none)", self.show("t1").stdout)
@@ -277,12 +277,12 @@ class TaskDependencyTests(TaskTestCase):
 
     def test_indirect_cycle_is_rejected(self):
         self.make_tasks("One", "Two", "Three")
-        self.run_actl("task", "update", "t2", "--depends-on", "t1")
-        self.run_actl("task", "update", "t3", "--depends-on", "t2")
+        self.run_josi("task", "update", "t2", "--depends-on", "t1")
+        self.run_josi("task", "update", "t3", "--depends-on", "t2")
 
         for task_id, dependency in (("t1", "t3"), ("t1", "t2"), ("t2", "t3")):
             with self.subTest(task=task_id, dependency=dependency):
-                result = self.run_actl(
+                result = self.run_josi(
                     "task", "update", task_id, "--depends-on", dependency
                 )
                 self.assertNotEqual(result.returncode, 0)
@@ -291,22 +291,22 @@ class TaskDependencyTests(TaskTestCase):
 
     def test_update_replaces_dependencies(self):
         self.make_tasks("One", "Two", "Three")
-        self.run_actl("task", "update", "t3", "--depends-on", "t1", "--depends-on", "t2")
-        result = self.run_actl("task", "update", "t3", "--depends-on", "t2")
+        self.run_josi("task", "update", "t3", "--depends-on", "t1", "--depends-on", "t2")
+        result = self.run_josi("task", "update", "t3", "--depends-on", "t2")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("depends_on: t2\n", self.show("t3").stdout)
 
     def test_clear_dependencies(self):
         self.make_tasks("One", "Two")
-        self.run_actl("task", "update", "t2", "--depends-on", "t1")
-        result = self.run_actl("task", "update", "t2", "--clear-dependencies")
+        self.run_josi("task", "update", "t2", "--depends-on", "t1")
+        result = self.run_josi("task", "update", "t2", "--clear-dependencies")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("depends_on: (none)", self.show("t2").stdout)
-        self.assertEqual(self.run_actl("task", "delete", "t1").returncode, 0)
+        self.assertEqual(self.run_josi("task", "delete", "t1").returncode, 0)
 
     def test_depends_on_and_clear_dependencies_conflict(self):
         self.make_tasks("One", "Two")
-        result = self.run_actl(
+        result = self.run_josi(
             "task", "update", "t2", "--depends-on", "t1", "--clear-dependencies"
         )
         self.assertNotEqual(result.returncode, 0)
@@ -314,24 +314,24 @@ class TaskDependencyTests(TaskTestCase):
 
     def test_delete_with_dependents_is_refused(self):
         self.make_tasks("One", "Two", "Three")
-        self.run_actl("task", "update", "t2", "--depends-on", "t1")
-        self.run_actl("task", "update", "t3", "--depends-on", "t1")
+        self.run_josi("task", "update", "t2", "--depends-on", "t1")
+        self.run_josi("task", "update", "t3", "--depends-on", "t1")
 
-        result = self.run_actl("task", "delete", "t1")
+        result = self.run_josi("task", "delete", "t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cannot delete task t1", result.stderr)
         self.assertIn("t2, t3 depend on it", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(self.show("t1").returncode, 0)
 
-        self.assertEqual(self.run_actl("task", "delete", "t2").returncode, 0)
-        self.assertEqual(self.run_actl("task", "delete", "t3").returncode, 0)
-        self.assertEqual(self.run_actl("task", "delete", "t1").returncode, 0)
+        self.assertEqual(self.run_josi("task", "delete", "t2").returncode, 0)
+        self.assertEqual(self.run_josi("task", "delete", "t3").returncode, 0)
+        self.assertEqual(self.run_josi("task", "delete", "t1").returncode, 0)
 
     def test_delete_removes_its_own_dependency_rows(self):
         self.make_tasks("One", "Two")
-        self.run_actl("task", "update", "t2", "--depends-on", "t1")
-        self.assertEqual(self.run_actl("task", "delete", "t2").returncode, 0)
+        self.run_josi("task", "update", "t2", "--depends-on", "t1")
+        self.assertEqual(self.run_josi("task", "delete", "t2").returncode, 0)
 
         conn = sqlite3.connect(str(self.task_db()))
         try:
@@ -346,7 +346,7 @@ class TaskDependencyTests(TaskTestCase):
         def update(task_id, dependency):
             return subprocess.Popen(
                 [
-                    sys.executable, "-m", "actl", "task", "update", task_id,
+                    sys.executable, "-m", "josi", "task", "update", task_id,
                     "--depends-on", dependency,
                 ],
                 cwd=str(self.repo),
@@ -391,10 +391,10 @@ class TaskDependencyTests(TaskTestCase):
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
 class TaskResetTests(TaskTestCase):
-    """``actl task reset`` clears the attempt budget and the stored state."""
+    """``josi task reset`` clears the attempt budget and the stored state."""
 
     def attempts_path(self, task_id="t1") -> Path:
-        return self.repo / ".actl" / "attempts" / task_id
+        return self.repo / ".josi" / "attempts" / task_id
 
     def set_status(self, status, task_id=1):
         conn = tasks.connect(self.task_db())
@@ -429,7 +429,7 @@ class TaskResetTests(TaskTestCase):
         )
         self.record_review()
 
-        result = self.run_actl("task", "reset", "t1")
+        result = self.run_josi("task", "reset", "t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Reset task t1", result.stdout)
 
@@ -441,11 +441,11 @@ class TaskResetTests(TaskTestCase):
 
     def test_reset_preserves_title_description_and_dependencies(self):
         self.make_tasks("First", "Second")
-        self.run_actl(
+        self.run_josi(
             "task", "update", "t2", "--description", "Body", "--depends-on", "t1"
         )
         self.set_status("FAILED", task_id=2)
-        result = self.run_actl("task", "reset", "t2")
+        result = self.run_josi("task", "reset", "t2")
         self.assertEqual(result.returncode, 0, result.stderr)
         shown = self.show("t2").stdout
         self.assertIn("title: Second", shown)
@@ -455,14 +455,14 @@ class TaskResetTests(TaskTestCase):
 
     def test_reset_is_idempotent(self):
         self.make_tasks("One")
-        self.assertEqual(self.run_actl("task", "reset", "t1").returncode, 0)
-        second = self.run_actl("task", "reset", "1")
+        self.assertEqual(self.run_josi("task", "reset", "t1").returncode, 0)
+        second = self.run_josi("task", "reset", "1")
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertIn("Reset task t1", second.stdout)
         self.assertIn("status: PENDING", self.show("t1").stdout)
 
     def test_reset_requires_an_existing_task(self):
-        result = self.run_actl("task", "reset", "t5")
+        result = self.run_josi("task", "reset", "t5")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("task t5 does not exist", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
@@ -470,7 +470,7 @@ class TaskResetTests(TaskTestCase):
     def test_reset_rejects_invalid_ids(self):
         for value in ("0", "t0", "banana", "1.5"):
             with self.subTest(value=value):
-                result = self.run_actl("task", "reset", value)
+                result = self.run_josi("task", "reset", value)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("invalid task id", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
@@ -479,18 +479,18 @@ class TaskResetTests(TaskTestCase):
         other = self.base / "other"
         other.mkdir()
         subprocess.run(["git", "init", "-q", str(other)], check=True, capture_output=True)
-        result = self.run_actl("task", "reset", "t1", cwd=other)
+        result = self.run_josi("task", "reset", "t1", cwd=other)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("actl init", result.stderr)
+        self.assertIn("josi init", result.stderr)
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
-class TaskProjectTests(ActlTestCase):
+class TaskProjectTests(JosiTestCase):
     """Task commands require a project and never cross project boundaries."""
 
     def test_init_creates_the_database(self):
         self.initialize()
-        self.assertTrue((self.repo / ".actl" / "tasks.db").is_file())
+        self.assertTrue((self.repo / ".josi" / "tasks.db").is_file())
 
     def test_task_commands_require_initialized_project(self):
         self.init_git()
@@ -503,91 +503,91 @@ class TaskProjectTests(ActlTestCase):
         )
         for args in cases:
             with self.subTest(args=args):
-                result = self.run_actl(*args)
+                result = self.run_josi(*args)
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("actl init", result.stderr)
+                self.assertIn("josi init", result.stderr)
                 self.assertNotIn("Traceback", result.stderr)
-        self.assertFalse((self.repo / ".actl").exists())
+        self.assertFalse((self.repo / ".josi").exists())
         self.assertEqual(self.calls(), [])
 
     def test_task_commands_from_subdirectory_use_the_project_root(self):
         self.initialize()
         self.assertEqual(
-            self.run_actl("task", "create", "--title", "Root task").returncode, 0
+            self.run_josi("task", "create", "--title", "Root task").returncode, 0
         )
         sub = self.repo / "src" / "nested"
         sub.mkdir(parents=True)
-        result = self.run_actl("task", "list", cwd=sub)
+        result = self.run_josi("task", "list", cwd=sub)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Root task", result.stdout)
-        self.assertTrue((self.repo / ".actl" / "tasks.db").is_file())
-        self.assertFalse((sub / ".actl").exists())
+        self.assertTrue((self.repo / ".josi" / "tasks.db").is_file())
+        self.assertFalse((sub / ".josi").exists())
 
     def test_task_commands_outside_git_repository(self):
         outside = self.base / "outside"
         outside.mkdir()
-        result = self.run_actl("task", "list", cwd=outside)
+        result = self.run_josi("task", "list", cwd=outside)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Git repository", result.stderr)
 
-    def test_task_commands_ignore_actl_outside_git(self):
+    def test_task_commands_ignore_josi_outside_git(self):
         self.initialize()
-        self.run_actl("task", "create", "--title", "Parent task")
+        self.run_josi("task", "create", "--title", "Parent task")
         copied = self.base / "copied"
-        shutil.copytree(self.repo / ".actl", copied / ".actl")
-        result = self.run_actl("task", "list", cwd=copied)
+        shutil.copytree(self.repo / ".josi", copied / ".josi")
+        result = self.run_josi("task", "list", cwd=copied)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Git repository", result.stderr)
 
     def test_task_commands_with_invalid_metadata(self):
         self.init_git()
-        (self.repo / ".actl").mkdir()
-        (self.repo / ".actl" / "project.json").write_text("not json", encoding="utf-8")
-        result = self.run_actl("task", "list")
+        (self.repo / ".josi").mkdir()
+        (self.repo / ".josi" / "project.json").write_text("not json", encoding="utf-8")
+        result = self.run_josi("task", "list")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("invalid actl project metadata", result.stderr)
+        self.assertIn("invalid Josi project metadata", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
     def test_stage1_project_gets_a_database_on_first_task_command(self):
         self.initialize()
-        db = self.repo / ".actl" / "tasks.db"
+        db = self.repo / ".josi" / "tasks.db"
         db.unlink()
         self.assertFalse(db.exists())
 
-        result = self.run_actl("task", "list")
+        result = self.run_josi("task", "list")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertTrue(db.is_file())
 
-        created = self.run_actl("task", "create", "--title", "One")
+        created = self.run_josi("task", "create", "--title", "One")
         self.assertEqual(created.returncode, 0, created.stderr)
 
     def test_repeated_initialization_preserves_tasks(self):
         self.initialize()
         self.assertEqual(
-            self.run_actl("task", "create", "--title", "Keep me").returncode, 0
+            self.run_josi("task", "create", "--title", "Keep me").returncode, 0
         )
 
-        result = self.run_actl("init")
+        result = self.run_josi("init")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("already initialized", result.stdout)
 
-        shown = self.run_actl("task", "show", "t1")
+        shown = self.run_josi("task", "show", "t1")
         self.assertEqual(shown.returncode, 0, shown.stderr)
         self.assertIn("title: Keep me", shown.stdout)
 
     def test_repeated_task_commands_preserve_tasks(self):
         self.initialize()
         self.assertEqual(
-            self.run_actl("task", "create", "--title", "Keep me").returncode, 0
+            self.run_josi("task", "create", "--title", "Keep me").returncode, 0
         )
         for _ in range(3):
-            self.assertEqual(self.run_actl("task", "list").returncode, 0)
-        self.assertIn("title: Keep me", self.run_actl("task", "show", "t1").stdout)
+            self.assertEqual(self.run_josi("task", "list").returncode, 0)
+        self.assertIn("title: Keep me", self.run_josi("task", "show", "t1").stdout)
 
     def test_projects_have_isolated_databases(self):
         self.initialize()
         self.assertEqual(
-            self.run_actl("task", "create", "--title", "Only in repo").returncode, 0
+            self.run_josi("task", "create", "--title", "Only in repo").returncode, 0
         )
 
         other = self.base / "other"
@@ -595,60 +595,60 @@ class TaskProjectTests(ActlTestCase):
         subprocess.run(
             ["git", "init", "-q", str(other)], check=True, capture_output=True
         )
-        self.assertEqual(self.run_actl("init", cwd=other).returncode, 0)
-        listing = self.run_actl("task", "list", cwd=other)
+        self.assertEqual(self.run_josi("init", cwd=other).returncode, 0)
+        listing = self.run_josi("task", "list", cwd=other)
         self.assertEqual(listing.returncode, 0, listing.stderr)
         self.assertEqual(listing.stdout, "")
-        created = self.run_actl("task", "create", "--title", "Only in other", cwd=other)
+        created = self.run_josi("task", "create", "--title", "Only in other", cwd=other)
         self.assertEqual(created.returncode, 0, created.stderr)
 
-        listing = self.run_actl("task", "list")
+        listing = self.run_josi("task", "list")
         self.assertIn("Only in repo", listing.stdout)
         self.assertNotIn("Only in other", listing.stdout)
 
     def test_nested_repository_never_uses_the_parent_database(self):
         self.initialize()
         self.assertEqual(
-            self.run_actl("task", "create", "--title", "Parent task").returncode, 0
+            self.run_josi("task", "create", "--title", "Parent task").returncode, 0
         )
         child = self.repo / "child-repo"
         child.mkdir()
         subprocess.run(
             ["git", "init", "-q", str(child)], check=True, capture_output=True
         )
-        result = self.run_actl("task", "list", cwd=child)
+        result = self.run_josi("task", "list", cwd=child)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("actl init", result.stderr)
+        self.assertIn("josi init", result.stderr)
         self.assertNotIn("Parent task", result.stdout + result.stderr)
 
     def test_task_commands_do_not_need_opencode(self):
         self.initialize()
         self.assertEqual(
-            self.run_actl("task", "create", "--title", "One").returncode, 0
+            self.run_josi("task", "create", "--title", "One").returncode, 0
         )
         if not shutil.which("git", path=MINIMAL_PATH):
             self.skipTest("git is not available on the minimal PATH")
         self.env["PATH"] = MINIMAL_PATH
-        result = self.run_actl("task", "list")
+        result = self.run_josi("task", "list")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("One", result.stdout)
 
     def test_task_commands_leave_the_planner_alone(self):
         self.initialize()
         self.assertEqual(
-            self.run_actl("task", "create", "--title", "One").returncode, 0
+            self.run_josi("task", "create", "--title", "One").returncode, 0
         )
-        self.assertEqual(self.run_actl("task", "list").returncode, 0)
-        self.assertEqual(self.run_actl("task", "show", "t1").returncode, 0)
+        self.assertEqual(self.run_josi("task", "list").returncode, 0)
+        self.assertEqual(self.run_josi("task", "show", "t1").returncode, 0)
         self.assertEqual(self.calls(), [], "task commands must not invoke OpenCode")
-        self.assertFalse((self.repo / ".actl" / "planner.json").exists())
+        self.assertFalse((self.repo / ".josi" / "planner.json").exists())
         self.assertFalse((self.repo / ".opencode").exists())
 
     def test_corrupt_database_is_reported_and_left_alone(self):
         self.initialize()
-        db = self.repo / ".actl" / "tasks.db"
+        db = self.repo / ".josi" / "tasks.db"
         db.write_bytes(b"this is not a sqlite database")
-        result = self.run_actl("task", "list")
+        result = self.run_josi("task", "list")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("task database", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
@@ -656,7 +656,7 @@ class TaskProjectTests(ActlTestCase):
 
     def test_schema_declares_foreign_keys(self):
         self.initialize()
-        conn = sqlite3.connect(str(self.repo / ".actl" / "tasks.db"))
+        conn = sqlite3.connect(str(self.repo / ".josi" / "tasks.db"))
         try:
             foreign_keys = conn.execute("PRAGMA foreign_key_list(dependencies)").fetchall()
         finally:
@@ -668,7 +668,7 @@ class TaskProjectTests(ActlTestCase):
         # A database created before Stage 7 has no runs table and no
         # tasks.run_id column; opening it migrates it in place.
         self.initialize()
-        db = self.repo / ".actl" / "tasks.db"
+        db = self.repo / ".josi" / "tasks.db"
         conn = sqlite3.connect(str(db))
         try:
             conn.executescript(
@@ -690,10 +690,10 @@ class TaskProjectTests(ActlTestCase):
         finally:
             conn.close()
 
-        result = self.run_actl("task", "list")
+        result = self.run_josi("task", "list")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("t1  DONE  Legacy", result.stdout)
-        result = self.run_actl("run", "list")
+        result = self.run_josi("run", "list")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(result.stdout, "")
 

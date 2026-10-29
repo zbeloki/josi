@@ -1,10 +1,10 @@
-"""Tests that actl does not generate OpenCode configuration at launch.
+"""Tests that josi does not generate OpenCode configuration at launch.
 
 OpenCode processes inherit the normal process environment, and an explicitly
 supplied environment (including ``OPENCODE_CONFIG_CONTENT``) passes through
 unchanged. These tests cover the wrapper directly and the real launch paths
 (the planner TUI and the worker/reviewer runs in their worktrees) through the
-fake ``opencode`` executable from ``test_actl``.
+fake ``opencode`` executable from ``test_josi``.
 """
 
 from __future__ import annotations
@@ -20,8 +20,8 @@ from unittest import mock
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
-from actl import opencode  # noqa: E402
-from test_actl import ActlTestCase  # noqa: E402
+from josi import opencode  # noqa: E402
+from test_josi import JosiTestCase  # noqa: E402
 from test_runs import TaskRunTestCase  # noqa: E402
 
 INLINE = json.dumps({"provider": {"openrouter": {"body": {"x": 1}}}})
@@ -74,15 +74,15 @@ class WrapperEnvironmentTests(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
-class PlannerLaunchConfigTests(ActlTestCase):
+class PlannerLaunchConfigTests(JosiTestCase):
     """The planner launch adds no OpenCode configuration."""
 
     def setUp(self):
         super().setUp()
         self.initialize()
 
-    def test_planner_calls_receive_no_actl_generated_config(self):
-        self.assertEqual(self.run_actl("plan").returncode, 0)
+    def test_planner_calls_receive_no_josi_generated_config(self):
+        self.assertEqual(self.run_josi("plan").returncode, 0)
         calls = self.calls()
         self.assertTrue(calls)
         for call in calls:
@@ -91,7 +91,7 @@ class PlannerLaunchConfigTests(ActlTestCase):
     def test_caller_config_is_not_overwritten_by_the_planner(self):
         self.env["OPENCODE_CONFIG_CONTENT"] = INLINE
         self.env["OPENCODE_CONFIG"] = "/some/custom.json"
-        self.assertEqual(self.run_actl("plan").returncode, 0)
+        self.assertEqual(self.run_josi("plan").returncode, 0)
         self.assertTrue(self.tui_calls())
         for call in self.calls():
             self.assertEqual(call["env"], {
@@ -110,7 +110,7 @@ class WorktreeLaunchConfigTests(TaskRunTestCase):
             ("--reviewer-model", "openrouter/openai/gpt-5"),
             ("--escalation-worker-model", "openrouter/anthropic/claude-opus-latest"),
         ):
-            result = self.run_actl("init", option, model)
+            result = self.run_josi("init", option, model)
             self.assertEqual(result.returncode, 0, result.stderr)
 
     def run_and_check(self, expected_env):
@@ -125,7 +125,7 @@ class WorktreeLaunchConfigTests(TaskRunTestCase):
         for call in self.calls():
             self.assertEqual(call["env"], expected_env, call["argv"])
 
-    def test_worker_and_reviewer_receive_no_actl_generated_config(self):
+    def test_worker_and_reviewer_receive_no_josi_generated_config(self):
         self.run_and_check({})
 
     def test_project_opencode_json_is_not_read_or_merged(self):

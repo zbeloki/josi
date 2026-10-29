@@ -1,4 +1,4 @@
-"""End-to-end tests for actl Stage 1.
+"""End-to-end tests for josi Stage 1.
 
 All OpenCode interactions run through a fake ``opencode`` executable placed on
 PATH, so the suite uses no real OpenCode process, no background service, and no
@@ -20,71 +20,71 @@ from pathlib import Path
 SRC = Path(__file__).resolve().parents[1] / "src"
 sys.path.insert(0, str(SRC))
 
-from actl.cli import PLANNER_AGENT_DOC, PLANNER_AGENT_NAME  # noqa: E402
+from josi.cli import PLANNER_AGENT_DOC, PLANNER_AGENT_NAME  # noqa: E402
 
 FAKE_OPENCODE = '''#!python
-"""Fake OpenCode CLI used by actl's test suite.
+"""Fake OpenCode CLI used by josi's test suite.
 
 Behaviour is controlled through environment variables:
 
-* ``ACTL_FAKE_LOG``             - JSONL file receiving {"argv": [...], "cwd": ...}
-* ``ACTL_FAKE_SESSION_ID``      - session id returned when creating a session
-* ``ACTL_FAKE_CREATE_EXIT``     - non-zero to make session creation fail
-* ``ACTL_FAKE_CREATE_DIR``      - override the reported session directory on create
-* ``ACTL_FAKE_CREATE_LOCATION`` - raw JSON for the reported session `location`
-* ``ACTL_FAKE_CREATE_AGENT``    - override the agent reported by session creation
-* ``ACTL_FAKE_GET_EXIT``        - non-zero to make session lookup fail
-* ``ACTL_FAKE_GET_DIR``     - override the reported session directory on lookup
-* ``ACTL_FAKE_GET_AGENT``   - agent reported by session lookup
-* ``ACTL_FAKE_SWITCH_EXIT`` - non-zero to make agent switching fail
-* ``ACTL_FAKE_TUI_EXIT``    - exit code for the interactive TUI invocation
-* ``ACTL_FAKE_RUN``         - worker behaviour on ``run``: commit (default),
+* ``JOSI_FAKE_LOG``             - JSONL file receiving {"argv": [...], "cwd": ...}
+* ``JOSI_FAKE_SESSION_ID``      - session id returned when creating a session
+* ``JOSI_FAKE_CREATE_EXIT``     - non-zero to make session creation fail
+* ``JOSI_FAKE_CREATE_DIR``      - override the reported session directory on create
+* ``JOSI_FAKE_CREATE_LOCATION`` - raw JSON for the reported session `location`
+* ``JOSI_FAKE_CREATE_AGENT``    - override the agent reported by session creation
+* ``JOSI_FAKE_GET_EXIT``        - non-zero to make session lookup fail
+* ``JOSI_FAKE_GET_DIR``     - override the reported session directory on lookup
+* ``JOSI_FAKE_GET_AGENT``   - agent reported by session lookup
+* ``JOSI_FAKE_SWITCH_EXIT`` - non-zero to make agent switching fail
+* ``JOSI_FAKE_TUI_EXIT``    - exit code for the interactive TUI invocation
+* ``JOSI_FAKE_RUN``         - worker behaviour on ``run``: commit (default),
                               dirty (leave an uncommitted file), none, empty
                               (make an empty commit), detach (leave the
                               worktree on a detached HEAD), commit-index
                               (commit a new ``worker-output-N.txt`` file,
                               with N the one-based invocation number from
-                              ``ACTL_FAKE_RUN_COUNT_FILE``), or
+                              ``JOSI_FAKE_RUN_COUNT_FILE``), or
                               ignore-collision (drop the ``local-notes.txt``
                               ignore rule and commit a tracked
                               ``local-notes.txt``)
-* ``ACTL_FAKE_RUN_EXIT``    - exit code for the noninteractive run
-* ``ACTL_FAKE_RUN_SEQUENCE`` - JSON list of per-invocation behaviours (a
+* ``JOSI_FAKE_RUN_EXIT``    - exit code for the noninteractive run
+* ``JOSI_FAKE_RUN_SEQUENCE`` - JSON list of per-invocation behaviours (a
                               string behaviour or an object with optional
                               ``behavior``, ``exit``, and ``wait_for``
                               members); the invocation number from
-                              ``ACTL_FAKE_RUN_COUNT_FILE`` selects the entry,
+                              ``JOSI_FAKE_RUN_COUNT_FILE`` selects the entry,
                               and entries past the end fall back to the
                               environment defaults
-* ``ACTL_FAKE_RUN_COUNT_FILE`` - file counting worker invocations; used with
-                              ``ACTL_FAKE_RUN_SEQUENCE`` and ``commit-index``
-* ``ACTL_FAKE_RUN_STREAM``  - text the worker prints to stdout and stderr
+* ``JOSI_FAKE_RUN_COUNT_FILE`` - file counting worker invocations; used with
+                              ``JOSI_FAKE_RUN_SEQUENCE`` and ``commit-index``
+* ``JOSI_FAKE_RUN_STREAM``  - text the worker prints to stdout and stderr
                               (flushed immediately) before it waits or does
                               any work, to test that the log is written
                               while the worker is still running
-* ``ACTL_FAKE_RUN_MARKER``  - file receiving the worker PID when it starts
-* ``ACTL_FAKE_RUN_WAIT_FOR`` - the worker waits for this file (max 120s)
+* ``JOSI_FAKE_RUN_MARKER``  - file receiving the worker PID when it starts
+* ``JOSI_FAKE_RUN_WAIT_FOR`` - the worker waits for this file (max 120s)
                               after writing the marker and before doing its
                               work
-* ``ACTL_FAKE_RUN_DONE``    - file written when the worker is about to exit
-* ``ACTL_FAKE_REVIEW_JSON`` - the final reviewer message (defaults to an
+* ``JOSI_FAKE_RUN_DONE``    - file written when the worker is about to exit
+* ``JOSI_FAKE_REVIEW_JSON`` - the final reviewer message (defaults to an
                               approval); ``opencode run --agent plan`` prints
                               it as the text event of ``--format json`` output
-* ``ACTL_FAKE_REVIEW_SEQUENCE`` - JSON list of per-invocation reviewer
+* ``JOSI_FAKE_REVIEW_SEQUENCE`` - JSON list of per-invocation reviewer
                               messages (objects) selected with
-                              ``ACTL_FAKE_REVIEW_COUNT_FILE``; entries past
-                              the end fall back to ``ACTL_FAKE_REVIEW_JSON``
-* ``ACTL_FAKE_REVIEW_COUNT_FILE`` - file counting reviewer invocations; used
-                              with ``ACTL_FAKE_REVIEW_SEQUENCE``
-* ``ACTL_FAKE_REVIEW_EXIT`` - exit code for the reviewer invocation
-* ``ACTL_FAKE_REVIEW_MARKER`` - file receiving the reviewer PID when it starts
-* ``ACTL_FAKE_REVIEW_WAIT_FOR`` - the reviewer waits for this file (max 120s)
-* ``ACTL_FAKE_REVIEW_DONE`` - file written when the reviewer is about to exit
-* ``ACTL_FAKE_REVIEW_MUTATE`` - reviewer-side change to its own checkout:
+                              ``JOSI_FAKE_REVIEW_COUNT_FILE``; entries past
+                              the end fall back to ``JOSI_FAKE_REVIEW_JSON``
+* ``JOSI_FAKE_REVIEW_COUNT_FILE`` - file counting reviewer invocations; used
+                              with ``JOSI_FAKE_REVIEW_SEQUENCE``
+* ``JOSI_FAKE_REVIEW_EXIT`` - exit code for the reviewer invocation
+* ``JOSI_FAKE_REVIEW_MARKER`` - file receiving the reviewer PID when it starts
+* ``JOSI_FAKE_REVIEW_WAIT_FOR`` - the reviewer waits for this file (max 120s)
+* ``JOSI_FAKE_REVIEW_DONE`` - file written when the reviewer is about to exit
+* ``JOSI_FAKE_REVIEW_MUTATE`` - reviewer-side change to its own checkout:
                               ``commit`` (replace a tracked file and commit),
                               ``dirty`` (modify a tracked file), or
                               ``untracked`` (write a scratch file)
-* ``ACTL_FAKE_TESTS``       - test-writer behaviour on ``opencode run
+* ``JOSI_FAKE_TESTS``       - test-writer behaviour on ``opencode run
                               --format json`` with the build agent: none
                               (default; change nothing and decide that no
                               tests are needed), commit (commit a new
@@ -92,27 +92,27 @@ Behaviour is controlled through environment variables:
                               uncommitted file), untracked (leave an
                               untracked file), or empty (make an empty
                               commit)
-* ``ACTL_FAKE_TESTS_JSON``  - the final test-writer message (defaults to a
+* ``JOSI_FAKE_TESTS_JSON``  - the final test-writer message (defaults to a
                               ``no_tests_needed`` decision)
-* ``ACTL_FAKE_TESTS_EXIT``  - exit code for the test-writer invocation
-* ``ACTL_FAKE_TESTS_SEQUENCE`` - JSON list of per-invocation test-writer
+* ``JOSI_FAKE_TESTS_EXIT``  - exit code for the test-writer invocation
+* ``JOSI_FAKE_TESTS_SEQUENCE`` - JSON list of per-invocation test-writer
                               behaviours (a string behaviour or an object
                               with optional ``behavior``, ``exit``, and
                               ``message`` members) selected with
-                              ``ACTL_FAKE_TESTS_COUNT_FILE``; entries past
-                              the end fall back to ``ACTL_FAKE_TESTS``
-* ``ACTL_FAKE_TESTS_COUNT_FILE`` - file counting test-writer invocations;
-                              used with ``ACTL_FAKE_TESTS_SEQUENCE``
-* ``ACTL_FAKE_SESSION_USAGE`` - JSON object with the cumulative ``cost`` and
+                              ``JOSI_FAKE_TESTS_COUNT_FILE``; entries past
+                              the end fall back to ``JOSI_FAKE_TESTS``
+* ``JOSI_FAKE_TESTS_COUNT_FILE`` - file counting test-writer invocations;
+                              used with ``JOSI_FAKE_TESTS_SEQUENCE``
+* ``JOSI_FAKE_SESSION_USAGE`` - JSON object with the cumulative ``cost`` and
                               ``tokens`` reported by every session lookup
-* ``ACTL_FAKE_SESSION_USAGE_SEQUENCE`` - JSON list of per-lookup cumulative
+* ``JOSI_FAKE_SESSION_USAGE_SEQUENCE`` - JSON list of per-lookup cumulative
                               usage objects selected with
-                              ``ACTL_FAKE_SESSION_USAGE_COUNT_FILE``; entries
+                              ``JOSI_FAKE_SESSION_USAGE_COUNT_FILE``; entries
                               past the end fall back to
-                              ``ACTL_FAKE_SESSION_USAGE``
-* ``ACTL_FAKE_SESSION_USAGE_COUNT_FILE`` - file counting session lookups; used
-                              with ``ACTL_FAKE_SESSION_USAGE_SEQUENCE``
-* ``ACTL_FAKE_MODEL_LIST`` - JSON list of model objects returned by
+                              ``JOSI_FAKE_SESSION_USAGE``
+* ``JOSI_FAKE_SESSION_USAGE_COUNT_FILE`` - file counting session lookups; used
+                              with ``JOSI_FAKE_SESSION_USAGE_SEQUENCE``
+* ``JOSI_FAKE_MODEL_LIST`` - JSON list of model objects returned by
                               ``GET /api/model`` (pricing metadata)
 """
 
@@ -124,7 +124,7 @@ import time
 
 
 def _log(argv):
-    path = os.environ.get("ACTL_FAKE_LOG")
+    path = os.environ.get("JOSI_FAKE_LOG")
     if not path:
         return
     env = {
@@ -174,11 +174,11 @@ def _sequence_item(name, index):
 
 def _session_usage():
     """Return the cumulative usage reported by one session lookup, or None."""
-    index = _next_index(os.environ.get("ACTL_FAKE_SESSION_USAGE_COUNT_FILE"))
-    item = _sequence_item("ACTL_FAKE_SESSION_USAGE_SEQUENCE", index)
+    index = _next_index(os.environ.get("JOSI_FAKE_SESSION_USAGE_COUNT_FILE"))
+    item = _sequence_item("JOSI_FAKE_SESSION_USAGE_SEQUENCE", index)
     if item is not None:
         return item if isinstance(item, dict) else json.loads(item)
-    raw = os.environ.get("ACTL_FAKE_SESSION_USAGE")
+    raw = os.environ.get("JOSI_FAKE_SESSION_USAGE")
     if not raw:
         return None
     return json.loads(raw)
@@ -186,22 +186,22 @@ def _session_usage():
 
 def _review_message():
     """The reviewer's final message for this invocation."""
-    index = _next_index(os.environ.get("ACTL_FAKE_REVIEW_COUNT_FILE"))
-    item = _sequence_item("ACTL_FAKE_REVIEW_SEQUENCE", index)
+    index = _next_index(os.environ.get("JOSI_FAKE_REVIEW_COUNT_FILE"))
+    item = _sequence_item("JOSI_FAKE_REVIEW_SEQUENCE", index)
     if item is not None:
         return item if isinstance(item, str) else json.dumps(item)
     return os.environ.get(
-        "ACTL_FAKE_REVIEW_JSON", '{"decision":"approved","findings":[]}'
+        "JOSI_FAKE_REVIEW_JSON", '{"decision":"approved","findings":[]}'
     )
 
 
 def _worker_plan():
     """Return ``(behavior, exit_code, wait_for, index)`` for this invocation."""
-    behavior = os.environ.get("ACTL_FAKE_RUN", "commit")
-    exit_code = int(os.environ.get("ACTL_FAKE_RUN_EXIT", "0"))
-    wait_for = os.environ.get("ACTL_FAKE_RUN_WAIT_FOR")
-    index = _next_index(os.environ.get("ACTL_FAKE_RUN_COUNT_FILE"))
-    item = _sequence_item("ACTL_FAKE_RUN_SEQUENCE", index)
+    behavior = os.environ.get("JOSI_FAKE_RUN", "commit")
+    exit_code = int(os.environ.get("JOSI_FAKE_RUN_EXIT", "0"))
+    wait_for = os.environ.get("JOSI_FAKE_RUN_WAIT_FOR")
+    index = _next_index(os.environ.get("JOSI_FAKE_RUN_COUNT_FILE"))
+    item = _sequence_item("JOSI_FAKE_RUN_SEQUENCE", index)
     if isinstance(item, dict):
         behavior = item.get("behavior", behavior)
         exit_code = int(item.get("exit", exit_code))
@@ -215,13 +215,13 @@ def _tests_plan():
     """Return ``(behavior, exit_code, message)`` for this test-writer turn.
 
     ``message`` is the final message to print, or None to fall back to
-    ``ACTL_FAKE_TESTS_JSON``.
+    ``JOSI_FAKE_TESTS_JSON``.
     """
-    behavior = os.environ.get("ACTL_FAKE_TESTS", "none")
-    exit_code = int(os.environ.get("ACTL_FAKE_TESTS_EXIT", "0"))
+    behavior = os.environ.get("JOSI_FAKE_TESTS", "none")
+    exit_code = int(os.environ.get("JOSI_FAKE_TESTS_EXIT", "0"))
     message = None
-    index = _next_index(os.environ.get("ACTL_FAKE_TESTS_COUNT_FILE"))
-    item = _sequence_item("ACTL_FAKE_TESTS_SEQUENCE", index)
+    index = _next_index(os.environ.get("JOSI_FAKE_TESTS_COUNT_FILE"))
+    item = _sequence_item("JOSI_FAKE_TESTS_SEQUENCE", index)
     if isinstance(item, dict):
         behavior = item.get("behavior", behavior)
         exit_code = int(item.get("exit", exit_code))
@@ -261,7 +261,7 @@ def _run_test_writer():
                       "part": {"type": "step-start"}}))
     if message is None:
         message = os.environ.get(
-            "ACTL_FAKE_TESTS_JSON",
+            "JOSI_FAKE_TESTS_JSON",
             '{"decision":"no_tests_needed","reason":"no tests required"}',
         )
     print(json.dumps({
@@ -274,15 +274,15 @@ def _run_test_writer():
 
 def _run_reviewer():
     """Emulate one noninteractive reviewer turn with --format json output."""
-    marker = os.environ.get("ACTL_FAKE_REVIEW_MARKER")
+    marker = os.environ.get("JOSI_FAKE_REVIEW_MARKER")
     if marker:
         with open(marker, "w", encoding="utf-8") as handle:
             handle.write(str(os.getpid()))
-    wait_for = os.environ.get("ACTL_FAKE_REVIEW_WAIT_FOR")
+    wait_for = os.environ.get("JOSI_FAKE_REVIEW_WAIT_FOR")
     deadline = time.time() + 120
     while wait_for and not os.path.exists(wait_for) and time.time() < deadline:
         time.sleep(0.05)
-    mutate = os.environ.get("ACTL_FAKE_REVIEW_MUTATE")
+    mutate = os.environ.get("JOSI_FAKE_REVIEW_MUTATE")
     if mutate == "commit":
         with open("worker-output.txt", "w", encoding="utf-8") as handle:
             handle.write("reviewer replacement\\n")
@@ -307,21 +307,21 @@ def _run_reviewer():
         "part": {"type": "text", "messageID": "msg_fake_review",
                  "text": message},
     }))
-    done = os.environ.get("ACTL_FAKE_REVIEW_DONE")
+    done = os.environ.get("JOSI_FAKE_REVIEW_DONE")
     if done:
         with open(done, "w", encoding="utf-8") as handle:
             handle.write("done")
-    return int(os.environ.get("ACTL_FAKE_REVIEW_EXIT", "0"))
+    return int(os.environ.get("JOSI_FAKE_REVIEW_EXIT", "0"))
 
 
 def _run_worker():
     """Emulate one noninteractive worker turn inside the current directory."""
     behavior, exit_code, wait_for, index = _worker_plan()
-    marker = os.environ.get("ACTL_FAKE_RUN_MARKER")
+    marker = os.environ.get("JOSI_FAKE_RUN_MARKER")
     if marker:
         with open(marker, "w", encoding="utf-8") as handle:
             handle.write(str(os.getpid()))
-    stream = os.environ.get("ACTL_FAKE_RUN_STREAM")
+    stream = os.environ.get("JOSI_FAKE_RUN_STREAM")
     if stream:
         print("fake opencode: " + stream + " on stdout", flush=True)
         print(
@@ -385,7 +385,7 @@ def _run_worker():
         subprocess.run(["git", "checkout", "-q", "--detach"], check=True)
     print("fake opencode: worker turn finished")
     print("fake opencode: worker detail", file=sys.stderr)
-    done = os.environ.get("ACTL_FAKE_RUN_DONE")
+    done = os.environ.get("JOSI_FAKE_RUN_DONE")
     if done:
         with open(done, "w", encoding="utf-8") as handle:
             handle.write("done")
@@ -400,46 +400,46 @@ def main():
         method, path = argv[1], argv[2]
 
         if method == "POST" and path == "/api/session":
-            code = int(os.environ.get("ACTL_FAKE_CREATE_EXIT", "0"))
+            code = int(os.environ.get("JOSI_FAKE_CREATE_EXIT", "0"))
             if code:
                 print("fake opencode: session creation failed", file=sys.stderr)
                 return code
             body = {}
             if "--data" in argv:
                 body = json.loads(argv[argv.index("--data") + 1])
-            if "ACTL_FAKE_CREATE_LOCATION" in os.environ:
-                location = json.loads(os.environ["ACTL_FAKE_CREATE_LOCATION"])
+            if "JOSI_FAKE_CREATE_LOCATION" in os.environ:
+                location = json.loads(os.environ["JOSI_FAKE_CREATE_LOCATION"])
             else:
                 directory = (
-                    os.environ.get("ACTL_FAKE_CREATE_DIR")
+                    os.environ.get("JOSI_FAKE_CREATE_DIR")
                     or body.get("location", {}).get("directory")
                     or os.getcwd()
                 )
                 location = {"directory": directory}
             session_id = os.environ.get(
-                "ACTL_FAKE_SESSION_ID", "ses_fake0000000000000000000"
+                "JOSI_FAKE_SESSION_ID", "ses_fake0000000000000000000"
             )
-            agent = os.environ.get("ACTL_FAKE_CREATE_AGENT") or body.get("agent")
+            agent = os.environ.get("JOSI_FAKE_CREATE_AGENT") or body.get("agent")
             print(json.dumps({"data": {"id": session_id,
                                        "agent": agent,
                                        "location": location}}))
             return 0
 
         if method == "POST" and path.startswith("/api/session/") and path.endswith("/agent"):
-            code = int(os.environ.get("ACTL_FAKE_SWITCH_EXIT", "0"))
+            code = int(os.environ.get("JOSI_FAKE_SWITCH_EXIT", "0"))
             if code:
                 print("fake opencode: agent switch failed", file=sys.stderr)
                 return code
             return 0
 
         if method == "GET" and path.startswith("/api/session/"):
-            code = int(os.environ.get("ACTL_FAKE_GET_EXIT", "0"))
+            code = int(os.environ.get("JOSI_FAKE_GET_EXIT", "0"))
             if code:
                 print("fake opencode: session not found", file=sys.stderr)
                 return code
             session_id = path.rsplit("/", 1)[-1]
-            directory = os.environ.get("ACTL_FAKE_GET_DIR") or os.getcwd()
-            agent = os.environ.get("ACTL_FAKE_GET_AGENT", "actl-planner")
+            directory = os.environ.get("JOSI_FAKE_GET_DIR") or os.getcwd()
+            agent = os.environ.get("JOSI_FAKE_GET_AGENT", "josi-planner")
             data = {"id": session_id,
                     "agent": agent,
                     "location": {"directory": directory}}
@@ -450,7 +450,7 @@ def main():
             return 0
 
         if method == "GET" and path == "/api/model":
-            raw = os.environ.get("ACTL_FAKE_MODEL_LIST", "[]")
+            raw = os.environ.get("JOSI_FAKE_MODEL_LIST", "[]")
             print(json.dumps({"data": json.loads(raw)}))
             return 0
 
@@ -465,7 +465,7 @@ def main():
 
     # Anything after the api and run handling is treated as the interactive
     # TUI invocation.
-    return int(os.environ.get("ACTL_FAKE_TUI_EXIT", "0"))
+    return int(os.environ.get("JOSI_FAKE_TUI_EXIT", "0"))
 
 
 if __name__ == "__main__":
@@ -482,11 +482,11 @@ def model_setting(value):
     return value
 
 
-class ActlTestCase(unittest.TestCase):
+class JosiTestCase(unittest.TestCase):
     """Shared fixtures: a temporary directory, a fake opencode, env control."""
 
     def setUp(self):
-        self.tmp = tempfile.TemporaryDirectory(prefix="actl-tests-")
+        self.tmp = tempfile.TemporaryDirectory(prefix="josi-tests-")
         self.addCleanup(self.tmp.cleanup)
         self.base = Path(self.tmp.name).resolve()
         self.bin = self.base / "bin"
@@ -504,9 +504,9 @@ class ActlTestCase(unittest.TestCase):
         self.env = os.environ.copy()
         self.env["PATH"] = str(self.bin) + os.pathsep + self.env.get("PATH", "")
         self.env["PYTHONPATH"] = str(SRC)
-        self.env["ACTL_FAKE_LOG"] = str(self.log)
+        self.env["JOSI_FAKE_LOG"] = str(self.log)
         for key in list(self.env):
-            if key.startswith("ACTL_FAKE_") and key != "ACTL_FAKE_LOG":
+            if key.startswith("JOSI_FAKE_") and key != "JOSI_FAKE_LOG":
                 del self.env[key]
             # OpenCode configuration must not leak in from the invoking
             # environment (for example a parent OpenCode session exporting
@@ -516,12 +516,12 @@ class ActlTestCase(unittest.TestCase):
 
     # -- helpers ---------------------------------------------------------
 
-    def run_actl(self, *args, cwd=None, input_text=""):
+    def run_josi(self, *args, cwd=None, input_text=""):
         # ``input_text`` defaults to empty but never None: stdin is always a
         # pipe that immediately reaches EOF, so an unexpected interactive
         # prompt fails the test instead of hanging on the terminal.
         return subprocess.run(
-            [sys.executable, "-m", "actl", *args],
+            [sys.executable, "-m", "josi", *args],
             cwd=str(cwd or self.repo),
             env=self.env,
             input=input_text,
@@ -538,7 +538,7 @@ class ActlTestCase(unittest.TestCase):
 
     def initialize(self):
         self.init_git()
-        result = self.run_actl("init")
+        result = self.run_josi("init")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def calls(self):
@@ -564,13 +564,13 @@ class ActlTestCase(unittest.TestCase):
         return [c for c in self.calls() if c["argv"][0] != "api"]
 
     def metadata_path(self) -> Path:
-        return self.repo / ".actl" / "project.json"
+        return self.repo / ".josi" / "project.json"
 
     def planner_path(self) -> Path:
-        return self.repo / ".actl" / "planner.json"
+        return self.repo / ".josi" / "planner.json"
 
     def agent_path(self) -> Path:
-        return self.repo / ".opencode" / "agents" / "actl-planner.md"
+        return self.repo / ".opencode" / "agents" / "josi-planner.md"
 
     def planner_session_id(self) -> str:
         return json.loads(self.planner_path().read_text(encoding="utf-8"))["session_id"]
@@ -600,12 +600,12 @@ class ActlTestCase(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
-class InitTests(ActlTestCase):
+class InitTests(JosiTestCase):
     def test_init_creates_metadata_and_gitignore(self):
         self.init_git()
-        result = self.run_actl("init")
+        result = self.run_josi("init")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Initialized actl", result.stdout)
+        self.assertIn("Initialized Josi", result.stdout)
 
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertEqual(metadata["schema_version"], 1)
@@ -620,11 +620,11 @@ class InitTests(ActlTestCase):
         self.assertIn("Base branch: " + unborn, result.stdout)
 
         gitignore = (self.repo / ".gitignore").read_text(encoding="utf-8")
-        self.assertIn(".actl/", gitignore.splitlines())
+        self.assertIn(".josi/", gitignore.splitlines())
 
     def test_init_stores_default_models(self):
         self.init_git()
-        result = self.run_actl("init")
+        result = self.run_josi("init")
         self.assertEqual(result.returncode, 0, result.stderr)
 
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
@@ -652,7 +652,7 @@ class InitTests(ActlTestCase):
 
     def test_init_explicit_model_overrides_only_its_default(self):
         self.init_git()
-        result = self.run_actl("init", "--worker-model", "provider/custom")
+        result = self.run_josi("init", "--worker-model", "provider/custom")
         self.assertEqual(result.returncode, 0, result.stderr)
 
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
@@ -667,7 +667,7 @@ class InitTests(ActlTestCase):
     def test_reinit_preserves_models_and_fills_missing_ones(self):
         self.init_git()
         self.assertEqual(
-            self.run_actl(
+            self.run_josi(
                 "init",
                 "--worker-model", "provider/worker",
                 "--reviewer-model", "provider/reviewer",
@@ -677,7 +677,7 @@ class InitTests(ActlTestCase):
         )
         # A plain re-init preserves every stored value.
         before = self.metadata_path().read_bytes()
-        result = self.run_actl("init")
+        result = self.run_josi("init")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("already initialized", result.stdout)
         self.assertEqual(self.metadata_path().read_bytes(), before)
@@ -688,7 +688,7 @@ class InitTests(ActlTestCase):
         self.metadata_path().write_text(
             json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
         )
-        result = self.run_actl("init")
+        result = self.run_josi("init")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
             "Updated the reviewer model to openrouter/openai/gpt-6-luna#high",
@@ -705,7 +705,7 @@ class InitTests(ActlTestCase):
 
     def test_reinit_explicit_model_updates_only_that_role(self):
         self.initialize()
-        result = self.run_actl("init", "--reviewer-model", "provider/other")
+        result = self.run_josi("init", "--reviewer-model", "provider/other")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Updated the reviewer model to provider/other", result.stdout)
 
@@ -720,7 +720,7 @@ class InitTests(ActlTestCase):
 
     def test_init_stores_default_test_writer_model(self):
         self.init_git()
-        result = self.run_actl("init")
+        result = self.run_josi("init")
         self.assertEqual(result.returncode, 0, result.stderr)
 
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
@@ -740,7 +740,7 @@ class InitTests(ActlTestCase):
         self.metadata_path().write_text(
             json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
         )
-        result = self.run_actl("init")
+        result = self.run_josi("init")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn(
             "Updated the test writer model to"
@@ -755,7 +755,7 @@ class InitTests(ActlTestCase):
 
     def test_reinit_explicit_test_writer_model_updates_only_that_role(self):
         self.initialize()
-        result = self.run_actl("init", "--test-writer-model", "provider/tests")
+        result = self.run_josi("init", "--test-writer-model", "provider/tests")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Updated the test writer model to provider/tests", result.stdout)
 
@@ -772,15 +772,15 @@ class InitTests(ActlTestCase):
         self.init_git()
         for value in ("", "model", "provider/", "/model", "two words/model"):
             with self.subTest(value=value):
-                result = self.run_actl("init", "--test-writer-model", value)
+                result = self.run_josi("init", "--test-writer-model", value)
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("invalid test writer model", result.stderr)
         # A leading dash would be read as an option; with the "=" form it
-        # reaches actl and is rejected as invalid.
-        result = self.run_actl("init", "--test-writer-model=-flag/model")
+        # reaches josi and is rejected as invalid.
+        result = self.run_josi("init", "--test-writer-model=-flag/model")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid test writer model", result.stderr)
-        self.assertFalse((self.repo / ".actl").exists())
+        self.assertFalse((self.repo / ".josi").exists())
 
     def test_init_adds_no_validation_commands(self):
         # Validation commands are the project's own configuration: init
@@ -788,7 +788,7 @@ class InitTests(ActlTestCase):
         # validation command (no pytest, nothing else), so validation is
         # skipped until the project adds commands itself.
         self.init_git()
-        result = self.run_actl("init")
+        result = self.run_josi("init")
         self.assertEqual(result.returncode, 0, result.stderr)
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertEqual(
@@ -802,15 +802,15 @@ class InitTests(ActlTestCase):
         )
 
         # A re-init never adds one either.
-        self.assertEqual(self.run_actl("init").returncode, 0)
+        self.assertEqual(self.run_josi("init").returncode, 0)
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertNotIn("validation", metadata)
 
     def test_init_outside_git_repository(self):
-        result = self.run_actl("init")
+        result = self.run_josi("init")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Git repository", result.stderr)
-        self.assertFalse((self.repo / ".actl").exists())
+        self.assertFalse((self.repo / ".josi").exists())
         self.assertEqual(self.calls(), [])
 
     def test_repeated_initialization_is_graceful(self):
@@ -818,7 +818,7 @@ class InitTests(ActlTestCase):
         self.initialize()
 
         metadata_before = self.metadata_path().read_text(encoding="utf-8")
-        result = self.run_actl("init")
+        result = self.run_josi("init")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("already initialized", result.stdout)
         self.assertEqual(self.metadata_path().read_text(encoding="utf-8"), metadata_before)
@@ -826,13 +826,13 @@ class InitTests(ActlTestCase):
         gitignore = (self.repo / ".gitignore").read_text(encoding="utf-8")
         self.assertIn("*.log", gitignore)
         self.assertIn("build/", gitignore)
-        self.assertEqual(gitignore.splitlines().count(".actl/"), 1)
+        self.assertEqual(gitignore.splitlines().count(".josi/"), 1)
 
     def test_init_without_gitignore_file(self):
         self.initialize()
         self.assertEqual(
             (self.repo / ".gitignore").read_text(encoding="utf-8").splitlines(),
-            [".actl/"],
+            [".josi/"],
         )
 
     def test_init_preserves_gitignore_bytes_and_crlf(self):
@@ -840,7 +840,7 @@ class InitTests(ActlTestCase):
         (self.repo / ".gitignore").write_bytes(before)
         self.initialize()
         self.assertEqual(
-            (self.repo / ".gitignore").read_bytes(), before + b".actl/\n"
+            (self.repo / ".gitignore").read_bytes(), before + b".josi/\n"
         )
 
     @unittest.skipIf(os.name == "nt", "trailing spaces in directory names are not portable")
@@ -850,11 +850,11 @@ class InitTests(ActlTestCase):
         subprocess.run(
             ["git", "init", "-q", str(spaced)], check=True, capture_output=True
         )
-        result = self.run_actl("init", cwd=spaced)
+        result = self.run_josi("init", cwd=spaced)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue((spaced / ".actl" / "project.json").is_file())
+        self.assertTrue((spaced / ".josi" / "project.json").is_file())
         self.assertFalse(
-            (self.repo / ".actl").exists(),
+            (self.repo / ".josi").exists(),
             "init must not write into the sibling directory 'repo'",
         )
 
@@ -863,21 +863,21 @@ class InitTests(ActlTestCase):
         (self.repo / ".gitignore").write_bytes(before)
         self.initialize()
         self.assertEqual(
-            (self.repo / ".gitignore").read_bytes(), before + b".actl/\n"
+            (self.repo / ".gitignore").read_bytes(), before + b".josi/\n"
         )
 
     def test_init_reports_metadata_write_failure(self):
         self.init_git()
-        (self.repo / ".actl").write_text("not a directory", encoding="utf-8")
-        result = self.run_actl("init")
+        (self.repo / ".josi").write_text("not a directory", encoding="utf-8")
+        result = self.run_josi("init")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn(".actl", result.stderr)
+        self.assertIn(".josi", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
 
     def test_init_reports_gitignore_read_failure(self):
         self.init_git()
         (self.repo / ".gitignore").mkdir()
-        result = self.run_actl("init")
+        result = self.run_josi("init")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn(".gitignore", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
@@ -889,21 +889,21 @@ class InitTests(ActlTestCase):
             self.skipTest("git is not available on the minimal PATH")
         self.init_git()
         self.env["PATH"] = MINIMAL_PATH
-        result = self.run_actl("init")
+        result = self.run_josi("init")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("OpenCode is not installed", result.stderr)
-        self.assertFalse((self.repo / ".actl").exists())
+        self.assertFalse((self.repo / ".josi").exists())
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
-class PlanTests(ActlTestCase):
+class PlanTests(JosiTestCase):
     def setUp(self):
         super().setUp()
         self.initialize()
 
     def test_first_planning_session(self):
-        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000001"
-        result = self.run_actl("plan")
+        self.env["JOSI_FAKE_SESSION_ID"] = "ses_faketest0000000000000001"
+        result = self.run_josi("plan")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Started planner session", result.stdout)
 
@@ -924,7 +924,7 @@ class PlanTests(ActlTestCase):
         self.assertEqual(self.switch_calls(), [], "fresh sessions already use the planner agent")
 
     def test_plan_installs_read_only_planner_agent(self):
-        self.assertEqual(self.run_actl("plan").returncode, 0)
+        self.assertEqual(self.run_josi("plan").returncode, 0)
         content = self.agent_path().read_text(encoding="utf-8")
         self.assertTrue(content.startswith("---\n"), "agent file needs frontmatter")
         self.assertIn("mode: primary", content)
@@ -936,7 +936,7 @@ class PlanTests(ActlTestCase):
         )
 
     def test_plan_agent_denies_everything_not_explicitly_reallowed(self):
-        self.assertEqual(self.run_actl("plan").returncode, 0)
+        self.assertEqual(self.run_josi("plan").returncode, 0)
         rules = self.planner_rules()
         # OpenCode appends agent rules after its broad base "allow everything"
         # policy and the last matching rule wins, so a catch-all deny must come
@@ -962,17 +962,17 @@ class PlanTests(ActlTestCase):
         # Only task management may be pre-approved. A broad task deny blocks
         # execution (and formatting variants) before the management allows.
         management = {
-            "actl task create *",
-            "actl task list *",
-            "actl task show *",
-            "actl task update *",
-            "actl task delete *",
+            "josi task create *",
+            "josi task list *",
+            "josi task show *",
+            "josi task update *",
+            "josi task delete *",
         }
         for rule in rules:
             if rule["action"] == "shell" and rule["effect"] == "allow":
                 self.assertIn(rule["resource"], management)
             if rule["action"] == "shell" and rule["effect"] == "deny":
-                self.assertIn(rule["resource"], ("actl task *", "actl run *", "*>*"))
+                self.assertIn(rule["resource"], ("josi task *", "josi run *", "*>*"))
         # The .env asks must follow the broad read allow, otherwise the
         # last-match-wins rule would silently turn them into plain allows.
         broad_read = rules.index({"action": "read", "resource": "*", "effect": "allow"})
@@ -980,12 +980,12 @@ class PlanTests(ActlTestCase):
         self.assertLess(broad_read, env_ask)
 
     def test_plan_agent_preapproves_only_task_commands(self):
-        self.assertEqual(self.run_actl("plan").returncode, 0)
+        self.assertEqual(self.run_josi("plan").returncode, 0)
         rules = self.planner_rules()
         # Only the task management subcommands are pre-approved, so the planner
         # can manage tasks without a prompt on every command...
         management_allows = [
-            {"action": "shell", "resource": "actl task " + command + " *",
+            {"action": "shell", "resource": "josi task " + command + " *",
              "effect": "allow"}
             for command in ("create", "list", "show", "update", "delete")
         ]
@@ -997,32 +997,32 @@ class PlanTests(ActlTestCase):
         self.assertIn(redirect_deny, rules)
         # ...while executing tasks (including whitespace variants) is denied
         # by the broad task deny that comes before those allows.
-        task_deny = {"action": "shell", "resource": "actl task *", "effect": "deny"}
+        task_deny = {"action": "shell", "resource": "josi task *", "effect": "deny"}
         self.assertIn(task_deny, rules)
         self.assertLess(rules.index(task_deny), rules.index(management_allows[0]))
         # Integrating a run into the base branch is never the planner's job.
-        run_deny = {"action": "shell", "resource": "actl run *", "effect": "deny"}
+        run_deny = {"action": "shell", "resource": "josi run *", "effect": "deny"}
         self.assertIn(run_deny, rules)
         self.assertLess(rules.index(task_deny), rules.index(run_deny))
         # ...while the rules stay effective: last match wins, so the broad ask
         # must come before the task deny, and the redirect deny (which blocks
-        # "actl task ... > file" silently overwriting files) must come after
+        # "josi task ... > file" silently overwriting files) must come after
         # the task allows. The catch-all deny comes first.
         self.assertLess(rules.index(ask), rules.index(task_deny))
         for shell_allow in management_allows:
             self.assertLess(rules.index(shell_allow), rules.index(redirect_deny))
         content = self.agent_path().read_text(encoding="utf-8")
-        self.assertIn("actl task create", content)
+        self.assertIn("josi task create", content)
         self.assertIn("checked separately", content)
-        self.assertIn("never open .actl/tasks.db", content)
+        self.assertIn("never open .josi/tasks.db", content)
 
     def test_plan_installs_planner_agent_once(self):
-        first = self.run_actl("plan")
+        first = self.run_josi("plan")
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assertNotIn("Updated the planner agent", first.stdout)
         mtime = self.agent_path().stat().st_mtime_ns
 
-        second = self.run_actl("plan")
+        second = self.run_josi("plan")
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assertNotIn("Updated the planner agent", second.stdout)
         self.assertEqual(self.agent_path().stat().st_mtime_ns, mtime)
@@ -1042,7 +1042,7 @@ class PlanTests(ActlTestCase):
         self.agent_path().parent.mkdir(parents=True)
         self.agent_path().write_text(legacy, encoding="utf-8")
 
-        result = self.run_actl("plan")
+        result = self.run_josi("plan")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Updated the planner agent", result.stdout)
         content = self.agent_path().read_text(encoding="utf-8")
@@ -1051,10 +1051,10 @@ class PlanTests(ActlTestCase):
         self.assertEqual(content, PLANNER_AGENT_DOC)
 
     def test_every_plan_run_starts_a_fresh_session(self):
-        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000002"
-        self.assertEqual(self.run_actl("plan").returncode, 0)
-        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000003"
-        result = self.run_actl("plan")
+        self.env["JOSI_FAKE_SESSION_ID"] = "ses_faketest0000000000000002"
+        self.assertEqual(self.run_josi("plan").returncode, 0)
+        self.env["JOSI_FAKE_SESSION_ID"] = "ses_faketest0000000000000003"
+        result = self.run_josi("plan")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Started planner session", result.stdout)
         self.assertNotIn("Resuming", result.stdout)
@@ -1073,32 +1073,32 @@ class PlanTests(ActlTestCase):
         self.assertFalse(any("delete" in c["argv"] for c in self.calls()))
 
     def test_plan_no_longer_accepts_new(self):
-        result = self.run_actl("plan", "--new")
+        result = self.run_josi("plan", "--new")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(self.calls(), [])
 
     def test_plan_never_sends_an_initial_prompt(self):
-        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000011"
-        self.assertEqual(self.run_actl("plan").returncode, 0)
-        self.assertEqual(self.run_actl("plan").returncode, 0)
-        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000012"
-        self.assertEqual(self.run_actl("plan").returncode, 0)
+        self.env["JOSI_FAKE_SESSION_ID"] = "ses_faketest0000000000000011"
+        self.assertEqual(self.run_josi("plan").returncode, 0)
+        self.assertEqual(self.run_josi("plan").returncode, 0)
+        self.env["JOSI_FAKE_SESSION_ID"] = "ses_faketest0000000000000012"
+        self.assertEqual(self.run_josi("plan").returncode, 0)
         self.assertEqual(len(self.tui_calls()), 3)
         for call in self.tui_calls():
             self.assertNotIn("--prompt", call["argv"])
 
     def test_plan_reports_agent_switch_failure(self):
-        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000013"
-        self.env["ACTL_FAKE_CREATE_AGENT"] = "build"
-        self.env["ACTL_FAKE_SWITCH_EXIT"] = "1"
-        result = self.run_actl("plan")
+        self.env["JOSI_FAKE_SESSION_ID"] = "ses_faketest0000000000000013"
+        self.env["JOSI_FAKE_CREATE_AGENT"] = "build"
+        self.env["JOSI_FAKE_SWITCH_EXIT"] = "1"
+        result = self.run_josi("plan")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("cannot select the planner agent", result.stderr)
         self.assertEqual(self.tui_calls(), [], "OpenCode must not be launched")
 
     def test_plan_agent_install_failure_is_reported(self):
         self.agent_path().mkdir(parents=True)  # a directory cannot be overwritten
-        result = self.run_actl("plan")
+        result = self.run_josi("plan")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("could not write the planner agent", result.stderr)
         self.assertEqual(self.tui_calls(), [])
@@ -1106,8 +1106,8 @@ class PlanTests(ActlTestCase):
     def test_plan_from_subdirectory_uses_project_root(self):
         sub = self.repo / "src" / "nested"
         sub.mkdir(parents=True)
-        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000008"
-        result = self.run_actl("plan", cwd=sub)
+        self.env["JOSI_FAKE_SESSION_ID"] = "ses_faketest0000000000000008"
+        result = self.run_josi("plan", cwd=sub)
         self.assertEqual(result.returncode, 0, result.stderr)
         tui = self.tui_calls()[0]
         self.assertEqual(tui["argv"][0], str(self.repo))
@@ -1115,8 +1115,8 @@ class PlanTests(ActlTestCase):
 
     @unittest.skipIf(os.name == "nt", "trailing spaces in directory names are not portable")
     def test_plan_does_not_resume_a_sibling_repository(self):
-        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000015"
-        self.assertEqual(self.run_actl("plan").returncode, 0)
+        self.env["JOSI_FAKE_SESSION_ID"] = "ses_faketest0000000000000015"
+        self.assertEqual(self.run_josi("plan").returncode, 0)
         self.assertEqual(len(self.tui_calls()), 1)
 
         spaced = self.base / "repo "
@@ -1124,9 +1124,9 @@ class PlanTests(ActlTestCase):
         subprocess.run(
             ["git", "init", "-q", str(spaced)], check=True, capture_output=True
         )
-        result = self.run_actl("plan", cwd=spaced)
+        result = self.run_josi("plan", cwd=spaced)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("actl init", result.stderr)
+        self.assertIn("josi init", result.stderr)
         self.assertEqual(
             len(self.tui_calls()), 1, "the sibling's session must not be resumed"
         )
@@ -1147,10 +1147,10 @@ class PlanTests(ActlTestCase):
             self.skipTest("git is not available on the minimal PATH")
 
         # A relative PATH entry resolves against the invocation directory; the
-        # selected executable must keep working after actl switches its
+        # selected executable must keep working after josi switches its
         # subprocesses to the project root.
         self.env["PATH"] = "." + os.pathsep + MINIMAL_PATH
-        result = self.run_actl("plan", cwd=nested)
+        result = self.run_josi("plan", cwd=nested)
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Started planner session", result.stdout)
         self.assertEqual(len(self.tui_calls()), 1)
@@ -1161,9 +1161,9 @@ class PlanTests(ActlTestCase):
         subprocess.run(
             ["git", "init", "-q", str(child)], check=True, capture_output=True
         )
-        result = self.run_actl("plan", cwd=child)
+        result = self.run_josi("plan", cwd=child)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("actl init", result.stderr)
+        self.assertIn("josi init", result.stderr)
         self.assertEqual(self.calls(), [])
         self.assertFalse((child / ".opencode").exists())
 
@@ -1171,37 +1171,37 @@ class PlanTests(ActlTestCase):
         if shutil.which("opencode", path=MINIMAL_PATH):
             self.skipTest("a real opencode executable is visible on the minimal PATH")
         self.env["PATH"] = MINIMAL_PATH
-        result = self.run_actl("plan")
+        result = self.run_josi("plan")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("OpenCode is not installed", result.stderr)
         self.assertEqual(self.tui_calls(), [])
 
     def test_plan_session_creation_failure(self):
-        self.env["ACTL_FAKE_CREATE_EXIT"] = "1"
-        result = self.run_actl("plan")
+        self.env["JOSI_FAKE_CREATE_EXIT"] = "1"
+        result = self.run_josi("plan")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("could not create", result.stderr)
         self.assertFalse(self.planner_path().exists())
         self.assertEqual(self.tui_calls(), [])
 
     def test_plan_session_created_in_wrong_directory_is_rejected(self):
-        self.env["ACTL_FAKE_CREATE_DIR"] = str(self.base / "elsewhere")
-        result = self.run_actl("plan")
+        self.env["JOSI_FAKE_CREATE_DIR"] = str(self.base / "elsewhere")
+        result = self.run_josi("plan")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("belongs to", result.stderr)
         self.assertFalse(self.planner_path().exists())
         self.assertEqual(self.tui_calls(), [])
 
     def test_plan_tui_failure_is_reported(self):
-        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000005"
-        self.env["ACTL_FAKE_TUI_EXIT"] = "7"
-        result = self.run_actl("plan")
+        self.env["JOSI_FAKE_SESSION_ID"] = "ses_faketest0000000000000005"
+        self.env["JOSI_FAKE_TUI_EXIT"] = "7"
+        result = self.run_josi("plan")
         self.assertEqual(result.returncode, 7)
         self.assertIn("exited with status 7", result.stderr)
 
     def test_plan_rejects_malformed_session_location(self):
-        self.env["ACTL_FAKE_CREATE_LOCATION"] = json.dumps({"directory": ["bad"]})
-        result = self.run_actl("plan")
+        self.env["JOSI_FAKE_CREATE_LOCATION"] = json.dumps({"directory": ["bad"]})
+        result = self.run_josi("plan")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("unexpected session directory", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
@@ -1209,9 +1209,9 @@ class PlanTests(ActlTestCase):
         self.assertEqual(self.tui_calls(), [])
 
     def test_plan_switches_agent_on_new_session_when_needed(self):
-        self.env["ACTL_FAKE_SESSION_ID"] = "ses_faketest0000000000000014"
-        self.env["ACTL_FAKE_CREATE_AGENT"] = "build"
-        result = self.run_actl("plan")
+        self.env["JOSI_FAKE_SESSION_ID"] = "ses_faketest0000000000000014"
+        self.env["JOSI_FAKE_CREATE_AGENT"] = "build"
+        result = self.run_josi("plan")
         self.assertEqual(result.returncode, 0, result.stderr)
         switches = self.switch_calls()
         self.assertEqual(len(switches), 1)
@@ -1224,27 +1224,27 @@ class PlanTests(ActlTestCase):
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
-class PlanGuardTests(ActlTestCase):
+class PlanGuardTests(JosiTestCase):
     def test_plan_before_init_does_not_launch_opencode(self):
         self.init_git()
-        result = self.run_actl("plan")
+        result = self.run_josi("plan")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("actl init", result.stderr)
+        self.assertIn("josi init", result.stderr)
         self.assertEqual(self.calls(), [])
         self.assertFalse((self.repo / ".opencode").exists())
 
     def test_plan_with_missing_metadata(self):
         self.init_git()
-        (self.repo / ".actl").mkdir()
-        result = self.run_actl("plan")
+        (self.repo / ".josi").mkdir()
+        result = self.run_josi("plan")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("invalid actl project metadata", result.stderr)
+        self.assertIn("invalid Josi project metadata", result.stderr)
         self.assertEqual(self.calls(), [])
         self.assertFalse((self.repo / ".opencode").exists())
 
     def test_plan_with_invalid_metadata(self):
         self.init_git()
-        (self.repo / ".actl").mkdir()
+        (self.repo / ".josi").mkdir()
         payloads = [
             "not json at all",
             json.dumps([]),
@@ -1258,38 +1258,38 @@ class PlanGuardTests(ActlTestCase):
         for payload in payloads:
             with self.subTest(payload=payload):
                 self.metadata_path().write_text(payload, encoding="utf-8")
-                result = self.run_actl("plan")
+                result = self.run_josi("plan")
                 self.assertNotEqual(result.returncode, 0)
-                self.assertIn("invalid actl project metadata", result.stderr)
+                self.assertIn("invalid Josi project metadata", result.stderr)
                 self.assertEqual(self.calls(), [])
                 self.assertFalse((self.repo / ".opencode").exists())
 
     def test_plan_with_undecodable_metadata(self):
         self.init_git()
-        (self.repo / ".actl").mkdir()
-        (self.repo / ".actl" / "project.json").write_bytes(b"\xff\xfe")
-        result = self.run_actl("plan")
+        (self.repo / ".josi").mkdir()
+        (self.repo / ".josi" / "project.json").write_bytes(b"\xff\xfe")
+        result = self.run_josi("plan")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("invalid actl project metadata", result.stderr)
+        self.assertIn("invalid Josi project metadata", result.stderr)
         self.assertNotIn("Traceback", result.stderr)
         self.assertEqual(self.calls(), [])
 
     def test_plan_outside_git_repository(self):
         outside = self.base / "outside"
         outside.mkdir()
-        result = self.run_actl("plan", cwd=outside)
+        result = self.run_josi("plan", cwd=outside)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Git repository", result.stderr)
         self.assertEqual(self.calls(), [])
 
-    def test_plan_ignores_actl_metadata_outside_git(self):
+    def test_plan_ignores_josi_metadata_outside_git(self):
         outside = self.base / "copied"
-        (outside / ".actl").mkdir(parents=True)
-        (outside / ".actl" / "project.json").write_text(
+        (outside / ".josi").mkdir(parents=True)
+        (outside / ".josi" / "project.json").write_text(
             json.dumps({"schema_version": 1, "name": "copied", "created_at": "x"}),
             encoding="utf-8",
         )
-        result = self.run_actl("plan", cwd=outside)
+        result = self.run_josi("plan", cwd=outside)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Git repository", result.stderr)
         self.assertEqual(self.calls(), [])

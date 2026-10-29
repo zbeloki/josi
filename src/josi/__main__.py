@@ -1,4 +1,4 @@
-"""Allow running actl as ``python -m actl``."""
+"""Allow running josi as ``python -m josi``."""
 
 import sys
 

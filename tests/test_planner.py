@@ -1,4 +1,4 @@
-"""End-to-end tests for actl Stage 3: planner integration with task management.
+"""End-to-end tests for josi Stage 3: planner integration with task management.
 
 Everything runs through the fake ``opencode`` executable from the Stage 1
 tests, so the suite needs no real OpenCode process and no model calls. The
@@ -20,7 +20,7 @@ import shutil
 import sqlite3
 import unittest
 
-from test_actl import ActlTestCase
+from test_josi import JosiTestCase
 
 
 def opencode_glob_match(value: str, pattern: str) -> bool:
@@ -52,33 +52,33 @@ class Ruleset:
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
-class PlannerRulesTests(ActlTestCase):
-    """The installed agent pre-approves exactly the actl task commands."""
+class PlannerRulesTests(JosiTestCase):
+    """The installed agent pre-approves exactly the josi task commands."""
 
     def setUp(self):
         super().setUp()
         self.initialize()
-        result = self.run_actl("plan")
+        result = self.run_josi("plan")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.ruleset = Ruleset(self.planner_rules())
 
     def test_task_commands_are_preapproved(self):
         commands = [
-            "actl task list",
-            "actl task show t1",
-            "actl task show 3",
-            "actl task create --title 'Add login'",
-            'actl task create --title "Add login" --description "Form with validation"',
-            "actl task create --title Tests --description-file acceptance.md",
-            "actl task create --title Tests --depends-on t1",
-            "actl task create --title Tests --depends-on t1,t2",
-            "actl task update t2 --title 'New title'",
-            "actl task update t2 --description 'New body'",
-            "actl task update t2 --description-file updated.md",
-            "actl task update t2 --depends-on t1",
-            "actl task update t2 --depends-on t1 --depends-on t3",
-            "actl task update t2 --clear-dependencies",
-            "actl task delete t2",
+            "josi task list",
+            "josi task show t1",
+            "josi task show 3",
+            "josi task create --title 'Add login'",
+            'josi task create --title "Add login" --description "Form with validation"',
+            "josi task create --title Tests --description-file acceptance.md",
+            "josi task create --title Tests --depends-on t1",
+            "josi task create --title Tests --depends-on t1,t2",
+            "josi task update t2 --title 'New title'",
+            "josi task update t2 --description 'New body'",
+            "josi task update t2 --description-file updated.md",
+            "josi task update t2 --depends-on t1",
+            "josi task update t2 --depends-on t1 --depends-on t3",
+            "josi task update t2 --clear-dependencies",
+            "josi task delete t2",
         ]
         for command in commands:
             with self.subTest(command=command):
@@ -90,7 +90,7 @@ class PlannerRulesTests(ActlTestCase):
             "git log --oneline -5",
             "cat README.md",
             "head -5 README.md",
-            "grep -n TODO src/actl/cli.py",
+            "grep -n TODO src/josi/cli.py",
             "ls -la src",
             "rm -rf src",
             "mv src/x src/y",
@@ -99,85 +99,85 @@ class PlannerRulesTests(ActlTestCase):
             "git diff --output=file",
             "git commit -m 'x'",
             "python -c 'print(1)'",
-            "actl init",
-            "actl plan",
-            "actlfake task list",
-            "actl taskrun",
+            "josi init",
+            "josi plan",
+            "josifake task list",
+            "josi taskrun",
         ]
         for command in commands:
             with self.subTest(command=command):
                 self.assertEqual(self.ruleset.effect("shell", command), "ask")
 
-    def test_actl_task_run_is_denied(self):
+    def test_josi_task_run_is_denied(self):
         commands = [
-            "actl task run",
-            "actl task run t1",
-            "actl task run 3",
-            "actl task run t2 --worker-model provider/model",
+            "josi task run",
+            "josi task run t1",
+            "josi task run 3",
+            "josi task run t2 --worker-model provider/model",
             # Extra whitespace must not turn execution into a management
             # command that the pre-approval allows.
-            "actl task  run t1",
-            "actl task   run t1",
+            "josi task  run t1",
+            "josi task   run t1",
         ]
         for command in commands:
             with self.subTest(command=command):
                 self.assertEqual(self.ruleset.effect("shell", command), "deny")
 
-    def test_actl_task_reset_is_denied(self):
+    def test_josi_task_reset_is_denied(self):
         # Resetting discards a task's budget, branch, and worktree: an
         # execution-state intervention the planner must never make.
         commands = [
-            "actl task reset t1",
-            "actl task reset 3",
-            "actl task reset t1 --force",
+            "josi task reset t1",
+            "josi task reset 3",
+            "josi task reset t1 --force",
             # Extra whitespace must not turn it into a management command.
-            "actl task  reset t1",
-            "actl task   reset t1",
+            "josi task  reset t1",
+            "josi task   reset t1",
         ]
         for command in commands:
             with self.subTest(command=command):
                 self.assertEqual(self.ruleset.effect("shell", command), "deny")
 
-    def test_actl_run_is_denied(self):
+    def test_josi_run_is_denied(self):
         commands = [
-            "actl run list",
-            "actl run show r1",
-            "actl run merge r1",
-            "actl run merge 1",
+            "josi run list",
+            "josi run show r1",
+            "josi run merge r1",
+            "josi run merge 1",
         ]
         for command in commands:
             with self.subTest(command=command):
                 self.assertEqual(self.ruleset.effect("shell", command), "deny")
         # A whitespace variant does not match the deny, but it is never
         # pre-approved either: the catch-all ask keeps it behind a prompt.
-        self.assertEqual(self.ruleset.effect("shell", "actl  run merge r1"), "ask")
+        self.assertEqual(self.ruleset.effect("shell", "josi  run merge r1"), "ask")
 
     def test_task_management_survives_the_run_deny(self):
         commands = [
-            "actl task list",
-            "actl task show t1",
-            "actl task create --title 'Add login'",
-            "actl task update t1 --title 'New title'",
-            "actl task delete t1",
+            "josi task list",
+            "josi task show t1",
+            "josi task create --title 'Add login'",
+            "josi task update t1 --title 'New title'",
+            "josi task delete t1",
         ]
         for command in commands:
             with self.subTest(command=command):
                 self.assertEqual(self.ruleset.effect("shell", command), "allow")
         # Only the real subcommand is blocked.
-        self.assertEqual(self.ruleset.effect("shell", "actl taskrun"), "ask")
-        self.assertEqual(self.ruleset.effect("shell", "actl tasks run t1"), "ask")
+        self.assertEqual(self.ruleset.effect("shell", "josi taskrun"), "ask")
+        self.assertEqual(self.ruleset.effect("shell", "josi tasks run t1"), "ask")
 
     def test_task_commands_cannot_redirect_output_to_files(self):
         # OpenCode reports a redirected statement as a single resource string,
-        # so "actl task ... > file" would match the management pre-approval.
+        # so "josi task ... > file" would match the management pre-approval.
         # The redirect deny is placed after the pre-approval (last match wins)
         # so a silently allowed command can never write or overwrite a file.
         commands = [
-            "actl task list > src/main.py",
-            "actl task list >> out.txt",
-            "actl task list 2>&1",
-            "actl task show t1 > report.txt",
-            "actl task create --title x > result.txt",
+            "josi task list > src/main.py",
+            "josi task list >> out.txt",
+            "josi task list 2>&1",
+            "josi task show t1 > report.txt",
+            "josi task create --title x > result.txt",
             "echo hi > src/main.py",
             "git status > log.txt",
         ]
@@ -188,14 +188,14 @@ class PlannerRulesTests(ActlTestCase):
     def test_task_allow_stops_at_the_command_boundary(self):
         # Only the documented management forms are pre-approved; bare task
         # commands and lookalikes are not.
-        self.assertEqual(self.ruleset.effect("shell", "actl task list"), "allow")
-        self.assertEqual(self.ruleset.effect("shell", "actl task"), "deny")
-        self.assertEqual(self.ruleset.effect("shell", "actl tasks list"), "ask")
-        self.assertEqual(self.ruleset.effect("shell", "actl-task list"), "ask")
+        self.assertEqual(self.ruleset.effect("shell", "josi task list"), "allow")
+        self.assertEqual(self.ruleset.effect("shell", "josi task"), "deny")
+        self.assertEqual(self.ruleset.effect("shell", "josi tasks list"), "ask")
+        self.assertEqual(self.ruleset.effect("shell", "josi-task list"), "ask")
         self.assertEqual(self.ruleset.effect("shell", "acctl task list"), "ask")
 
     def test_read_only_inspection_and_questions_are_preserved(self):
-        self.assertEqual(self.ruleset.effect("read", "src/actl/cli.py"), "allow")
+        self.assertEqual(self.ruleset.effect("read", "src/josi/cli.py"), "allow")
         self.assertEqual(self.ruleset.effect("read", ".env"), "ask")
         self.assertEqual(self.ruleset.effect("read", ".env.local"), "ask")
         self.assertEqual(self.ruleset.effect("read", ".env.example"), "allow")
@@ -205,12 +205,12 @@ class PlannerRulesTests(ActlTestCase):
 
     def test_editing_and_unknown_tools_are_denied(self):
         cases = [
-            ("edit", "src/actl/cli.py"),
-            ("write", "src/actl/cli.py"),
-            ("patch", "src/actl/cli.py"),
+            ("edit", "src/josi/cli.py"),
+            ("write", "src/josi/cli.py"),
+            ("patch", "src/josi/cli.py"),
             ("subagent", "general"),
             ("webfetch", "https://example.com"),
-            ("websearch", "actl documentation"),
+            ("websearch", "josi documentation"),
             ("todowrite", "*"),
             ("skill", "*"),
             ("execute", "*"),
@@ -225,13 +225,13 @@ class PlannerRulesTests(ActlTestCase):
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
-class PlannerInstructionsTests(ActlTestCase):
-    """The planner instructions document the real actl task CLI."""
+class PlannerInstructionsTests(JosiTestCase):
+    """The planner instructions document the real josi task CLI."""
 
     def setUp(self):
         super().setUp()
         self.initialize()
-        result = self.run_actl("plan")
+        result = self.run_josi("plan")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.content = self.agent_path().read_text(encoding="utf-8")
 
@@ -239,10 +239,10 @@ class PlannerInstructionsTests(ActlTestCase):
         for subcommand in ("create", "list", "show", "update", "delete"):
             with self.subTest(subcommand=subcommand):
                 # The documented command exists and has this exact syntax.
-                help_result = self.run_actl("task", subcommand, "--help")
+                help_result = self.run_josi("task", subcommand, "--help")
                 self.assertEqual(help_result.returncode, 0, help_result.stderr)
-                self.assertIn("usage: actl task " + subcommand, help_result.stdout)
-                self.assertIn("actl task " + subcommand, self.content)
+                self.assertIn("usage: josi task " + subcommand, help_result.stdout)
+                self.assertIn("josi task " + subcommand, self.content)
 
     def test_documents_the_actual_task_options(self):
         for option in (
@@ -264,7 +264,7 @@ class PlannerInstructionsTests(ActlTestCase):
             "acceptance criteria",
             "description",
             "depends",
-            "never open .actl/tasks.db",
+            "never open .josi/tasks.db",
             "Do not modify project code",
             "Do not execute implementation tasks",
         ):
@@ -278,34 +278,34 @@ class PlannerInstructionsTests(ActlTestCase):
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
-class PlannerTaskWorkflowTests(ActlTestCase):
+class PlannerTaskWorkflowTests(JosiTestCase):
     """Task management through the commands the planner is allowed to run."""
 
     def setUp(self):
         super().setUp()
         self.initialize()
-        result = self.run_actl("plan")
+        result = self.run_josi("plan")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.ruleset = Ruleset(self.planner_rules())
         self.src = self.repo / "src"
         self.src.mkdir()
         (self.src / "main.py").write_text("print('hello')\n", encoding="utf-8")
         (self.repo / "acceptance.md").write_text(
-            "Run `actl task list` and check the new task appears.\n", encoding="utf-8"
+            "Run `josi task list` and check the new task appears.\n", encoding="utf-8"
         )
 
     def task_db(self):
-        return self.repo / ".actl" / "tasks.db"
+        return self.repo / ".josi" / "tasks.db"
 
     def planner_command(self, *args):
         """Run a task command exactly as the planner would: only if allowed."""
-        command = shlex.join(["actl", *args])
+        command = shlex.join(["josi", *args])
         self.assertEqual(
             self.ruleset.effect("shell", command),
             "allow",
             "the planner may not run: " + command,
         )
-        return self.run_actl(*args)
+        return self.run_josi(*args)
 
     def test_workflow_creates_updates_deletes_and_persists_tasks(self):
         source_before = (self.src / "main.py").read_bytes()
@@ -424,7 +424,7 @@ class PlannerTaskWorkflowTests(ActlTestCase):
         self.planner_command("task", "create", "--title", "One")
         self.planner_command("task", "list")
 
-        result = self.run_actl("plan")
+        result = self.run_josi("plan")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertIn("Started planner session", result.stdout)
         self.assertNotIn("Resuming", result.stdout)
@@ -435,7 +435,7 @@ class PlannerTaskWorkflowTests(ActlTestCase):
         # Anything not pre-approved makes the workflow helper refuse to run,
         # and a redirected statement is denied outright, never asked.
         self.assertEqual(
-            self.ruleset.effect("shell", "actl task list > src/main.py"), "deny"
+            self.ruleset.effect("shell", "josi task list > src/main.py"), "deny"
         )
         with self.assertRaises(AssertionError):
             self.planner_command("task", "list", ">", "src/main.py")

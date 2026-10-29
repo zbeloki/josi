@@ -3,15 +3,15 @@ requires = ["setuptools>=61"]
 build-backend = "setuptools.build_meta"
 
 [project]
-name = "actl"
+name = "josi"
 version = "0.7.0"
-description = "Lightweight CLI for orchestrating AI coding agents through OpenCode"
+description = "Lightweight CLI for orchestrating AI coding agents"
 readme = "README.md"
 requires-python = ">=3.9"
 dependencies = []
 
 [project.scripts]
-actl = "actl.cli:main"
+josi = "josi.cli:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]

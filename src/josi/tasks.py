@@ -1,22 +1,22 @@
-"""SQLite-backed task storage for actl.
+"""SQLite-backed task storage for josi.
 
 Stage 2 keeps the project's tasks in a small SQLite database at
-``.actl/tasks.db``. The schema has five tables: ``tasks``, ``dependencies``,
+``.josi/tasks.db``. The schema has five tables: ``tasks``, ``dependencies``,
 ``reviews``, ``runs``, and ``usage``. There is no BLOCKED status - whether a
 task is blocked is derived from its dependencies when needed. A task's status
 is PENDING, RUNNING, IMPLEMENTED, FAILED, APPROVED, NEEDS_CHANGES,
-NEEDS_HUMAN, STAGED, or DONE; only ``actl task run`` moves a task between
-them, except that the explicit ``actl task reset`` intervention returns a
+NEEDS_HUMAN, STAGED, or DONE; only ``josi task run`` moves a task between
+them, except that the explicit ``josi task reset`` intervention returns a
 task to PENDING.
 
 Stage 7 groups executions into runs: a run row records the run branch, its
 status (RUNNING while executing, COMPLETE once every selected task was staged,
-INTEGRATED after ``actl run merge``), the base branch it started from, its
+INTEGRATED after ``josi run merge``), the base branch it started from, its
 start and expected commits, and its final commit. The expected commit is the
 commit the run branch is allowed to point at: the start commit, advanced only
 by successfully staged, reviewer-approved tasks. A task that was approved and
 fast-forwarded into its run branch is STAGED and keeps the id of that run in
-``tasks.run_id``; ``actl run merge`` turns its STAGED tasks DONE once the run
+``tasks.run_id``; ``josi run merge`` turns its STAGED tasks DONE once the run
 branch is part of the base branch. The ``run_selection`` table records which
 tasks each run is responsible for, so a failed batch stays resumable in the
 same run and a run is only COMPLETE when its whole selection is staged.
@@ -70,7 +70,7 @@ RUN_RUNNING = "RUNNING"
 RUN_COMPLETE = "COMPLETE"
 RUN_INTEGRATED = "INTEGRATED"
 RUN_STATUSES = (RUN_RUNNING, RUN_COMPLETE, RUN_INTEGRATED)
-RUN_BRANCH_PREFIX = "actl/run/"
+RUN_BRANCH_PREFIX = "josi/run/"
 REVIEW_APPROVED = "approved"
 REVIEW_CHANGES_REQUESTED = "changes_requested"
 REVIEW_DECISIONS = (REVIEW_APPROVED, REVIEW_CHANGES_REQUESTED)
@@ -157,7 +157,7 @@ class Task:
     """A stored task plus the ids it depends on (sorted ascending).
 
     ``run_id`` is the run a STAGED task is staged in; it stays recorded after
-    ``actl run merge`` turns the task DONE so the association between a run
+    ``josi run merge`` turns the task DONE so the association between a run
     and its tasks survives integration.
     """
 
@@ -178,7 +178,7 @@ class Run:
     ``status`` is RUNNING while the run executes (an interrupted or stopped
     execution stays RUNNING until it is resumed), COMPLETE once every
     selected task was staged and the final commit was recorded, and
-    INTEGRATED after ``actl run merge`` fast-forwarded the run branch into
+    INTEGRATED after ``josi run merge`` fast-forwarded the run branch into
     the configured base branch.
 
     ``expected_commit`` is the only commit the run branch may point at: the
@@ -370,8 +370,8 @@ def update_task(conn, task_id: int, title=None, description=None, depends_on=Non
 def set_task_status(conn, task_id: int, status: str) -> Task:
     """Set the task's status and return the task.
 
-    Only the statuses actl defines are accepted; the caller decides which
-    transitions are legal (``actl task run`` moves tasks between them).
+    Only the statuses josi defines are accepted; the caller decides which
+    transitions are legal (``josi task run`` moves tasks between them).
     """
     if status not in STATUSES:
         raise TaskError("invalid task status " + repr(status))
@@ -428,7 +428,7 @@ def record_usage(
 ) -> None:
     """Store one invocation's usage with its task and run attribution.
 
-    ``usage`` is an :class:`actl.usage.Usage`: its ``None`` fields are stored
+    ``usage`` is an :class:`josi.usage.Usage`: its ``None`` fields are stored
     as NULL so an unavailable amount is never confused with a zero one.
     """
     with conn:
@@ -515,7 +515,7 @@ def unfinished_dependencies(conn, task_id: int, run_id=None) -> list:
     branch through an integrated run) or by ``STAGED`` in the run the
     dependent is currently executing in: the dependency's approved commit is
     already in that same run branch. A dependency STAGED in any other run is
-    not satisfied - it must first be marked DONE through ``actl run merge``.
+    not satisfied - it must first be marked DONE through ``josi run merge``.
     """
     return [
         (row["depends_on_id"], row["status"], row["run_id"])
@@ -615,7 +615,7 @@ def running_run(conn):
 
     At most one run executes at a time, so a RUNNING run means the project's
     last execution was interrupted before it finished; the next
-    ``actl task run`` resumes it instead of creating a new one.
+    ``josi task run`` resumes it instead of creating a new one.
     """
     row = conn.execute(
         "SELECT * FROM runs WHERE status = ? ORDER BY id DESC LIMIT 1",
@@ -628,7 +628,7 @@ def complete_run(conn, run_id: int, final_commit: str) -> Run:
     """Record the run's final commit and mark it COMPLETE.
 
     COMPLETE means execution stopped: the run branch is frozen at the
-    recorded commit and ``actl run merge`` may fast-forward it into the base
+    recorded commit and ``josi run merge`` may fast-forward it into the base
     branch (a run stopped by a task failure is completed too, so its staged
     work can be integrated explicitly).
     """
@@ -698,8 +698,8 @@ def reset_task(conn, task_id: int) -> Task:
     task behaves like a newly created one. Dependencies, title, description,
     and timestamps are preserved.
 
-    The worker attempt budget (``.actl/attempts/tN``) and the task branch and
-    worktree are owned by :mod:`actl.execution` and are cleared by the caller;
+    The worker attempt budget (``.josi/attempts/tN``) and the task branch and
+    worktree are owned by :mod:`josi.execution` and are cleared by the caller;
     this function only touches the database.
     """
     with conn:

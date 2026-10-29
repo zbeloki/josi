@@ -5,7 +5,7 @@ project's configured validation commands run sequentially inside the task
 worktree. The first non-zero exit stops the run and fails the task; every
 command's output and exit code is written to a validation log.
 
-Configuration lives in the project's existing metadata (``.actl/project.json``)::
+Configuration lives in the project's existing metadata (``.josi/project.json``)::
 
     {
       "validation": {

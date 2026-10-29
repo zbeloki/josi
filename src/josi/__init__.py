@@ -1,0 +1,3 @@
+"""josi - a lightweight CLI for orchestrating AI coding agents with OpenCode."""
+
+__version__ = "0.7.0"

@@ -1,15 +1,15 @@
 """Per-invocation OpenCode usage capture and cost derivation.
 
-actl records how many tokens each OpenCode invocation used and what it cost,
+josi records how many tokens each OpenCode invocation used and what it cost,
 so a task's usage can accumulate across worker attempts, reviews, and
 format retries of either the reviewer or the test writer, and across CLI
 invocations. The raw numbers come from
 OpenCode's own session metadata (``GET /api/session/<id>``: the session's
-cumulative ``cost`` and ``tokens``); actl turns a session's cumulative totals
+cumulative ``cost`` and ``tokens``); josi turns a session's cumulative totals
 into one invocation's usage by subtracting the totals read before the turn.
 
 Costs are used exactly as OpenCode reports them when available. When OpenCode
-reports tokens but no cost, actl derives the input and output costs from the
+reports tokens but no cost, josi derives the input and output costs from the
 model's pricing metadata (``GET /api/model``). When neither is available the
 amount is recorded as unavailable rather than as zero, so a missing value can
 never be mistaken for a free invocation. A usage record keeps the raw token
@@ -21,7 +21,7 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Optional
 
-# Invocation stages actl attributes usage to.
+# Invocation stages josi attributes usage to.
 STAGE_TEST_WRITER = "test_writer"
 STAGE_TEST_WRITER_FORMAT_RETRY = "test_writer_format_retry"
 STAGE_WORKER = "worker"
@@ -36,7 +36,7 @@ USAGE_UNAVAILABLE = "unavailable"
 COST_REPORTED = "reported"
 COST_DERIVED = "derived"
 
-# Accumulated-cost states shown by ``actl task show`` and ``actl run show``.
+# Accumulated-cost states shown by ``josi task show`` and ``josi run show``.
 # ``unavailable`` means no usage was recorded at all, ``incomplete`` means
 # some amount is missing, and ``complete`` means every amount is known.
 TOTALS_COMPLETE = "complete"
@@ -154,7 +154,7 @@ def subtract(after: Usage, before: Optional[Usage]) -> Usage:
 def pricing_from_models(model: str, models) -> Optional[Pricing]:
     """Return the pricing for ``model`` from OpenCode's model list, or None.
 
-    ``model`` is actl's ``provider/model`` (optionally ``#variant``) form.
+    ``model`` is josi's ``provider/model`` (optionally ``#variant``) form.
     The variant never changes a model's price, so it is ignored here. A model
     whose pricing metadata is missing or incomplete yields None rather than a
     partial price.
@@ -242,7 +242,7 @@ def format_lines(usage: Usage) -> list:
 def format_totals(totals) -> list:
     """Return the cost summary lines for accumulated usage totals.
 
-    ``totals`` is the mapping returned by :func:`actl.tasks.usage_totals`.
+    ``totals`` is the mapping returned by :func:`josi.tasks.usage_totals`.
     Only costs are shown here; per-invocation token counts stay in the logs.
     A total that no record carried is spelled ``unavailable``, and a total
     known only in part is flagged ``incomplete``, so a missing amount is

@@ -17,7 +17,7 @@ import unittest
 
 from test_verification import VerificationTestCase
 
-from actl import tasks
+from josi import tasks
 
 
 def token_counts(input, output=0, reasoning=0, cache_read=0, cache_write=0):
@@ -56,11 +56,11 @@ class UsageTestCase(VerificationTestCase):
         super().setUp()
         # The test-writer stage gets its own named model, so its usage rows
         # and pricing are as uniform as the other stages'.
-        result = self.run_actl("init", "--test-writer-model", "tests/model")
+        result = self.run_josi("init", "--test-writer-model", "tests/model")
         self.assertEqual(result.returncode, 0, result.stderr)
 
     def set_pricing(self, models=None):
-        self.env["ACTL_FAKE_MODEL_LIST"] = json.dumps(
+        self.env["JOSI_FAKE_MODEL_LIST"] = json.dumps(
             PRICING if models is None else models
         )
 
@@ -68,14 +68,14 @@ class UsageTestCase(VerificationTestCase):
         payload = {"tokens": counts}
         if cost is not None:
             payload["cost"] = cost
-        self.env["ACTL_FAKE_SESSION_USAGE"] = json.dumps(payload)
+        self.env["JOSI_FAKE_SESSION_USAGE"] = json.dumps(payload)
 
     def set_session_sequence(self, entries, name="usage-count"):
-        self.env["ACTL_FAKE_SESSION_USAGE_SEQUENCE"] = json.dumps(entries)
-        self.env["ACTL_FAKE_SESSION_USAGE_COUNT_FILE"] = str(self.base / name)
+        self.env["JOSI_FAKE_SESSION_USAGE_SEQUENCE"] = json.dumps(entries)
+        self.env["JOSI_FAKE_SESSION_USAGE_COUNT_FILE"] = str(self.base / name)
 
     def usage_rows(self, task_id=1):
-        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
         try:
             return tasks.task_usage(conn, task_id)
         finally:
@@ -95,7 +95,7 @@ class UsageTestCase(VerificationTestCase):
         return rows[0]
 
     def run_usage_rows(self, run_id=1):
-        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
         try:
             return tasks.run_usage(conn, run_id)
         finally:
@@ -220,14 +220,14 @@ class UsageCaptureTests(UsageTestCase):
 
     def test_retries_record_each_attempt_separately(self):
         self.set_pricing()
-        self.env["ACTL_FAKE_REVIEW_SEQUENCE"] = json.dumps([
+        self.env["JOSI_FAKE_REVIEW_SEQUENCE"] = json.dumps([
             {"decision": "changes_requested", "findings": [{
                 "severity": "major", "description": "Broken.",
                 "scenario": "s", "impact": "i", "location": "f.py",
             }]},
             {"decision": "approved", "findings": []},
         ])
-        self.env["ACTL_FAKE_REVIEW_COUNT_FILE"] = str(self.base / "review-count")
+        self.env["JOSI_FAKE_REVIEW_COUNT_FILE"] = str(self.base / "review-count")
         # One lookup per invocation: test writer, worker 1, review 1,
         # worker 2, review 2. Every session is fresh, so each value is that
         # invocation's own usage.
@@ -260,11 +260,11 @@ class UsageCaptureTests(UsageTestCase):
 
     def test_review_format_retry_is_attributed_separately(self):
         self.set_pricing()
-        self.env["ACTL_FAKE_REVIEW_SEQUENCE"] = json.dumps([
+        self.env["JOSI_FAKE_REVIEW_SEQUENCE"] = json.dumps([
             "not a JSON verdict",
             {"decision": "approved", "findings": []},
         ])
-        self.env["ACTL_FAKE_REVIEW_COUNT_FILE"] = str(self.base / "review-count")
+        self.env["JOSI_FAKE_REVIEW_COUNT_FILE"] = str(self.base / "review-count")
         # The reviewer session is reused for the retry, so its cumulative
         # totals grow: the second lookup's difference is the retry's usage.
         self.set_session_sequence([
@@ -298,12 +298,12 @@ class UsageCaptureTests(UsageTestCase):
     def test_test_writer_format_retry_is_attributed_separately(self):
         self.set_pricing()
         decision = {"decision": "tests_written", "summary": "added"}
-        self.env["ACTL_FAKE_TESTS_SEQUENCE"] = json.dumps([
+        self.env["JOSI_FAKE_TESTS_SEQUENCE"] = json.dumps([
             {"behavior": "commit",
              "message": "Tests pass.\n\n" + json.dumps(decision)},
             {"message": json.dumps(decision)},
         ])
-        self.env["ACTL_FAKE_TESTS_COUNT_FILE"] = str(self.base / "tests-count")
+        self.env["JOSI_FAKE_TESTS_COUNT_FILE"] = str(self.base / "tests-count")
         # The test-writer session is reused for the retry, so its cumulative
         # totals grow: the second lookup's difference is the retry's usage.
         self.set_session_sequence([
@@ -344,7 +344,7 @@ class UsagePersistenceTests(UsageTestCase):
         # First invocation: the worker fails before any review, but its usage
         # is still recorded.
         self.set_session_usage(0.01, token_counts(1000))
-        self.env["ACTL_FAKE_RUN_EXIT"] = "1"
+        self.env["JOSI_FAKE_RUN_EXIT"] = "1"
         self.make_task()
         first = self.run_task("t1")
         self.assertNotEqual(first.returncode, 0)
@@ -353,7 +353,7 @@ class UsagePersistenceTests(UsageTestCase):
         self.assertAlmostEqual(workers[0].cost_total, 0.01)
 
         # Second invocation: the worker completes and the reviewer approves.
-        del self.env["ACTL_FAKE_RUN_EXIT"]
+        del self.env["JOSI_FAKE_RUN_EXIT"]
         self.set_session_usage(0.02, token_counts(2000))
         second = self.run_task("t1")
         self.assertEqual(second.returncode, 0, second.stderr)
@@ -371,7 +371,7 @@ class UsagePersistenceTests(UsageTestCase):
         self.make_task()
         self.assertEqual(self.run_task("t1").returncode, 0)
 
-        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
         try:
             run_rows = tasks.run_usage(conn, 1)
             self.assertEqual(len(run_rows), 3)
@@ -385,18 +385,18 @@ class UsagePersistenceTests(UsageTestCase):
 
 
 class UsageSummaryTests(UsageTestCase):
-    """``actl task show`` and ``actl run show`` display accumulated costs."""
+    """``josi task show`` and ``josi run show`` display accumulated costs."""
 
     def test_task_show_accumulates_across_retries(self):
         self.set_pricing()
-        self.env["ACTL_FAKE_REVIEW_SEQUENCE"] = json.dumps([
+        self.env["JOSI_FAKE_REVIEW_SEQUENCE"] = json.dumps([
             {"decision": "changes_requested", "findings": [{
                 "severity": "major", "description": "Broken.",
                 "scenario": "s", "impact": "i", "location": "f.py",
             }]},
             {"decision": "approved", "findings": []},
         ])
-        self.env["ACTL_FAKE_REVIEW_COUNT_FILE"] = str(self.base / "review-count")
+        self.env["JOSI_FAKE_REVIEW_COUNT_FILE"] = str(self.base / "review-count")
         self.set_session_sequence([
             {"cost": 0.005, "tokens": token_counts(500, output=50)},
             {"cost": 0.01, "tokens": token_counts(1000, output=100)},
@@ -411,7 +411,7 @@ class UsageSummaryTests(UsageTestCase):
         self.assertEqual([row.stage for row in records], [
             "test_writer", "worker", "review", "worker", "review",
         ])
-        shown = self.run_actl("task", "show", "t1")
+        shown = self.run_josi("task", "show", "t1")
         self.assertEqual(shown.returncode, 0, shown.stderr)
         self.assert_cost_summary(shown.stdout, records, "complete")
         # The task totals are the sum of every attempt, and no per-invocation
@@ -424,10 +424,10 @@ class UsageSummaryTests(UsageTestCase):
     def test_task_show_accumulates_across_cli_invocations(self):
         self.set_pricing()
         self.set_session_usage(0.01, token_counts(1000))
-        self.env["ACTL_FAKE_RUN_EXIT"] = "1"
+        self.env["JOSI_FAKE_RUN_EXIT"] = "1"
         self.make_task()
         self.assertNotEqual(self.run_task("t1").returncode, 0)
-        del self.env["ACTL_FAKE_RUN_EXIT"]
+        del self.env["JOSI_FAKE_RUN_EXIT"]
         self.set_session_usage(0.02, token_counts(2000))
         self.assertEqual(self.run_task("t1").returncode, 0)
 
@@ -436,7 +436,7 @@ class UsageSummaryTests(UsageTestCase):
         # second ran the worker and the review, with the completed
         # test-generation stage skipped.
         self.assertEqual(len(records), 4, "both invocations keep their usage")
-        shown = self.run_actl("task", "show", "t1")
+        shown = self.run_josi("task", "show", "t1")
         self.assertEqual(shown.returncode, 0, shown.stderr)
         self.assert_cost_summary(shown.stdout, records, "complete")
         self.assertAlmostEqual(
@@ -450,13 +450,13 @@ class UsageSummaryTests(UsageTestCase):
         self.make_task()
         self.assertEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(self.integrate("r1").returncode, 0)
-        created = self.run_actl("task", "create", "--title", "Second")
+        created = self.run_josi("task", "create", "--title", "Second")
         self.assertEqual(created.returncode, 0, created.stderr)
         self.set_session_usage(0.07, token_counts(3000))
         second_run = self.run_task("t2")
         self.assertEqual(second_run.returncode, 0, second_run.stderr)
 
-        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
         try:
             first_rows = tasks.run_usage(conn, 1)
             second_rows = tasks.run_usage(conn, 2)
@@ -470,13 +470,13 @@ class UsageSummaryTests(UsageTestCase):
         )
         self.assertEqual({row.task_id for row in second_rows}, {2})
 
-        first = self.run_actl("run", "show", "r1")
+        first = self.run_josi("run", "show", "r1")
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assert_cost_summary(first.stdout, first_rows, "complete")
         self.assertAlmostEqual(
             float(self.cost_field(first.stdout, "cost_total")), 0.03
         )
-        second = self.run_actl("run", "show", "r2")
+        second = self.run_josi("run", "show", "r2")
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assert_cost_summary(second.stdout, second_rows, "complete")
         self.assertAlmostEqual(
@@ -485,13 +485,13 @@ class UsageSummaryTests(UsageTestCase):
 
     def test_show_with_no_recorded_usage_is_not_a_confirmed_zero(self):
         self.make_task()
-        conn = tasks.connect(self.repo / ".actl" / "tasks.db")
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
         try:
             tasks.create_run(conn, "main", self.base_sha, [1])
         finally:
             conn.close()
 
-        shown = self.run_actl("task", "show", "t1")
+        shown = self.run_josi("task", "show", "t1")
         self.assertEqual(shown.returncode, 0, shown.stderr)
         self.assertEqual(
             self.cost_field(shown.stdout, "cost_status"), "unavailable"
@@ -501,7 +501,7 @@ class UsageSummaryTests(UsageTestCase):
         )
         self.assertNotIn("0.000000", shown.stdout)
 
-        run_show = self.run_actl("run", "show", "r1")
+        run_show = self.run_josi("run", "show", "r1")
         self.assertEqual(run_show.returncode, 0, run_show.stderr)
         self.assertEqual(
             self.cost_field(run_show.stdout, "cost_status"), "unavailable"
@@ -518,12 +518,12 @@ class UsageSummaryTests(UsageTestCase):
         self.assertEqual(self.run_task("t1").returncode, 0)
 
         records = self.usage_rows()
-        shown = self.run_actl("task", "show", "t1")
+        shown = self.run_josi("task", "show", "t1")
         self.assertEqual(shown.returncode, 0, shown.stderr)
         self.assert_cost_summary(shown.stdout, records, "unavailable")
         self.assertNotIn("0.000000", shown.stdout)
 
-        run_show = self.run_actl("run", "show", "r1")
+        run_show = self.run_josi("run", "show", "r1")
         self.assertEqual(run_show.returncode, 0, run_show.stderr)
         self.assert_cost_summary(run_show.stdout, self.run_usage_rows(), "unavailable")
         self.assertNotIn("0.000000", run_show.stdout)
@@ -535,7 +535,7 @@ class UsageSummaryTests(UsageTestCase):
         self.make_task()
         self.assertEqual(self.run_task("t1").returncode, 0)
 
-        shown = self.run_actl("task", "show", "t1")
+        shown = self.run_josi("task", "show", "t1")
         self.assertEqual(shown.returncode, 0, shown.stderr)
         self.assertEqual(
             self.cost_field(shown.stdout, "cost_total"), "0.060000"
@@ -550,7 +550,7 @@ class UsageSummaryTests(UsageTestCase):
             self.cost_field(shown.stdout, "cost_status"), "incomplete"
         )
 
-        run_show = self.run_actl("run", "show", "r1")
+        run_show = self.run_josi("run", "show", "r1")
         self.assertEqual(
             self.cost_field(run_show.stdout, "cost_status"), "incomplete"
         )

@@ -1,7 +1,7 @@
 """Minimal wrapper around the OpenCode CLI.
 
-actl delegates everything session-related to OpenCode: OpenCode owns the
-session store, the conversation transcripts, and the interactive TUI. actl
+josi delegates everything session-related to OpenCode: OpenCode owns the
+session store, the conversation transcripts, and the interactive TUI. josi
 only creates a project-scoped session, verifies where an existing session
 lives, and launches the TUI against it.
 
@@ -11,9 +11,9 @@ The integration targets the OpenCode v2 CLI (tested with 2.1.2):
   explicit location (``{"location": {"directory": "<project root>"}}``) using
   a given agent and returns the generated session ID. Creating the session
   explicitly is necessary because the TUI creates sessions lazily and would
-  otherwise generate an ID actl cannot capture.
+  otherwise generate an ID josi cannot capture.
 * ``opencode api GET /api/session/<id>`` returns session metadata, including
-  the directory the session belongs to and the selected agent, so actl can
+  the directory the session belongs to and the selected agent, so josi can
   refuse to resume a session that does not belong to the project and can
   re-select the planner agent on sessions created before it existed.
 * ``opencode api POST /api/session/<id>/agent --data {"agent": ...}`` switches
@@ -23,12 +23,12 @@ The integration targets the OpenCode v2 CLI (tested with 2.1.2):
 * ``opencode run --agent <agent> --model <provider/model> --session <id>
   "<message>"`` runs one noninteractive turn: OpenCode executes the message
   with the given agent and model, prints the transcript to stdout/stderr, and
-  exits with status 0 when the turn succeeded. Actl uses this to run the
+  exits with status 0 when the turn succeeded. Josi uses this to run the
   worker (the built-in ``build`` agent) inside a task worktree; a permission
   that would ask the user in a TUI is auto-rejected in a noninteractive run,
   so the worker never blocks on a prompt.
 * ``opencode run ... --format json`` prints the turn as JSONL events instead
-  of a rendered transcript. actl uses this for the reviewer (the built-in
+  of a rendered transcript. josi uses this for the reviewer (the built-in
   read-only ``plan`` agent), so the final message - the structured verdict -
   can be read back without scraping the rendered output.
 
@@ -140,7 +140,7 @@ def session_usage(binary: str, directory: Path, session_id: str, env=None) -> di
 def model_list(binary: str, directory: Path, env=None) -> list:
     """Return the models OpenCode knows about, with their pricing metadata.
 
-    ``GET /api/model`` reports every available model; actl reads the cost of
+    ``GET /api/model`` reports every available model; josi reads the cost of
     the model it launched to derive input/output costs when OpenCode did not
     report a cost itself.
     """
@@ -194,8 +194,8 @@ def run_headless(
 
     The transcript is streamed into ``output`` (a writable file object); the
     turn's stdout and stderr are merged so the log keeps the original order.
-    ``pass_fds`` are kept open in the OpenCode process - actl passes the
-    execution lock file descriptor so the lock outlives an actl crash.
+    ``pass_fds`` are kept open in the OpenCode process - josi passes the
+    execution lock file descriptor so the lock outlives a Josi crash.
     ``agent`` selects the OpenCode agent; ``output_format`` selects the CLI
     output format (``"json"`` makes the reviewer's final message machine
     readable). ``env`` is the process environment; when omitted, the

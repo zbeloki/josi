@@ -46,8 +46,9 @@ josi run show r1            # show one run, its commits, and its tasks
 josi run merge r1           # integrate a completed run into the base branch
 ```
 
-- `josi init` requires a Git repository, creates `.josi/project.json`, and adds
-  `.josi/` to `.gitignore` (existing `.gitignore` content is preserved).
+- `josi init` requires a Git repository, creates `josi.json`, and adds
+  `.josi/` and `/josi.json` to the root `.gitignore` (existing content is
+  preserved).
   Running it again is harmless. It also checks that OpenCode is installed.
   It always records all four model settings, so a project is ready to run a
   task right away. Without an argument each setting gets a default:
@@ -85,7 +86,7 @@ josi run merge r1           # integrate a completed run into the base branch
 
 ## Agent backends
 
-A project runs on one agent CLI, stored as `agent` in `.josi/project.json`:
+A project runs on one agent CLI, stored as `agent` in `josi.json`:
 `opencode` (the default, also assumed for projects created before the setting
 existed), `claude`, or `codex`. Every role - planner, worker, reviewer, escalation
 worker, and test writer - uses it.
@@ -589,7 +590,7 @@ josi init --worker-model provider/model#variant   # with a model variant
 josi init --agent claude --worker-model sonnet#low
 ```
 
-It is stored as `worker_model` in `.josi/project.json` as a model/effort pair
+It is stored as `worker_model` in `josi.json` as a model/effort pair
 (the file may be edited directly as well) and defaults to the agent's worker
 default (see "Agent backends") when `josi init` runs without
 `--worker-model`. `josi task run` requires it whenever the worker
@@ -604,7 +605,7 @@ The escalation worker model is project configuration required for every run:
 josi init --escalation-worker-model openrouter/anthropic/claude-opus-latest
 ```
 
-It is stored as `escalation_worker_model` in `.josi/project.json` and defaults
+It is stored as `escalation_worker_model` in `josi.json` and defaults
 to the agent's escalation default when `josi init` runs without
 `--escalation-worker-model`. It is used
 for the third and final worker attempt of a repair cycle. `josi task run`
@@ -620,7 +621,7 @@ The reviewer model is configured independently:
 josi init --reviewer-model openrouter/anthropic/claude-sonnet-latest
 ```
 
-It is stored as `reviewer_model` in `.josi/project.json` and defaults to
+It is stored as `reviewer_model` in `josi.json` and defaults to
 the agent's reviewer default when `josi init` runs without
 `--reviewer-model`. `josi task run`
 requires it: without a reviewer model the command fails before taking the
@@ -634,7 +635,7 @@ The test-writer model is project configuration required for every run:
 josi init --test-writer-model openrouter/deepseek/deepseek-v4.1-flash#low
 ```
 
-It is stored as `test_writer_model` in `.josi/project.json` and defaults to
+It is stored as `test_writer_model` in `josi.json` and defaults to
 the agent's test-writer default when `josi init` runs without
 `--test-writer-model`. `josi task run` requires it exactly like the reviewer
 and escalation models: without one the run fails before taking the execution
@@ -664,7 +665,7 @@ All four settings are written by every `josi init`: a setting that is omitted
 keeps the value already stored, and a default is filled in only when no value
 is stored yet. Passing an argument overrides just that setting, so a single
 re-init can change one model without disturbing the others. The stored values
-may also be edited directly in `.josi/project.json`.
+may also be edited directly in `josi.json`.
 
 The base branch is project-level configuration too:
 
@@ -672,7 +673,7 @@ The base branch is project-level configuration too:
 josi init --base develop
 ```
 
-It is stored as `base_branch` in `.josi/project.json` (the file may be edited
+It is stored as `base_branch` in `josi.json` (the file may be edited
 directly as well). Without `--base`, `josi init` uses the remote default
 branch (`origin/HEAD`) when the matching local branch exists, otherwise
 `main` or `master` when exactly one of them exists; when the choice is
@@ -889,7 +890,7 @@ the existing commits.
 
 ## Validation and review
 
-Validation commands are project configuration in `.josi/project.json`:
+Validation commands are project configuration in `josi.json`:
 
 ```json
 {
@@ -1127,7 +1128,7 @@ variables such as `OPENCODE_CONFIG_CONTENT`, which Josi never sets or alters.
 ### OpenCode configuration and provider routing
 
 Josi does not configure OpenCode or choose a provider route: it only passes the
-model names stored in `.josi/project.json` (for example
+model names stored in `josi.json` (for example
 `openrouter/anthropic/claude-sonnet-latest`) and leaves everything else to
 OpenCode. Provider-routing preferences, such as OpenRouter provider ordering or
 price sorting, are therefore not a Josi default. To set one, use OpenCode's own
@@ -1137,11 +1138,15 @@ Josi-launched processes pick it up like any other OpenCode run.
 
 ## Project files
 
+Existing users must run `josi init` again and manually transfer desired settings
+from `.josi/project.json` to the root `josi.json`. Josi does not read or migrate
+the old configuration. Task databases, logs, and worktrees remain in `.josi/`.
+
 ```
+josi.json          # personal configuration: schema_version, name, agent,
+                   # worker_model, reviewer_model, escalation_worker_model,
+                   # test_writer_model, validation.commands, base_branch, created_at
 .josi/
-├── project.json    # schema_version, name, agent, worker_model, reviewer_model,
-│                   # escalation_worker_model, test_writer_model,
-│                   # validation.commands, base_branch, created_at
 ├── tasks.db        # SQLite database (tasks, dependencies, reviews,
 │                   # runs, run selections, per-invocation usage)
 ├── execution.lock  # project-wide execution lock (fcntl.flock)
@@ -1247,9 +1252,9 @@ an environment supplied by the caller reaches OpenCode unchanged.
 - Every `josi plan` starts a fresh planner session; earlier sessions remain
   available inside the agent CLI.
 - Josi must be run from inside the project. It locates the Git repository
-  root (even from a subdirectory) and requires `.josi/` there, so a nested
-  Git repository is never treated as part of its parent's Josi project.
-- Josi writes its managed files (`.josi/`, `.gitignore`, and the planner
+  root (even from a subdirectory) and requires `josi.json` and `.josi/` there,
+  so a nested Git repository is never treated as part of its parent's Josi project.
+- Josi writes its managed files (`josi.json`, `.josi/`, `.gitignore`, and the planner
   agent) with plain file writes that follow symlinks. A repository containing
   a hostile symlink at one of those paths can redirect the write. Run Josi
   only in trusted repositories. Accepted for Stage 1.

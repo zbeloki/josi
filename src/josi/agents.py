@@ -1,6 +1,6 @@
 """Agent backends: the CLIs josi drives to plan, implement, and review.
 
-A project selects one backend (``agent`` in ``.josi/project.json``) and every
+A project selects one backend (``agent`` in ``josi.json``) and every
 role - planner, worker, reviewer, escalation worker, test writer - runs on it.
 Backends include:
 

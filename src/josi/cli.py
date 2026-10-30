@@ -105,7 +105,7 @@ from . import (
 )
 
 PROJECT_DIR = ".josi"
-PROJECT_METADATA = "project.json"
+PROJECT_METADATA = "josi.json"
 SCHEMA_VERSION = 1
 GITIGNORE_ENTRY = ".josi/"
 PLANNER_TITLE = "Josi planner"
@@ -332,10 +332,10 @@ def git_toplevel(start: Path) -> Path:
 
 
 def load_project_metadata(root: Path) -> dict:
-    """Load and validate ``.josi/project.json``."""
-    path = root / PROJECT_DIR / PROJECT_METADATA
+    """Load and validate ``josi.json``."""
+    path = root / PROJECT_METADATA
     if not path.is_file():
-        raise MetadataError("missing " + str(path))
+        raise MetadataError("missing " + str(path) + "; run 'josi init' first")
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, UnicodeDecodeError, json.JSONDecodeError) as exc:
@@ -577,19 +577,20 @@ def _run_base_branch(root: Path, metadata: dict) -> str:
 
 
 def ensure_gitignore(root: Path) -> None:
-    """Make sure ``.josi/`` is ignored, preserving existing bytes exactly."""
+    """Ignore personal configuration and execution state, preserving existing bytes."""
     path = root / ".gitignore"
-    entry = GITIGNORE_ENTRY.encode("utf-8")
     try:
-        if path.exists():
-            content = path.read_bytes()
-            lines = [line.strip() for line in content.splitlines()]
-            if entry in lines or entry.rstrip(b"/") in lines:
-                return
+        content = path.read_bytes() if path.exists() else b""
+        lines = [line.strip() for line in content.splitlines()]
+        missing = []
+        entry = GITIGNORE_ENTRY.encode("utf-8")
+        if entry not in lines and entry.rstrip(b"/") not in lines:
+            missing.append(entry)
+        if b"/josi.json" not in lines:
+            missing.append(b"/josi.json")
+        if missing:
             separator = b"" if content == b"" or content.endswith(b"\n") else b"\n"
-            path.write_bytes(content + separator + entry + b"\n")
-        else:
-            path.write_bytes(entry + b"\n")
+            path.write_bytes(content + separator + b"\n".join(missing) + b"\n")
     except OSError as exc:
         raise ProjectError("could not update " + str(path) + " (" + str(exc) + ")")
 
@@ -622,7 +623,7 @@ def cmd_init(args) -> int:
     except ProjectError as exc:
         return _fail(str(exc))
     josi_dir = root / PROJECT_DIR
-    metadata_path = josi_dir / PROJECT_METADATA
+    metadata_path = root / PROJECT_METADATA
     metadata = None
     if metadata_path.exists():
         try:
@@ -630,7 +631,7 @@ def cmd_init(args) -> int:
         except MetadataError as exc:
             return _fail(
                 "existing josi metadata is invalid (" + str(exc) + "); "
-                "remove '" + str(josi_dir) + "' and re-run 'josi init'"
+                "remove '" + str(metadata_path) + "' and re-run 'josi init'"
             )
     stored_agent = project_agent(metadata) if metadata is not None else None
     agent = args.agent or stored_agent or agents.DEFAULT_AGENT
@@ -791,7 +792,7 @@ def _project_root() -> Path:
     """Return the project root, requiring a valid initialized Josi project.
 
     The Git repository root is resolved first and must contain a valid
-    ``.josi/project.json``, so no command can read or write another project's
+    ``josi.json``, so no command can read or write another project's
     state - not even from a nested repository.
     """
     root = git_toplevel(Path.cwd())

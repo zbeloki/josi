@@ -361,7 +361,28 @@ The same Git safeguards apply. Only staged work is integrated and marked
 `DONE`; pending tasks remain available for a new run. The original selection
 and `partially_integrated: true` in `josi run show r1` remain recorded even
 after those remaining tasks execute in later runs. Repeating the merge safely
-finishes any interrupted status updates.
+finishes any interrupted status updates and reports the recorded partial
+integration with the remaining tasks' current statuses. Reset discards the
+existing attempt budget, branch, and worktree; merge never performs it.
+
+For example, an interrupted run `r1` selected `t1`, `t2`, and `t3`: `t1` is
+`STAGED`, `t2` is `RUNNING`, and `t3` is still `PENDING`. The user explicitly
+discards the unfinished attempt before integrating the staged work:
+
+```sh
+josi run show r1
+josi task reset t2
+josi run merge r1 --partial
+josi run show r1
+josi task run t2 t3
+josi run merge r2
+```
+
+The partial merge marks `t1` `DONE` and leaves `t2` and `t3` `PENDING`.
+Their later execution creates a new run `r2` from the updated base branch
+(assuming it is the next run), with a fresh attempt budget for `t2`. The
+original `r1` selection and partial-integration flag remain visible after
+`r2` completes and is integrated.
 
 `josi run merge r1` fast-forwards a completed run into the configured base
 branch and transitions its `STAGED` tasks to `DONE`. The command is
@@ -371,7 +392,7 @@ idempotent and detects a manual integration:
   already `DONE`) and the run branch pointed at the expected commit when the
   run finished. A failed batch stays `RUNNING`; resume it with
   `josi task run ...` to finish it, or explicitly use `--partial` as described
-  below. The recorded
+  above. The recorded
   final commit is the verified expected commit, never whatever the branch
   happened to hold when execution stopped.
 - If the recorded final commit is already an ancestor of the base branch -
@@ -439,8 +460,8 @@ immediately. The run branch, task worktrees, logs, and the already staged
 work are preserved; the run stays `RUNNING`, the failing task is reported,
 and the command exits non-zero. `josi task run ...` resumes that same run,
 so the remaining selected tasks continue from the staged work and the whole
-plan finishes in isolation. `josi run merge` refuses an unfinished run: no
-partial plan is ever integrated automatically or by accident.
+plan finishes in isolation. `josi run merge` refuses an unfinished run by default. Explicit
+`--partial` integration requires the reset-first workflow described above.
 
 Only one unfinished, unmerged run may exist. A stopped or interrupted run
 stays `RUNNING` and the next `josi task run ...` resumes it, so a failed

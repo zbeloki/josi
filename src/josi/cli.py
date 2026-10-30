@@ -1024,6 +1024,10 @@ def cmd_run_show(args) -> int:
     print("created_at: " + run.created_at)
     print("updated_at: " + run.updated_at)
     _print_costs(totals)
+    print("selection: " + (", ".join(
+        "t" + str(task.id) for task in associated
+    ) or "(none)"))
+    print("Task statuses below are current, including execution in later runs.")
     print("tasks:")
     if not associated:
         print("(none)")
@@ -1091,6 +1095,8 @@ def _merge_run(
             + (("; marked " + ", ".join("t" + str(i) for i in done) + " DONE")
                if done else "")
         )
+        if run.partially_integrated:
+            _print_partial_integration(josi_dir, run)
         return 0
     partial = partial or run.partially_integrated
     if partial:
@@ -1107,7 +1113,11 @@ def _merge_run(
                 "cannot partially integrate run r" + str(run.id) + ": "
                 + ", ".join("t" + str(task.id) + " (" + task.status + ")"
                             for task in blocked)
-                + "; reset these tasks yourself with 'josi task reset tN' first"
+                + "; reset these tasks yourself first: "
+                + "; ".join("josi task reset t" + str(task.id) for task in blocked)
+                + ". Reset discards the existing attempt budget, branch, and"
+                " worktree. Merge never resets tasks automatically; no task"
+                " state has been changed. Then retry with --partial."
             )
         if not run.partially_integrated and not any(
             task.status == tasks.STATUS_STAGED for task in selected
@@ -1197,7 +1207,33 @@ def _merge_run(
         + ("; " + ", ".join("t" + str(i) for i in done) + " \u2192 DONE"
            if done else "")
     )
+    if partial:
+        _print_partial_integration(josi_dir, run)
     return 0
+
+
+def _print_partial_integration(josi_dir: Path, run) -> None:
+    """Describe this run separately from later execution of its selection."""
+    conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
+    try:
+        selected = tasks.selected_tasks(conn, run.id)
+        integrated = tasks.run_tasks(conn, run.id)
+    finally:
+        conn.close()
+    print("Partial integration recorded for run r" + str(run.id) + ".")
+    print("Integrated tasks: " + (", ".join(
+        "t" + str(task.id) for task in integrated
+    ) or "(none)"))
+    remaining = [task for task in selected if task.run_id != run.id]
+    print("Tasks outside this integration (current status): " + (", ".join(
+        "t" + str(task.id) + " (" + task.status + ")" for task in remaining
+    ) or "(none)"))
+    pending = [task for task in remaining if task.status == tasks.STATUS_PENDING]
+    print("Tasks left pending: " + (", ".join(
+        "t" + str(task.id) for task in pending
+    ) or "(none)"))
+    if pending:
+        print("Execute pending tasks later in a new run with josi task run --all")
 
 
 def _finish_run_tasks(josi_dir: Path, run) -> list:
@@ -3300,11 +3336,16 @@ def build_parser() -> argparse.ArgumentParser:
     run_merge = run_sub.add_parser(
         "merge",
         help="fast-forward a completed run into the configured base branch",
+        description="By default, merge requires a finished selection (COMPLETE run). "
+        "Merge never resets tasks automatically.",
     )
     run_merge.add_argument("id", help="run id (rN or N)")
     run_merge.add_argument(
         "--partial", action="store_true",
-        help="integrate staged work after unfinished tasks have been reset",
+        help="integrate staged work only when every selected task is STAGED, DONE, "
+        "or PENDING, with at least one STAGED task. Explicitly reset unfinished "
+        "attempted tasks first with josi task reset tN; reset discards the existing "
+        "attempt budget, branch, and worktree. Pending tasks execute later in a new run",
     )
     return parser
 

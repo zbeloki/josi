@@ -1024,6 +1024,16 @@ class IntegrationOutputTests(IntegrationTestCase):
 
 
 class PartialIntegrationTests(IntegrationTestCase):
+    def test_merge_help_explains_reset_first_eligibility(self):
+        result = self.run_josi("run", "merge", "--help")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        output = " ".join(result.stdout.split())
+        for text in ("--partial", "finished selection", "STAGED, DONE, or PENDING",
+                     "at least one STAGED", "josi task reset tN",
+                     "attempt budget, branch, and worktree", "never resets",
+                     "later in a new run"):
+            self.assertIn(text, output)
+
     def interrupted_run(self):
         self.create("First")
         self.create("Remaining")
@@ -1045,12 +1055,19 @@ class PartialIntegrationTests(IntegrationTestCase):
         self.assertNotEqual(refused.returncode, 0)
         result = self.partial()
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Integrated tasks: t1", result.stdout)
+        self.assertIn("Tasks left pending: t2", result.stdout)
+        self.assertIn("later in a new run", result.stdout)
         self.assertEqual(self.task_status("t1"), "DONE")
         self.assertEqual(self.task_status("t2"), "PENDING")
         self.assertEqual(self.run_status(), "INTEGRATED")
         self.assertEqual(self.run_show()["partially_integrated"], "true")
         for command in (self.partial, self.integrate):
-            self.assertEqual(command().returncode, 0)
+            repeated = command()
+            self.assertEqual(repeated.returncode, 0, repeated.stderr)
+            self.assertIn("already integrated", repeated.stdout)
+            self.assertIn("Partial integration recorded", repeated.stdout)
+            self.assertIn("Tasks left pending: t2", repeated.stdout)
         result = self.run_task("t2")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.run_status("r2"), "COMPLETE")
@@ -1058,6 +1075,15 @@ class PartialIntegrationTests(IntegrationTestCase):
         self.assertIn("t2  STAGED", self.run_show()["output"])
         self.assertEqual(self.integrate().returncode, 0)
         self.assertEqual(self.task_status("t2"), "STAGED")
+        self.assertEqual(self.integrate("r2").returncode, 0)
+        shown = self.run_show()
+        self.assertEqual(shown["partially_integrated"], "true")
+        self.assertEqual(shown["selection"], "t1, t2")
+        self.assertIn("t2  DONE", shown["output"])
+        repeated = self.partial()
+        self.assertIn("Integrated tasks: t1\n", repeated.stdout)
+        self.assertIn("t2 (DONE)", repeated.stdout)
+        self.assertIn("Tasks left pending: (none)", repeated.stdout)
         conn = tasks.connect(self.repo / ".josi" / "tasks.db")
         try:
             self.assertEqual([task.id for task in tasks.selected_tasks(conn, 1)], [1, 2])
@@ -1183,7 +1209,10 @@ class PartialIntegrationTests(IntegrationTestCase):
                 result = self.partial()
                 self.assertNotEqual(result.returncode, 0)
                 self.assertIn("t2 (" + status + ")", result.stderr)
-                self.assertIn("josi task reset", result.stderr)
+                self.assertIn("josi task reset t2", result.stderr)
+                self.assertIn("attempt budget, branch, and worktree", result.stderr)
+                self.assertIn("Merge never resets tasks automatically", result.stderr)
+                self.assertIn("Then retry with --partial", result.stderr)
                 self.assertEqual(self.task_status("t2"), status)
                 self.assertEqual(self.task_status("t1"), "STAGED")
                 self.assertEqual(self.git("rev-parse", "main").stdout, before)

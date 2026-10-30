@@ -1023,5 +1023,156 @@ class IntegrationOutputTests(IntegrationTestCase):
         self.assertTrue(self.run_worktree().is_dir())
 
 
+class PartialIntegrationTests(IntegrationTestCase):
+    def interrupted_run(self):
+        self.create("First")
+        self.create("Remaining")
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
+        try:
+            tasks.select_run_tasks(conn, 1, [2])
+            tasks.set_run_status(conn, 1, tasks.RUN_RUNNING)
+        finally:
+            conn.close()
+
+    def partial(self):
+        return self.run_josi("run", "merge", "r1", "--partial")
+
+    def test_partial_closes_run_and_preserves_history_after_remaining_execution(self):
+        self.interrupted_run()
+        refused = self.integrate()
+        self.assertNotEqual(refused.returncode, 0)
+        result = self.partial()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status("t1"), "DONE")
+        self.assertEqual(self.task_status("t2"), "PENDING")
+        self.assertEqual(self.run_status(), "INTEGRATED")
+        self.assertEqual(self.run_show()["partially_integrated"], "true")
+        for command in (self.partial, self.integrate):
+            self.assertEqual(command().returncode, 0)
+        result = self.run_task("t2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.run_status("r2"), "COMPLETE")
+        self.assertEqual(self.run_show()["partially_integrated"], "true")
+        self.assertIn("t2  STAGED", self.run_show()["output"])
+        self.assertEqual(self.integrate().returncode, 0)
+        self.assertEqual(self.task_status("t2"), "STAGED")
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
+        try:
+            self.assertEqual([task.id for task in tasks.selected_tasks(conn, 1)], [1, 2])
+            run = tasks.get_run(conn, 1)
+            self.assertEqual(run.final_commit, run.expected_commit)
+            self.assertTrue(run.partially_integrated)
+        finally:
+            conn.close()
+
+    def test_all_unsafe_selected_statuses_require_explicit_reset(self):
+        self.interrupted_run()
+        before = self.git("rev-parse", "main").stdout
+        for status in tasks.STATUSES:
+            if status in ("STAGED", "DONE", "PENDING"):
+                continue
+            with self.subTest(status=status):
+                self.set_task_status(status, 2)
+                conn = tasks.connect(self.repo / ".josi" / "tasks.db")
+                snapshot = conn.execute("SELECT * FROM runs").fetchall()
+                conn.close()
+                result = self.partial()
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("t2 (" + status + ")", result.stderr)
+                self.assertIn("josi task reset", result.stderr)
+                self.assertEqual(self.task_status("t2"), status)
+                self.assertEqual(self.task_status("t1"), "STAGED")
+                self.assertEqual(self.git("rev-parse", "main").stdout, before)
+                conn = tasks.connect(self.repo / ".josi" / "tasks.db")
+                self.assertEqual(conn.execute("SELECT * FROM runs").fetchall(), snapshot)
+                conn.close()
+        result = self.run_josi("task", "reset", "t2")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.partial().returncode, 0)
+
+    def test_no_staged_work_is_refused(self):
+        self.interrupted_run()
+        self.set_task_status("DONE")
+        result = self.partial()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no selected tasks are STAGED", result.stderr)
+        self.assertEqual(self.run_status(), "RUNNING")
+        self.assertEqual(self.git("rev-parse", "main").stdout.strip(), self.base_sha)
+
+    def test_partial_safeguards_and_manual_integration_recovery(self):
+        self.interrupted_run()
+        expected = self.git("rev-parse", "josi/run/r1").stdout.strip()
+        self.dirty_base()
+        self.assertNotEqual(self.partial().returncode, 0)
+        self.clean_base()
+        self.assertEqual(self.run_status(), "RUNNING")
+        self.assertEqual(self.run_show()["partially_integrated"], "false")
+        self.git("reset", "--hard", self.base_sha, cwd=self.run_worktree())
+        self.assertIn("moved after", self.partial().stderr)
+        self.git("reset", "--hard", expected, cwd=self.run_worktree())
+        self.git("merge", "--ff-only", "josi/run/r1")
+        self.git("worktree", "remove", str(self.run_worktree()))
+        self.git("branch", "-D", "josi/run/r1")
+        result = self.partial()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("merged by hand", result.stdout)
+        self.assertEqual(self.task_status(), "DONE")
+        self.assertEqual(self.run_show()["partially_integrated"], "true")
+
+    def test_retry_after_interrupted_status_finalization(self):
+        from unittest.mock import patch
+        from josi import cli
+
+        self.interrupted_run()
+        with patch.object(cli, "_finish_run_tasks", side_effect=RuntimeError("interrupted")):
+            with self.assertRaisesRegex(RuntimeError, "interrupted"):
+                cli._merge_run(self.repo, self.repo / ".josi", 1, "main", True)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(self.run_status(), "RUNNING")
+        # Also cover interruption after the last STAGED task became DONE.
+        self.set_task_status("DONE")
+        result = self.integrate()
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.run_status(), "INTEGRATED")
+        self.assertEqual(self.task_status("t2"), "PENDING")
+        self.assertEqual(self.run_show()["partially_integrated"], "true")
+
+    def test_partial_preserves_lock_and_fast_forward_safeguards(self):
+        from josi import execution
+
+        self.interrupted_run()
+        with execution.lock(self.repo / ".josi"):
+            result = self.partial()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(self.run_status(), "RUNNING")
+        (self.repo / "unrelated.txt").write_text("base advanced\n")
+        self.commit("Advance base")
+        before = self.git("rev-parse", "main").stdout
+        result = self.partial()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("manual Git integration required", result.stderr)
+        self.assertEqual(self.git("rev-parse", "main").stdout, before)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(self.run_status(), "RUNNING")
+        self.assertEqual(self.run_show()["partially_integrated"], "false")
+
+    def test_partial_requires_recorded_expected_commit(self):
+        self.interrupted_run()
+        conn = tasks.connect(self.repo / ".josi" / "tasks.db")
+        try:
+            with conn:
+                conn.execute("UPDATE runs SET expected_commit = NULL WHERE id = 1")
+        finally:
+            conn.close()
+        result = self.partial()
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("no expected commit", result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(self.run_status(), "RUNNING")
+        self.assertEqual(self.git("rev-parse", "main").stdout.strip(), self.base_sha)
+
+
 if __name__ == "__main__":
     unittest.main()

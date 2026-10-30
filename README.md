@@ -352,6 +352,17 @@ merges only the exact commit the reviewer approved:
 
 ### Integrating a run
 
+To close an interrupted run without finishing its selection, first reset
+unfinished tasks yourself with `josi task reset tN`, then execute
+`josi run merge r1 --partial`. Every selected task must be `STAGED`, `DONE`,
+or `PENDING`, with at least one `STAGED` task. Other statuses block the command
+and identify tasks needing a reset; Josi never resets them automatically.
+The same Git safeguards apply. Only staged work is integrated and marked
+`DONE`; pending tasks remain available for a new run. The original selection
+and `partially_integrated: true` in `josi run show r1` remain recorded even
+after those remaining tasks execute in later runs. Repeating the merge safely
+finishes any interrupted status updates.
+
 `josi run merge r1` fast-forwards a completed run into the configured base
 branch and transitions its `STAGED` tasks to `DONE`. The command is
 idempotent and detects a manual integration:
@@ -359,7 +370,8 @@ idempotent and detects a manual integration:
 - The run must be `COMPLETE`: every task selected for it was staged (or was
   already `DONE`) and the run branch pointed at the expected commit when the
   run finished. A failed batch stays `RUNNING`; resume it with
-  `josi task run ...` instead of integrating a partial plan. The recorded
+  `josi task run ...` to finish it, or explicitly use `--partial` as described
+  below. The recorded
   final commit is the verified expected commit, never whatever the branch
   happened to hold when execution stopped.
 - If the recorded final commit is already an ancestor of the base branch -

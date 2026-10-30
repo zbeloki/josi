@@ -88,6 +88,7 @@ CREATE TABLE IF NOT EXISTS runs (
     start_commit TEXT NOT NULL,
     expected_commit TEXT,
     final_commit TEXT,
+    partially_integrated INTEGER NOT NULL DEFAULT 0,
     created_at TEXT NOT NULL,
     updated_at TEXT NOT NULL
 );
@@ -178,14 +179,17 @@ class Run:
     ``status`` is RUNNING while the run executes (an interrupted or stopped
     execution stays RUNNING until it is resumed), COMPLETE once every
     selected task was staged and the final commit was recorded, and
-    INTEGRATED after ``josi run merge`` fast-forwarded the run branch into
+    INTEGRATED after ``josi run merge`` integrated the recorded commit into
     the configured base branch.
 
     ``expected_commit`` is the only commit the run branch may point at: the
     start commit, advanced atomically by every successful staging. A run
-    branch found anywhere else is refused instead of trusted, and the
-    recorded final commit is always this verified value - never whatever the
-    branch happens to point at when execution stops.
+    branch found anywhere else is refused instead of trusted. The recorded
+    final commit is always this verified value - never whatever the branch
+    happens to point at when execution stops.
+
+    ``partially_integrated`` records explicit partial integration permanently,
+    independently of later changes to the selected tasks.
     """
 
     id: int
@@ -197,6 +201,7 @@ class Run:
     expected_commit: object
     created_at: str
     updated_at: str
+    partially_integrated: bool = False
 
 
 @dataclass(frozen=True)
@@ -274,6 +279,11 @@ def _migrate(conn) -> None:
         if "run_id" not in columns:
             conn.execute(
                 "ALTER TABLE tasks ADD COLUMN run_id INTEGER REFERENCES runs(id)"
+            )
+        if "partially_integrated" not in run_columns:
+            conn.execute(
+                "ALTER TABLE runs ADD COLUMN partially_integrated INTEGER"
+                " NOT NULL DEFAULT 0"
             )
         if "expected_commit" not in run_columns:
             conn.execute("ALTER TABLE runs ADD COLUMN expected_commit TEXT")
@@ -643,6 +653,21 @@ def complete_run(conn, run_id: int, final_commit: str) -> Run:
     return get_run(conn, run_id)
 
 
+def record_partial_integration(conn, run_id: int, commit: str) -> Run:
+    """Record confirmed Git integration before finalizing task statuses.
+
+    Keeping this durable makes retries safe even if task finalization stops
+    midway. The original run selection is never changed.
+    """
+    with conn:
+        conn.execute(
+            "UPDATE runs SET partially_integrated = 1, final_commit = ?,"
+            " updated_at = ? WHERE id = ?",
+            (commit, _utc_now(), run_id),
+        )
+    return get_run(conn, run_id)
+
+
 def set_run_status(conn, run_id: int, status: str) -> Run:
     """Set the run's status and return the run."""
     if status not in RUN_STATUSES:
@@ -838,6 +863,7 @@ def _to_run(row) -> Run:
         start_commit=row["start_commit"],
         final_commit=row["final_commit"],
         expected_commit=row["expected_commit"],
+        partially_integrated=bool(row["partially_integrated"]),
         created_at=row["created_at"],
         updated_at=row["updated_at"],
     )

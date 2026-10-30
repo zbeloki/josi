@@ -87,7 +87,7 @@ import sqlite3
 import subprocess
 import sys
 from contextlib import contextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -1017,6 +1017,7 @@ def cmd_run_show(args) -> int:
     print("id: r" + str(run.id))
     print("status: " + run.status)
     print("branch: " + run.branch)
+    print("partially_integrated: " + str(run.partially_integrated).lower())
     print("base_branch: " + run.base_branch)
     print("start_commit: " + run.start_commit)
     print("final_commit: " + (run.final_commit or "(none)"))
@@ -1032,7 +1033,7 @@ def cmd_run_show(args) -> int:
 
 
 def cmd_run_merge(args) -> int:
-    """Integrate a completed run into the configured base branch."""
+    """Integrate a completed run, or explicitly integrate its staged subset."""
     try:
         run_id = _parse_run_id(args.id)
         root = _project_root()
@@ -1043,7 +1044,7 @@ def cmd_run_merge(args) -> int:
         return _fail(str(exc))
     try:
         with execution.lock(josi_dir):
-            return _merge_run(root, josi_dir, run_id, base_branch)
+            return _merge_run(root, josi_dir, run_id, base_branch, args.partial)
     except (
         ProjectError, tasks.TaskError, sqlite3.Error,
         execution.ExecutionError,
@@ -1062,8 +1063,11 @@ def _run_database():
         conn.close()
 
 
-def _merge_run(root: Path, josi_dir: Path, run_id: int, base_branch: str) -> int:
-    """Fast-forward a COMPLETE run into the base branch; idempotent.
+def _merge_run(
+    root: Path, josi_dir: Path, run_id: int, base_branch: str,
+    partial: bool = False,
+) -> int:
+    """Integrate a COMPLETE run or an explicitly requested staged subset.
 
     Three cases keep the command safe to repeat:
 
@@ -1088,7 +1092,33 @@ def _merge_run(root: Path, josi_dir: Path, run_id: int, base_branch: str) -> int
                if done else "")
         )
         return 0
-    if run.status != tasks.RUN_COMPLETE:
+    partial = partial or run.partially_integrated
+    if partial:
+        conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
+        try:
+            selected = tasks.selected_tasks(conn, run.id)
+        finally:
+            conn.close()
+        blocked = [task for task in selected if task.status not in (
+            tasks.STATUS_STAGED, tasks.STATUS_DONE, tasks.STATUS_PENDING,
+        )]
+        if blocked:
+            raise tasks.TaskError(
+                "cannot partially integrate run r" + str(run.id) + ": "
+                + ", ".join("t" + str(task.id) + " (" + task.status + ")"
+                            for task in blocked)
+                + "; reset these tasks yourself with 'josi task reset tN' first"
+            )
+        if not run.partially_integrated and not any(
+            task.status == tasks.STATUS_STAGED for task in selected
+        ):
+            raise tasks.TaskError("cannot partially integrate run r" + str(run.id)
+                                  + ": no selected tasks are STAGED")
+        if not run.expected_commit:
+            raise tasks.TaskError("cannot partially integrate run: no expected commit")
+        # Use only the commit recorded by successful staging, never branch HEAD.
+        run = replace(run, final_commit=run.expected_commit)
+    if not partial and run.status != tasks.RUN_COMPLETE:
         raise tasks.TaskError(
             "cannot integrate run r" + str(run.id) + ": its execution is still"
             " marked " + run.status + " and not every selected task is staged;"
@@ -1140,7 +1170,8 @@ def _merge_run(root: Path, josi_dir: Path, run_id: int, base_branch: str) -> int
             print("  " + str(exc))
             print("")
             print("Integrate the run branch by hand and commit the result, then")
-            print("run 'josi run merge r" + str(run.id) + "' again to finalize"
+            print("run 'josi run merge r" + str(run.id)
+                  + (" --partial" if partial else "") + "' again to finalize"
                   " its status:")
             print(
                 "    git checkout " + base_branch + " && git merge " + run.branch
@@ -1153,6 +1184,12 @@ def _merge_run(root: Path, josi_dir: Path, run_id: int, base_branch: str) -> int
         print(
             "Fast-forwarded run r" + str(run.id) + " into " + base_branch + "."
         )
+    if partial:
+        conn = tasks.connect(josi_dir / tasks.DATABASE_NAME)
+        try:
+            tasks.record_partial_integration(conn, run.id, run.final_commit)
+        finally:
+            conn.close()
     done = _finish_run_tasks(josi_dir, run)
     _set_run_status(josi_dir, run.id, tasks.RUN_INTEGRATED)
     print(
@@ -3265,6 +3302,10 @@ def build_parser() -> argparse.ArgumentParser:
         help="fast-forward a completed run into the configured base branch",
     )
     run_merge.add_argument("id", help="run id (rN or N)")
+    run_merge.add_argument(
+        "--partial", action="store_true",
+        help="integrate staged work after unfinished tasks have been reset",
+    )
     return parser
 
 

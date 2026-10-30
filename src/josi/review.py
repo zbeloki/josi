@@ -44,6 +44,9 @@ Review priorities, in order:
 2. Does it work correctly under normal operating conditions?
 3. Does it handle common failures reasonably?
 4. Does it introduce significant security, correctness, or data-loss risks?
+5. Do meaningful tests cover the requested behavior and relevant failures?
+   Assess test adequacy and flag unjustified coverage reductions or tests
+   weakened or deleted merely to conceal defects.
 
 Focus on changes introduced by the task. Do not audit unrelated code.
 
@@ -174,6 +177,9 @@ def build_prompt(task, base_commit, commit, diff, validation_summary, policy) ->
         "Inspect files in this checkout whenever the diff is not enough"
         " context. Judge the changes this task introduces; use the rest of"
         " the repository only as context.\n"
+        "Assess whether meaningful tests cover the requested behavior and"
+        " relevant failures. Assess test adequacy and unjustified coverage"
+        " reductions, including tests weakened or deleted to conceal defects.\n"
         "\n"
         "Review policy:\n" + policy + "\n"
         "\n"

@@ -20,12 +20,7 @@
 * One noninteractive OpenCode turn runs inside the worktree and its output is
   streamed into a log file under ``.josi/runs/``. Validation and review get
   their own logs in the same directory.
-* Before the first worker attempt, a test-generation turn runs in the same
-  worktree with the project's test-writer model (see :mod:`josi.testgen`):
-  it writes and commits the task's tests, or explicitly decides that the
-  task needs none. Its outcome is recorded in ``.josi/testgen/tN`` so a
-  retry never repeats a completed stage, and the worker prompt instructs
-  the worker to keep the generated tests unchanged.
+* Workers own implementation and relevant tests in the same commits.
 * The reviewer gets a temporary detached worktree under ``.josi/review/``
   (see ``add_review_worktree``), so its checkout can never touch the task
   worktree.
@@ -67,7 +62,6 @@ INTEGRATE_DIR = "integrate"
 BASE_DIR = "base"
 RUNS_DIR = "runs"
 ATTEMPTS_DIR = "attempts"
-TESTGEN_DIR = "testgen"
 #: Total worker attempts a task gets before it needs a human (Stage 6).
 MAX_WORKER_ATTEMPTS = 3
 DEFAULT_BASE_CANDIDATES = ("main", "master")
@@ -483,62 +477,6 @@ def branch_base(josi_dir: Path, task_id: int):
     return commit or None
 
 
-def record_testgen_outcome(josi_dir: Path, task_id: int, decision: str) -> None:
-    """Record that the test-generation stage completed with ``decision``.
-
-    The record is written only after the stage succeeded, so an interrupted
-    or failed stage never suppresses a later one.
-    """
-    path = josi_dir / TESTGEN_DIR / ("t" + str(task_id))
-    payload = {"decision": decision}
-    try:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps(payload, indent=2) + "\n", encoding="utf-8")
-    except OSError as exc:
-        raise ExecutionError(
-            "cannot record the test-generation outcome " + str(path)
-            + " (" + str(exc) + ")"
-        )
-
-
-def testgen_outcome(josi_dir: Path, task_id: int):
-    """Return the recorded test-generation decision, or None.
-
-    A missing record means the stage has not completed yet. A record that
-    cannot be read or parsed is ignored rather than fatal: the stage would
-    simply run again, which a broken marker must never silently prevent.
-    """
-    path = josi_dir / TESTGEN_DIR / ("t" + str(task_id))
-    try:
-        data = json.loads(path.read_text(encoding="utf-8"))
-    except (OSError, UnicodeDecodeError, ValueError):
-        return None
-    if not isinstance(data, dict):
-        return None
-    decision = data.get("decision")
-    return decision if isinstance(decision, str) else None
-
-
-def clear_testgen_outcome(josi_dir: Path, task_id: int) -> None:
-    """Delete the task's recorded test-generation outcome.
-
-    Used only by the explicit ``josi task reset`` intervention: the record
-    belongs to the branch and worktree the reset discards, so keeping it
-    would make the next execution skip a stage that never ran on the fresh
-    branch. A missing record is not an error.
-    """
-    path = josi_dir / TESTGEN_DIR / ("t" + str(task_id))
-    try:
-        path.unlink()
-    except FileNotFoundError:
-        return
-    except OSError as exc:
-        raise ExecutionError(
-            "cannot remove the test-generation outcome " + str(path)
-            + " (" + str(exc) + ")"
-        )
-
-
 def remove_temporary_worktree(root: Path, path: Path) -> str:
     """Remove a temporary worktree; return an error text or "".
 
@@ -829,9 +767,7 @@ def worker_prompt(
     failed validation command and its output, or the blocking reviewer
     findings. The branch is never reset or discarded.
 
-    The instructions always tell the worker to keep the tests the
-    test-generation stage produced: the worker implements the task around
-    the generated tests and never modifies, weakens, or deletes them.
+    Workers own implementation, meaningful tests, and verification together.
     """
     description = task.description.strip() or "(none)"
     lines = [
@@ -863,9 +799,11 @@ def worker_prompt(
         "- Inspect the relevant project files and follow the existing style.",
         "- Modify the code as needed to implement the task, without touching",
         "  unrelated functionality.",
-        "- Do not write, add, modify, weaken, or delete tests. Tests for this",
-        "  task are produced by a separate test-generation stage: keep any",
-        "  existing tests as they are and implement the task so they pass.",
+        "- Add and update meaningful tests, fixtures, and assertions for the",
+        "  requested behavior together with the implementation. Preserve useful",
+        "  coverage; never weaken or delete tests merely to conceal defects.",
+        "- Address validation failures and review findings, including test",
+        "  adequacy and test-related feedback, in subsequent attempts.",
         "- Run the relevant tests or checks to verify your work.",
         "- Commit your changes on the current branch with Git. When you finish,",
         "  the worktree must be clean: no uncommitted or untracked files",

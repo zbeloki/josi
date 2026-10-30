@@ -39,6 +39,8 @@ Explicitly unsupported environments or accepted limitations.
 ## Review rules
 
 - Evaluate likelihood AND impact.
+- Assess meaningful test coverage for the requested behavior and relevant failures.
+- Flag unjustified coverage reductions and tests weakened or deleted to conceal defects.
 - Require a concrete reproduction for blocking findings.
 - Prefer simple fixes over defensive frameworks.
 - Do not recommend speculative hardening.

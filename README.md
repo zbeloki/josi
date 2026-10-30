@@ -50,20 +50,17 @@ josi run merge r1           # integrate a completed run into the base branch
   `.josi/` and `/josi.json` to the root `.gitignore` (existing content is
   preserved).
   Running it again is harmless. It also checks that OpenCode is installed.
-  It always records all four model settings, so a project is ready to run a
+  It always records all three model settings, so a project is ready to run a
   task right away. Without an argument each setting gets a default:
   `worker_model` = `openrouter/deepseek/deepseek-v4.1-flash#low`,
   `reviewer_model` = `openrouter/openai/gpt-6-luna#high`,
-  `escalation_worker_model` = `openrouter/anthropic/claude-sonnet-5.5#medium`,
-  and `test_writer_model` = `openrouter/z-ai/glm-5.3#high`.
+  and `escalation_worker_model` = `openrouter/anthropic/claude-sonnet-5.5#medium`.
   `josi init --worker-model MODEL` overrides the default worker model, for
   example `josi init --worker-model openrouter/anthropic/claude-sonnet-latest`;
   `josi init --reviewer-model MODEL` overrides the independent reviewer's
   model, which `josi task run` requires; and
   `josi init --escalation-worker-model MODEL` overrides the stronger model used
-  for the third and final repair attempt, which `josi task run` also requires;
-  and `josi init --test-writer-model MODEL` overrides the project's test-writer
-  model, required by `josi task run` like the reviewer and escalation models.
+  for the third and final repair attempt, which `josi task run` also requires.
   Re-running `josi init` preserves every model already stored and fills in a
   default only for a setting that is missing; passing an argument updates that
   one setting and leaves the others untouched. It never configures validation
@@ -88,8 +85,8 @@ josi run merge r1           # integrate a completed run into the base branch
 
 A project runs on one agent CLI, stored as `agent` in `josi.json`:
 `opencode` (the default, also assumed for projects created before the setting
-existed), `claude`, or `codex`. Every role - planner, worker, reviewer, escalation
-worker, and test writer - uses it.
+existed), `claude`, or `codex`. Every role - planner, worker, reviewer, and escalation
+worker - uses it.
 
 ```sh
 josi init                      # OpenCode (default)
@@ -109,10 +106,9 @@ its own defaults:
 | worker | `openrouter/deepseek/deepseek-v4.1-flash#low` | `sonnet#low` | `gpt-6.1-sol#low` |
 | reviewer | `openrouter/openai/gpt-6-luna#high` | `opus#medium` | `gpt-6.1-sol#medium` |
 | escalation worker | `openrouter/anthropic/claude-sonnet-5.5#medium` | `opus#medium` | `gpt-6-astra#medium` |
-| test writer | `openrouter/z-ai/glm-5.3#high` | `sonnet#medium` | `gpt-6.1-sol#medium` |
 
 `josi init --agent` on an existing project switches its agent and resets all
-four model settings to the new agent's defaults (models named in the same
+three model settings to the new agent's defaults (models named in the same
 command are kept). Re-running `josi init` without `--agent` keeps the stored
 agent and models. Older projects that store models as `name#effort` strings
 keep working unchanged.
@@ -125,7 +121,7 @@ With `codex`:
 - Model names need no provider prefix. Josi passes `--model` and configures
   `model_reasoning_effort` for `#none`, `#minimal`, `#low`, `#medium`, `#high`,
   or `#xhigh`. Codex reports model-specific effort incompatibilities.
-- Workers, escalation workers, and test writers use `codex exec --json` with
+- Workers and escalation workers use `codex exec --json` with
   prompts on stdin and `--dangerously-bypass-approvals-and-sandbox`. They can
   execute commands without confirmation or sandbox restrictions, matching
   Josi's Claude automation behavior. Use a trusted repository and environment.
@@ -166,7 +162,7 @@ With `claude`:
   are pre-approved, and `josi task run`, `josi task reset`, and `josi run` are
   disallowed. This is best-effort: Claude Code matches shell permissions by
   command prefix. Model selection stays interactive.
-- Workers, the test writer, and the reviewer run as `claude -p` with the
+- Workers and the reviewer run as `claude -p` with the
   prompt on stdin and `--permission-mode bypassPermissions`; the isolated task
   worktree is the boundary. The reviewer additionally disallows the editing
   and web tools. Each turn's answer, tokens, and cost come from the final
@@ -219,19 +215,17 @@ josi task reset t2
   already part of the same run branch). `APPROVED` and `STAGED` in another
   run do not unlock dependents.
 - `josi task review tN` is the way back after you fixed a `NEEDS_HUMAN` task by
-  hand (commit the fix on the task branch first). It runs no test generation
-  and no worker: it validates and reviews the commit already on the task
-  branch. On approval the task is staged exactly as by `josi task run`; if
+  hand (commit the fix on the task branch first). It runs no worker: it validates and reviews the commit
+  already on the task branch. On approval the task is staged exactly as by `josi task run`; if
   the reviewer still requests changes, the findings are reported and the task
   stays `NEEDS_HUMAN`. It also accepts `FAILED` and `IMPLEMENTED` tasks, takes
   the execution lock, and neither spends nor refunds worker attempts.
 - `josi task reset tN` starts a task over: it clears the task's worker attempt
-  budget (`.josi/attempts/tN`), the recorded test-generation outcome
-  (`.josi/testgen/tN`), returns its status to `PENDING`, clears its run
+  budget (`.josi/attempts/tN`), returns its status to `PENDING`, clears its run
   association, deletes its stored reviews, and discards its task branch and
   worktree (including any uncommitted work), so the next execution creates a
-  fresh branch from the run branch like a new task and runs test generation
-  again. Dependencies, title, and description are preserved. The worktree is
+  fresh branch from the run branch like a new task. Dependencies, title, and description
+  are preserved. The worktree is
   removed before any state is discarded, so a failed cleanup leaves the task
   untouched and the reset can be retried. It is an explicit human intervention
   - not a planning command - so it takes the project-wide execution lock and
@@ -250,8 +244,7 @@ josi task reset t2
 ## Running tasks
 
 `josi task run` executes tasks end to end inside a **run**: a
-test-generation turn writes the task's tests first, a noninteractive OpenCode
-worker implements each task in an isolated Git worktree, the project's
+noninteractive OpenCode worker implements each task and its tests in an isolated Git worktree, the project's
 validation commands run on the worker's commit, an independent reviewer
 approves or rejects that exact commit, and the approved commit is
 fast-forwarded into the run branch, which marks the task `STAGED`. The
@@ -270,8 +263,8 @@ josi run merge r1         # integrate the completed run into the base branch
 
 One run goes through these steps:
 
-1. The project must be initialized with a reviewer model, an escalation
-   worker model, and a test-writer model, and the task must exist, be
+1. The project must be initialized with a reviewer model and an escalation
+   worker model, and the task must exist, be
    runnable, and have all its dependencies satisfied (`DONE`, or `STAGED` in
    the run being executed). A task that starts the worker also needs the
    worker model; without one of the required models the command refuses
@@ -292,32 +285,19 @@ One run goes through these steps:
    from the base branch, so a task starts from the previous staged task's
    result. They are created the first time the task runs in this run - never
    at `josi task create`.
-5. Before the first worker attempt, a test-generation turn runs in the task
-   worktree with the project's test-writer model and the built-in `build`
-   agent. It decides whether the task needs automated tests: it either
-   writes and commits them on the task branch, or explicitly decides that no
-   tests are needed and changes nothing. A final message that is not one
-   JSON object is reformatted once, like the reviewer's verdict. The
-   generated tests stay committed on the task branch: the worker implements
-   the task around them, and the project's configured validation commands
-   exercise them after the worker - Josi never runs the tests itself, and
-   validation stays optional when no commands are configured. A completed
-   stage is recorded (and never repeated on a retry); an execution error, an
-   invalid outcome, uncommitted changes, or a dirty worktree fails the task
-   instead of starting the worker.
-6. OpenCode runs one noninteractive turn inside the worktree with the
+5. OpenCode runs one noninteractive turn inside the worktree with the
    project's worker model and the built-in `build` agent
    (`opencode run --agent build --model MODEL --session ID`). A repair
    attempt uses the escalation model on the third attempt and carries the
    previous failure as feedback; the worker continues on the same branch and
    Josi never resets the branch or discards earlier commits.
-7. The worker's complete stdout and stderr are written straight into a log
+6. The worker's complete stdout and stderr are written straight into a log
    file under `.josi/runs/` while it runs; the log path is printed when the
    worker starts, so the run can be followed with `tail -f <logfile>`.
-8. After the worker succeeds, the configured validation commands run in the
+7. After the worker succeeds, the configured validation commands run in the
    task worktree (see below) and an independent reviewer examines the
    validated commit in a temporary worktree.
-9. An approval marks the task `APPROVED` and Josi stages it: the exact
+8. An approval marks the task `APPROVED` and Josi stages it: the exact
    validated and approved commit is fast-forwarded into the run branch (see
    below) and the task becomes `STAGED`. A failed validation command or a
    rejection with critical or major findings starts the next worker attempt
@@ -340,7 +320,7 @@ worker, validation, and review and attempts to stage the recorded approved
 commit into the run.
 
 The terminal shows only Josi's own timestamped events - task, models,
-worktree preparation, test-writer start and outcome, worker start, worker
+worktree preparation, worker start, worker
 exit code, validation start and result, reviewer start and verdict, the
 staging merge, and the final task status - plus the log paths and the final
 reminder with the `josi run merge` command. Transcripts and validation output
@@ -471,23 +451,9 @@ If you already merged r1 manually, execute the
 same command to finalize its status.
 ```
 
-The worker prompt contains the task title, its description, and the worker
-instructions: implement the task, keep the tests the test-generation stage
-wrote unchanged, run the relevant checks, commit the changes on the branch,
-keep the worktree clean, and never merge into the run branch.
-
-The test writer receives the task title and description in the task worktree
-with its own instructions: decide whether the task needs automated tests, and
-either write and commit them (running them to verify they pass) or explicitly
-decide that no tests are needed and change nothing. It must end its turn with
-exactly one JSON decision - `tests_written` or `no_tests_needed` - which is
-parsed strictly like the reviewer's verdict; prose, several objects, and
-unknown decisions are refused. A final message that is not one JSON object is
-reformatted once by the same session, like the reviewer's verdict: the
-correction may only restate the decision, and a turn that changes the branch
-fails the stage. `tests_written` counts only together with committed changes,
-`no_tests_needed` succeeds without requiring a commit, and either way the
-worktree must be clean before the worker starts.
+The worker prompt contains the task title, description, and instructions to
+implement the task with meaningful tests, verify behavior, address findings,
+commit changes, keep the worktree clean, and never merge into the run branch.
 
 The lifecycle is:
 
@@ -629,39 +595,18 @@ execution lock, creating a worktree, or changing the task, instead of
 silently skipping the independent review. An `IMPLEMENTED` task is validated
 and reviewed without launching the worker again.
 
-The test-writer model is project configuration required for every run:
+Workers add and update meaningful tests, fixtures, and assertions alongside
+implementation, run relevant checks, and address validation and review feedback.
+Useful coverage must be preserved; tests must never be weakened or deleted to
+conceal defects. Reviewers assess test adequacy and unjustified coverage reductions.
+Configured validation remains optional and runs after the worker.
 
-```sh
-josi init --test-writer-model openrouter/deepseek/deepseek-v4.1-flash#low
-```
+Obsolete model settings are ignored without modifying existing configuration.
+Historical test-generation markers are ignored on resume and retained as artifacts.
+Existing commits and consumed worker attempts are preserved, including after a
+previously failed test-generation stage. No separate test-generation session runs.
 
-It is stored as `test_writer_model` in `josi.json` and defaults to
-the agent's test-writer default when `josi init` runs without
-`--test-writer-model`. `josi task run` requires it exactly like the reviewer
-and escalation models: without one the run fails before taking the execution
-lock, creating a worktree, or changing the task.
-
-The model drives the **test-generation stage**: a separate noninteractive
-OpenCode turn with the built-in `build` agent that runs in the task worktree
-before the first worker attempt (`opencode run --agent build --model MODEL
---session ID --format json "<prompt>"`). The turn's transcript goes into its
-own timestamped log (`.josi/runs/t1-<timestamp>-tests.log`) and its usage is
-recorded under the distinct `test_writer` stage. When the stage succeeds, its
-decision is recorded in `.josi/testgen/t1` and never repeated - not on a
-worker retry, and not after the attempt budget was deliberately reset. A
-stage that was interrupted before it completed (no recorded decision and no
-committed changes on the task branch) runs again on the next execution;
-committed changes on the task branch from any earlier work always skip it.
-
-The stage itself never runs the generated tests. After the worker succeeds,
-the project's configured validation commands run in the task worktree, where
-the test-writer commit is already part of the branch, so those commands
-exercise the generated tests like any other project check. Validation
-commands are project configuration and stay optional: with no commands
-configured, validation is skipped and the run continues with review, and
-`josi init` never adds pytest or any other validation command by default.
-
-All four settings are written by every `josi init`: a setting that is omitted
+All three settings are written by every `josi init`: a setting that is omitted
 keeps the value already stored, and a default is filled in only when no value
 is stored yet. Passing an argument overrides just that setting, so a single
 re-init can change one model without disturbing the others. The stored values
@@ -690,8 +635,7 @@ the next `josi init`, and `josi task run` keeps working by detecting the
 branch without writing metadata.
 
 Every stage writes its own log: `.josi/runs/t1-<timestamp>.log` for the
-worker, `.josi/runs/t1-<timestamp>-tests.log` for the test-generation stage
-that runs before the first worker attempt, plus
+worker, plus
 `.josi/runs/t1-<timestamp>-validation.log` and
 `.josi/runs/t1-<timestamp>-review.log` when those stages run. Each log starts
 with a header (task, attempt, model, branch, commit) and ends with the result
@@ -702,8 +646,7 @@ the final summary; use `tail -f` to watch a run.
 
 ### Usage and cost reporting
 
-Every worker attempt, test-generation turn, review, and format retry of
-either the test writer or the reviewer reads its usage from OpenCode's
+Every worker attempt, review, and review format retry reads its usage from OpenCode's
 session metadata (`GET /api/session/<id>`),
 which reports the session's cumulative `cost` and token counts. For a reused
 session, Josi subtracts the cumulative totals read before the turn from the
@@ -711,7 +654,7 @@ totals read after it; for a fresh session, the reported totals are that
 turn's usage. Each invocation's token counts (input, output, reasoning,
 cache read, and cache write) and available cost data are written to that
 invocation's log and stored in `.josi/tasks.db` with its task id, run id,
-stage (`worker`, `test_writer`, `test_writer_format_retry`, `review`, or
+stage (`worker`, `review`, or
 `review_format_retry`), and attempt.
 
 The `cost_total` is OpenCode's reported cost when OpenCode provides one. When
@@ -725,8 +668,10 @@ their sum. If neither is available, the amount is recorded as `unavailable`,
 never as zero.
 
 `josi task show` reports totals that accumulate over every usage record for
-the task: the test-generation stage, all worker attempts, reviews,
-review-format retries, repairs, and separate CLI invocations. `josi run show`
+the task: all worker attempts, reviews,
+review-format retries, repairs, and separate CLI invocations. Historical
+`test_writer` and `test_writer_format_retry` records remain readable and
+included in totals; new runs produce neither stage. `josi run show`
 reports only records attributed to
 that run, so usage from the same task in an earlier or later run is not
 included. The `cost_status` line summarizes the included records:
@@ -842,10 +787,6 @@ task t1: Add authentication
 
 [14:00] Preparing worktree
 [14:00] Created worktree .josi/worktrees/t1 (branch josi/t1)
-[14:00] Test writer started (model tests/model)
-[14:00] tests log: .josi/runs/t1-20260101T140000123456Z-tests.log
-[14:01] Test writer finished with exit code 0
-[14:01] Test generation finished (no tests needed)
 [14:01] Worker attempt 1/3 (provider/model)
 [14:03] Validation passed
 [14:04] Reviewer started
@@ -884,8 +825,8 @@ Deleting `.josi/attempts/t1` is the explicit intervention that grants a fresh
 three-attempt budget, and the preserved branch and worktree are reused.
 `josi task reset t1` is the stronger, command-line form of that intervention:
 it also returns the task to `PENDING` and discards its branch, worktree, stored
-reviews, and recorded test-generation outcome, so the task starts over from
-scratch - including a fresh test-generation stage - instead of continuing on
+and reviews, so the task starts over from
+scratch instead of continuing on
 the existing commits.
 
 ## Validation and review
@@ -902,8 +843,8 @@ Validation commands are project configuration in `josi.json`:
 
 The list is entirely the project's choice: `josi init` never writes a
 `validation` section and never adds pytest or any other validation command by
-default. The tests the test-generation stage commits are exercised by these
-commands after the worker, not by the stage itself.
+default. The tests the worker commits are exercised by these
+commands after the worker, alongside the checks the worker runs.
 
 - Commands run sequentially in the task worktree, exactly as written (a
   shell), and stop at the first non-zero exit.
@@ -1112,8 +1053,6 @@ conversations itself. It uses these OpenCode surfaces:
 | Open the planner TUI | `opencode <project-root> --session <id>` |
 | Create a worker session in a task worktree | `opencode api POST /api/session` (location and agent `build`) |
 | Run the worker noninteractively | `opencode run --agent build --model <model> --session <id> "<prompt>"` |
-| Create a test-writer session in a task worktree | `opencode api POST /api/session` (location and agent `build`) |
-| Run the test writer and read its decision | `opencode run --agent build --model <model> --session <id> --format json "<prompt>"` |
 | Create a reviewer session in a temporary worktree | `opencode api POST /api/session` (location and agent `plan`) |
 | Run the reviewer and get a machine-readable verdict | `opencode run --agent plan --model <model> --session <id> --format json "<prompt>"` |
 
@@ -1145,15 +1084,14 @@ the old configuration. Task databases, logs, and worktrees remain in `.josi/`.
 ```
 josi.json          # personal configuration: schema_version, name, agent,
                    # worker_model, reviewer_model, escalation_worker_model,
-                   # test_writer_model, validation.commands, base_branch, created_at
+                   # validation.commands, base_branch, created_at
 .josi/
 ├── tasks.db        # SQLite database (tasks, dependencies, reviews,
 │                   # runs, run selections, per-invocation usage)
 ├── execution.lock  # project-wide execution lock (fcntl.flock)
 ├── base/           # branch-creation commit per task: t1, t2, ...
 ├── attempts/       # used worker attempts + next-attempt feedback: t1, t2, ...
-├── testgen/        # recorded test-generation outcome per task: t1, t2, ...
-├── runs/           # tN-<timestamp>.log worker, -tests.log, -validation.log,
+├── runs/           # tN-<timestamp>.log worker, -validation.log,
 │                   # -review.log
 ├── review/         # temporary reviewer worktrees (removed after review)
 ├── integrate/      # temporary merge worktrees (removed after the merge)
@@ -1193,24 +1131,7 @@ worktree, a task branch moving during review, the built-in and project
 review policies, the configured models, the missing-reviewer-model preflight
 and its ordering before the execution lock, the recorded branch base, and
 validating/reviewing an `IMPLEMENTED` task without rerunning the worker or
-requiring a worker model. The test-generation suite (`test_testgen`) covers
-the stage that runs before the first worker attempt: the test writer's
-session, configured model, JSON output format, task worktree, and position
-before the worker; `no_tests_needed` succeeding without a commit and
-`tests_written` counting only together with committed test changes; invalid
-outcomes, execution errors, uncommitted or untracked changes, and empty
-commits failing the stage before the worker starts; a prose-wrapped or
-otherwise malformed final message being reformatted once without losing the
-decision or the commit, a bounded retry, and an unusable decision or a
-branch-changing retry failing the stage; the stage's own
-`-tests.log` and the separate `test_writer` usage records; the worker prompt
-keeping the generated tests unchanged; the completed stage persisting across
-retries, repair attempts, and resumes while a failed stage reruns without
-spending a worker attempt; and the test-writer model's `josi init` defaults,
-overrides, malformed values, and missing-model preflight before the execution
-lock. The generated tests are exercised by the project's own validation
-commands after the worker, and validation stays optional: `josi init` adds no
-validation command by default. The Stage 6 tests cover the repair loop: approval on
+requiring a worker model. The Stage 6 tests cover the repair loop: approval on
 the first attempt, minor findings without a retry, a second attempt with
 reviewer feedback, escalation on the third attempt, `NEEDS_HUMAN` after three
 rejections or three validation failures, validation feedback, cumulative

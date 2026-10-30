@@ -2,7 +2,7 @@
 
 josi records how many tokens each OpenCode invocation used and what it cost,
 so a task's usage can accumulate across worker attempts, reviews, and
-format retries of either the reviewer or the test writer, and across CLI
+review format retries, and across CLI
 invocations. The raw numbers come from
 OpenCode's own session metadata (``GET /api/session/<id>``: the session's
 cumulative ``cost`` and ``tokens``); josi turns a session's cumulative totals
@@ -21,9 +21,11 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from typing import Optional
 
-# Invocation stages josi attributes usage to.
+# Historical stage names remain readable for existing usage records.
 STAGE_TEST_WRITER = "test_writer"
 STAGE_TEST_WRITER_FORMAT_RETRY = "test_writer_format_retry"
+
+# Invocation stages produced by current execution.
 STAGE_WORKER = "worker"
 STAGE_REVIEW = "review"
 STAGE_REVIEW_FORMAT_RETRY = "review_format_retry"

@@ -28,15 +28,7 @@ Stage 4:
 
 * ``josi task run <id>`` executes one task with a noninteractive OpenCode
   worker inside a dedicated Git worktree, under a project-wide execution lock.
-* Before the first worker attempt, a test-generation turn runs in the same
-  worktree with the project's test-writer model: it writes and commits the
-  task's tests, or explicitly decides that no tests are needed. A final
-  message that is not one JSON object is reformatted once before failing.
-  Execution errors, invalid outcomes, uncommitted changes, and a dirty
-  worktree fail the stage instead of starting the worker. The worker prompt
-  instructs the worker to keep the generated tests unchanged; the configured
-  validation commands still run after the worker and can execute those
-  tests.
+* Workers own implementation and meaningful tests together, and run relevant checks.
 
 Stage 5:
 
@@ -100,7 +92,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from . import (
-    __version__, agents, execution, opencode, review, tasks, testgen, usage,
+    __version__, agents, execution, opencode, review, tasks, usage,
     validation,
 )
 
@@ -459,18 +451,6 @@ def _escalation_worker_model(metadata: dict) -> str:
     )
 
 
-def _test_writer_model(metadata: dict) -> str:
-    """Return the project's test-writer model or raise.
-
-    Required by ``josi task run`` from the start, exactly like the reviewer
-    and escalation models: without it the run refuses before any lock,
-    worktree, or task change.
-    """
-    return _model_setting(
-        metadata, "test_writer_model", "test writer", "test-writer-model"
-    )
-
-
 def _validate_explicit_base_branch(root: Path, value: str) -> str:
     """Validate ``--base`` and return the branch name.
 
@@ -650,7 +630,6 @@ def cmd_init(args) -> int:
         ("reviewer_model", "reviewer", args.reviewer_model),
         ("escalation_worker_model", "escalation worker",
          args.escalation_worker_model),
-        ("test_writer_model", "test writer", args.test_writer_model),
     ):
         requested_models[key] = None
         if value is not None:
@@ -713,11 +692,6 @@ def cmd_init(args) -> int:
                     "Updated the escalation worker model to "
                     + updates["escalation_worker_model"]
                 )
-            if "test_writer_model" in updates:
-                print(
-                    "Updated the test writer model to "
-                    + updates["test_writer_model"]
-                )
             if "base_branch" in updates:
                 print("Updated the base branch to " + updates["base_branch"])
         else:
@@ -753,7 +727,6 @@ def cmd_init(args) -> int:
         print("Worker model: " + settings["worker_model"])
         print("Reviewer model: " + settings["reviewer_model"])
         print("Escalation worker model: " + settings["escalation_worker_model"])
-        print("Test writer model: " + settings["test_writer_model"])
 
     # Creating the task database here (and again, idempotently, on every task
     # command) is safe: the schema uses CREATE TABLE IF NOT EXISTS, so
@@ -999,12 +972,11 @@ def _reset_task(root: Path, josi_dir: Path, task_id: int) -> int:
                 + (run if task.run_id is not None else "rN") + "' first"
             )
         # Discard the implementation first: the worktree cleanup runs before
-        # anything else is thrown away, so when it fails the attempt budget,
-        # the test-generation outcome, and the database state are all left
+        # anything else is thrown away, so when it fails the attempt budget
+        # and the database state are left
         # untouched and the reset can simply be retried.
         execution.reset_task_worktree(root, josi_dir, task_id)
         execution.clear_attempt_state(josi_dir, task_id)
-        execution.clear_testgen_outcome(josi_dir, task_id)
         tasks.reset_task(conn, task_id)
     finally:
         conn.close()
@@ -1241,10 +1213,6 @@ def cmd_task_run(args) -> int:
         metadata = load_project_metadata(root)
         reviewer_model = _reviewer_model(metadata)
         escalation_worker_model = _escalation_worker_model(metadata)
-        # The test-writer model is required like the reviewer and escalation
-        # models: a missing or malformed value refuses the run before the
-        # lock, the worktrees, or any OpenCode launch.
-        test_writer_model = _test_writer_model(metadata)
         validation_commands = validation.commands_from_metadata(metadata)
         base_branch = _run_base_branch(root, metadata)
         backend = agents.create(project_agent(metadata))
@@ -1277,12 +1245,12 @@ def cmd_task_run(args) -> int:
                 return _run_all(
                     backend, root, josi_dir, lock_fd, metadata, base_branch,
                     reviewer_model, escalation_worker_model,
-                    test_writer_model, validation_commands, run,
+                    validation_commands, run,
                 )
             return _run_explicit(
                 backend, root, josi_dir, lock_fd, requested, metadata,
                 base_branch, reviewer_model, escalation_worker_model,
-                test_writer_model, validation_commands, run,
+                validation_commands, run,
             )
     except (
         ProjectError, tasks.TaskError, sqlite3.Error,
@@ -1296,7 +1264,7 @@ def cmd_task_review(args) -> int:
     """Validate and review a task's committed implementation, then stage it.
 
     This is the way back after a human fixed a NEEDS_HUMAN task by hand: no
-    test generation and no worker run, only validation and review of the
+    worker run, only validation and review of the
     commit already on the task branch. An approval stages the task exactly
     like ``josi task run``; a rejection ends it NEEDS_HUMAN again.
     """
@@ -1452,7 +1420,7 @@ def _preflight_tasks(josi_dir: Path, requested) -> None:
 
 def _run_explicit(
     backend, root, josi_dir, lock_fd, requested, metadata, base_branch,
-    reviewer_model, escalation_worker_model, test_writer_model,
+    reviewer_model, escalation_worker_model,
     validation_commands, run,
 ) -> int:
     """Execute an explicit task list strictly in the order it was given.
@@ -1470,7 +1438,7 @@ def _run_explicit(
     for task_id in requested:
         code, detail, run = _execute_task(
             backend, root, josi_dir, task_id, metadata, lock_fd, base_branch,
-            reviewer_model, escalation_worker_model, test_writer_model,
+            reviewer_model, escalation_worker_model,
             validation_commands, run, selection,
         )
         if code != 0:
@@ -1500,7 +1468,7 @@ def _dependency_satisfied(dep_id, state, run) -> bool:
 
 def _run_all(
     backend, root, josi_dir, lock_fd, metadata, base_branch,
-    reviewer_model, escalation_worker_model, test_writer_model,
+    reviewer_model, escalation_worker_model,
     validation_commands, run,
 ) -> int:
     """Execute every eligible task in dependency order, one at a time.
@@ -1573,7 +1541,7 @@ def _run_all(
             )
         code, detail, run = _execute_task(
             backend, root, josi_dir, ready.id, metadata, lock_fd, base_branch,
-            reviewer_model, escalation_worker_model, test_writer_model,
+            reviewer_model, escalation_worker_model,
             validation_commands, run, selection,
         )
         if code != 0:
@@ -1718,7 +1686,7 @@ def _print_summary(
 
 def _execute_task(
     backend, root, josi_dir, task_id, metadata, lock_fd, base_branch,
-    reviewer_model, escalation_worker_model, test_writer_model,
+    reviewer_model, escalation_worker_model,
     validation_commands, run, selection,
 ) -> tuple:
     """Run one task while the execution lock is held.
@@ -1728,12 +1696,6 @@ def _execute_task(
     before the first task that actually executes. The task branch is created
     from the run branch, and an approval is fast-forwarded into the run
     branch and marked STAGED - never into the configured base branch.
-
-    Before the first worker attempt, the test-generation stage runs in the
-    same worktree with the project's test-writer model: it writes and commits
-    the task's tests, or explicitly decides that the task needs none. A
-    completed stage is never repeated (its outcome is recorded), and a failed
-    one stops the task like any other stage failure.
 
     A task gets up to three completed worker attempts in the same branch and
     worktree: the first two with the project's worker model and the third
@@ -1854,7 +1816,6 @@ def _execute_task(
         print("model: " + _worker_model(metadata))
         print("reviewer model: " + reviewer_model)
         print("escalation model: " + escalation_worker_model)
-        print("test writer model: " + test_writer_model)
         if task.status == tasks.STATUS_RUNNING:
             _event(
                 "Retrying task t" + str(task.id)
@@ -1889,9 +1850,8 @@ def _execute_task(
     while attempts < execution.MAX_WORKER_ATTEMPTS:
         attempt = attempts + 1
         # The task branch and worktree are prepared once for the whole
-        # worker sequence and reused as they are: the test-generation stage
-        # and every worker attempt run in the same worktree, and nothing is
-        # ever reset between attempts.
+        # worker sequence and reused as they are: every worker attempt
+        # runs in the same worktree, and nothing is reset between attempts.
         if worktree is None:
             announce = attempt == 1
             try:
@@ -1921,31 +1881,6 @@ def _execute_task(
                         "Reusing worktree " + str(worktree.path)
                         + " (branch " + worktree.branch + ")"
                     )
-        if attempt == 1:
-            # The test-generation stage runs once, before the first worker
-            # attempt, so the worker starts from the tests it left behind.
-            try:
-                generate_tests = _needs_test_generation(
-                    josi_dir, task, worktree, run.branch,
-                )
-            except execution.ExecutionError as exc:
-                return _verification_failed(josi_dir, task.id, str(exc), run)
-            if generate_tests:
-                outcome, reason, tests_log = _run_test_generation(
-                    backend, josi_dir, task, lock_fd, run.branch,
-                    test_writer_model, run.id, worktree,
-                )
-                if outcome == tasks.STATUS_FAILED:
-                    _event("Test generation failed")
-                    _set_task_status(josi_dir, task.id, tasks.STATUS_FAILED)
-                    _event("Task status: FAILED")
-                    _fail(
-                        "task t" + str(task.id)
-                        + " failed: test generation: " + reason
-                        + " (log: " + str(tests_log) + ")"
-                    )
-                    return 1, "test generation failed", run
-                execution.record_testgen_outcome(josi_dir, task.id, outcome)
         model = _attempt_model(metadata, attempt, escalation_worker_model)
         _event(
             "Worker attempt " + str(attempt) + "/"
@@ -2077,195 +2012,6 @@ def _run_worker_attempt(
         if reason:
             log.write("reason: " + reason + "\n")
     return status, reason, log_path
-
-
-def _needs_test_generation(
-    josi_dir: Path, task, worktree, base_branch: str,
-) -> bool:
-    """Whether the test-generation stage still has to run for ``task``.
-
-    The stage runs once, before the first worker attempt. A recorded outcome
-    means it already completed - even when it decided that no tests are
-    needed and committed nothing. Committed changes on the task branch mean
-    an earlier execution already produced work there (an interrupted test
-    writer, or an implementation left by an older josi version), and a fresh
-    test-writing turn must never run after it.
-    """
-    if execution.testgen_outcome(josi_dir, task.id) is not None:
-        return False
-    return not execution.worktree_has_committed_changes(
-        worktree.path, base_branch
-    )
-
-
-def _run_test_generation(
-    backend, josi_dir, task, lock_fd, base_branch, model, run_id, worktree,
-):
-    """Run the test-generation stage in the prepared task worktree.
-
-    The test writer receives the task title and description with the
-    project's test-writer model and answers with one JSON decision (see
-    :mod:`josi.testgen`). Returns ``(status, reason, log_path)`` like
-    :func:`_run_worker_attempt`: the parsed decision with an empty reason
-    when the stage succeeded, and ``FAILED`` with a reason for an execution
-    error, an invalid outcome, uncommitted changes, or a dirty worktree.
-
-    A final message that is not one JSON object is reformatted once by the
-    same session, with no file changes allowed; a message that is still not
-    one JSON object, or a decision that is unusable, fails the stage. The
-    stage's transcript goes into its own timestamped log and its model
-    usage is recorded under the distinct test-writer stages.
-    """
-    log_path, log = execution.open_stage_log(josi_dir, task.id, "tests")
-    with log:
-        log.write("josi test generation\n")
-        log.write("task: t" + str(task.id) + " - " + task.title + "\n")
-        log.write("model: " + model + "\n")
-        log.write("started_at: " + _utc_now() + "\n")
-
-        _set_task_status(josi_dir, task.id, tasks.STATUS_RUNNING)
-        status = tasks.STATUS_FAILED
-        reason = ""
-        exit_code = None
-        session = None
-        try:
-            log.write("branch: " + worktree.branch + "\n")
-            log.write("worktree: " + str(worktree.path) + "\n")
-            session = backend.create_session(
-                worktree.path,
-                title="josi test writer t" + str(task.id) + ": " + task.title,
-                role=agents.ROLE_WORKER,
-            )
-            log.write("session: " + session.id + "\n")
-            log.write("---\n")
-            # Flush before the test writer starts writing to the same file
-            # through its inherited stdout descriptor, so the header stays
-            # on top and the parsed answer can be read back by position.
-            log.flush()
-            _event("Test writer started (model " + model + ")")
-            _event("tests log: " + str(log_path))
-            prompt = testgen.build_prompt(task, worktree.branch, base_branch)
-            expected_commit = None
-            previous = None
-            for format_attempt in range(2):
-                # Parse only this turn, never a decision from an earlier turn
-                # if the correction produces no text (or reuses message IDs).
-                log.flush()
-                output_start = log.tell()
-                exit_code = backend.run_headless(
-                    worktree.path, session, model, prompt, log,
-                    agents.ROLE_WORKER, pass_fds=(lock_fd,), structured=True,
-                )
-                if exit_code == 0:
-                    _event("Test writer finished with exit code 0")
-                else:
-                    _event(
-                        "Test writer failed with exit code " + str(exit_code)
-                    )
-                with open(log.name, "rb") as transcript:
-                    transcript.seek(output_start)
-                    output = transcript.read().decode(
-                        "utf-8", errors="replace"
-                    )
-                # The session is reused for the one format retry, so the
-                # previous cumulative usage is subtracted to attribute each
-                # turn its own.
-                previous = _capture_usage(
-                    backend, worktree.path, session, model, task, run_id,
-                    usage.STAGE_TEST_WRITER if format_attempt == 0
-                    else usage.STAGE_TEST_WRITER_FORMAT_RETRY,
-                    1, log, josi_dir, turn_output=output, previous=previous,
-                )
-                try:
-                    status, reason = _evaluate_test_generation(
-                        backend, worktree, exit_code, base_branch, output,
-                        expected_commit=expected_commit,
-                    )
-                except testgen.TestGenFormatError as exc:
-                    if format_attempt == 0:
-                        log.write("format_error: " + str(exc) + "\n")
-                        log.write("format_retry: 1 of 1\n")
-                        _event(
-                            "Test writer output format invalid; retrying once"
-                        )
-                        # The correction may only reformat the answer: pin the
-                        # branch tip so a turn that changes it fails the stage.
-                        expected_commit = execution.head_commit(worktree.path)
-                        prompt = testgen.format_retry_prompt()
-                        continue
-                    status, reason = tasks.STATUS_FAILED, str(exc)
-                except testgen.TestGenError as exc:
-                    status, reason = tasks.STATUS_FAILED, str(exc)
-                break
-        except (execution.ExecutionError, agents.AgentError, OSError) as exc:
-            reason = str(exc)
-
-        log.write("---\n")
-        log.write("finished_at: " + _utc_now() + "\n")
-        if exit_code is not None:
-            log.write("exit_code: " + str(exit_code) + "\n")
-        log.write("result: " + status + "\n")
-        if reason:
-            log.write("reason: " + reason + "\n")
-    if status != tasks.STATUS_FAILED:
-        if status == testgen.DECISION_TESTS_WRITTEN:
-            _event("Test generation finished (tests committed)")
-        else:
-            _event("Test generation finished (no tests needed)")
-    return status, reason, log_path
-
-
-def _evaluate_test_generation(
-    backend, worktree, exit_code, base_branch, output, expected_commit=None,
-):
-    """Turn a finished test-generation run into ``(status, reason)``.
-
-    A non-zero exit, a worktree left on another branch, uncommitted or
-    untracked changes, and a branch that moved during a reformat retry are
-    all stage failures: the worker must never start from an uncertain state. A
-    ``tests_written`` decision counts only together with committed changes; a
-    ``no_tests_needed`` decision succeeds without requiring a commit.
-
-    An answer that is not one JSON object raises
-    :class:`testgen.TestGenFormatError` so the caller can ask once for a
-    reformat; an unusable decision raises :class:`testgen.TestGenError`.
-    """
-    if exit_code != 0:
-        return (
-            tasks.STATUS_FAILED,
-            "the " + backend.label + " test writer exited with status " + str(exit_code),
-        )
-    branch = execution.worktree_branch(worktree.path)
-    if branch != worktree.branch:
-        return (
-            tasks.STATUS_FAILED,
-            "the test writer left the worktree on '" + branch
-            + "' instead of '" + worktree.branch + "'",
-        )
-    dirty = execution.worktree_dirty(worktree.path)
-    if dirty:
-        return (
-            tasks.STATUS_FAILED,
-            "the test writer left the worktree dirty (commit or remove the"
-            " changes and run the task again)",
-        )
-    if expected_commit is not None and (
-        execution.head_commit(worktree.path) != expected_commit
-    ):
-        return (
-            tasks.STATUS_FAILED,
-            "the test writer changed the branch while reformatting its answer",
-        )
-    decision = testgen.outcome_from_output(output, backend.final_text)
-    if decision == testgen.DECISION_TESTS_WRITTEN and not (
-        execution.worktree_has_committed_changes(worktree.path, base_branch)
-    ):
-        return (
-            tasks.STATUS_FAILED,
-            "the test writer reported " + testgen.DECISION_TESTS_WRITTEN
-            + " but committed no test changes relative to " + base_branch,
-        )
-    return decision, ""
 
 
 def _record_usage(
@@ -3436,11 +3182,6 @@ def build_parser() -> argparse.ArgumentParser:
              " repair cycle (name[#effort]); required by 'josi task run'",
     )
     init.add_argument(
-        "--test-writer-model", metavar="MODEL",
-        help="set the project's test-writer model (name[#effort]); required"
-             " by 'josi task run'",
-    )
-    init.add_argument(
         "--base", metavar="BRANCH",
         help="base branch for task branches (default: detect, or ask when"
              " ambiguous)",
@@ -3497,7 +3238,7 @@ def build_parser() -> argparse.ArgumentParser:
 
     run = task_sub.add_parser(
         "run",
-        help="execute tasks: test generation, worker, validation, review,"
+        help="execute tasks: worker, validation, review,"
              " and staging",
     )
     run.add_argument(

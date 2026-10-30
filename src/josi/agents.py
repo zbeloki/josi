@@ -1,7 +1,7 @@
 """Agent backends: the CLIs josi drives to plan, implement, and review.
 
 A project selects one backend (``agent`` in ``josi.json``) and every
-role - planner, worker, reviewer, escalation worker, test writer - runs on it.
+role - planner, worker, reviewer, escalation worker - runs on it.
 Backends include:
 
 * :class:`OpenCodeBackend` wraps the OpenCode CLI (see :mod:`josi.opencode`).
@@ -79,7 +79,6 @@ read-only inspection fails, explain the limitation instead of escalating it.
 # ``(model, effort)`` pairs.
 MODEL_KEYS = (
     "worker_model", "reviewer_model", "escalation_worker_model",
-    "test_writer_model",
 )
 DEFAULT_MODELS = {
     AGENT_OPENCODE: {
@@ -88,19 +87,16 @@ DEFAULT_MODELS = {
         "escalation_worker_model": (
             "openrouter/anthropic/claude-sonnet-5.5", "medium"
         ),
-        "test_writer_model": ("openrouter/z-ai/glm-5.3", "high"),
     },
     AGENT_CODEX: {
         "worker_model": ("gpt-6.1-sol", "low"),
         "reviewer_model": ("gpt-6.1-sol", "medium"),
         "escalation_worker_model": ("gpt-6-astra", "medium"),
-        "test_writer_model": ("gpt-6.1-sol", "medium"),
     },
     AGENT_CLAUDE: {
         "worker_model": ("sonnet", "low"),
         "reviewer_model": ("opus", "medium"),
         "escalation_worker_model": ("opus", "medium"),
-        "test_writer_model": ("sonnet", "medium"),
     },
 }
 

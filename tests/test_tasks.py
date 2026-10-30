@@ -535,6 +535,7 @@ class TaskProjectTests(JosiTestCase):
         self.run_josi("task", "create", "--title", "Parent task")
         copied = self.base / "copied"
         shutil.copytree(self.repo / ".josi", copied / ".josi")
+        shutil.copy2(self.metadata_path(), copied / "josi.json")
         result = self.run_josi("task", "list", cwd=copied)
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("Git repository", result.stderr)
@@ -542,7 +543,7 @@ class TaskProjectTests(JosiTestCase):
     def test_task_commands_with_invalid_metadata(self):
         self.init_git()
         (self.repo / ".josi").mkdir()
-        (self.repo / ".josi" / "project.json").write_text("not json", encoding="utf-8")
+        self.metadata_path().write_text("not json", encoding="utf-8")
         result = self.run_josi("task", "list")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid Josi project metadata", result.stderr)

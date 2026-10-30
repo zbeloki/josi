@@ -109,7 +109,7 @@ class ClaudeTestCase(JosiTestCase):
     def commit_base(self):
         self.init_git()
         self.git("symbolic-ref", "HEAD", "refs/heads/main")
-        (self.repo / ".gitignore").write_text(".josi/\n", encoding="utf-8")
+        (self.repo / ".gitignore").write_text(".josi/\n/josi.json\n", encoding="utf-8")
         (self.repo / "README.md").write_text("base\n", encoding="utf-8")
         self.git("add", "-A")
         self.git(

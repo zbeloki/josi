@@ -36,7 +36,7 @@ class TaskRunTestCase(JosiTestCase):
         self.git("symbolic-ref", "HEAD", "refs/heads/main")
         # Track ``.gitignore`` in the base commit (init would add the entry
         # itself) so the checkout stays clean for the assertions below.
-        (self.repo / ".gitignore").write_text(".josi/\n", encoding="utf-8")
+        (self.repo / ".gitignore").write_text(".josi/\n/josi.json\n", encoding="utf-8")
         (self.repo / "README.md").write_text("base\n", encoding="utf-8")
         self.commit("base commit")
         # Initialize after the base commit, so ``init`` detects and stores
@@ -207,6 +207,7 @@ class TaskRunTestCase(JosiTestCase):
 
 class RunExecutionTests(TaskRunTestCase):
     def test_successful_run_builds_branch_worktree_and_commits(self):
+        config_before = self.metadata_path().read_bytes()
         self.make_task()
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -239,6 +240,16 @@ class RunExecutionTests(TaskRunTestCase):
             "josi/run/r1",
         )
         self.assertEqual(self.run_status(), "COMPLETE")
+
+        # Personal configuration stays at the root; execution still writes
+        # its database, lock, worktrees, and logs exclusively under .josi/.
+        self.assertEqual(self.metadata_path().read_bytes(), config_before)
+        self.assertFalse((self.repo / ".josi" / "project.json").exists())
+        self.assertTrue((self.repo / ".josi" / "tasks.db").is_file())
+        self.assertTrue((self.repo / ".josi" / "execution.lock").is_file())
+        self.assertTrue(self.log_paths())
+        for artifact in ("tasks.db", "execution.lock", "worktrees", "run-worktrees", "runs"):
+            self.assertFalse((self.repo / artifact).exists(), artifact)
 
         log = self.log_text()
         self.assertTrue(log.startswith("josi task run\n"), log[:80])
@@ -562,7 +573,7 @@ class WorkerModelTests(TaskRunTestCase):
         )
         self.assertEqual(result.returncode, 0, result.stderr)
         metadata = json.loads(
-            (repo / ".josi" / "project.json").read_text(encoding="utf-8")
+            (repo / "josi.json").read_text(encoding="utf-8")
         )
         self.assertEqual(model_setting(metadata["worker_model"]), "provider/model")
 

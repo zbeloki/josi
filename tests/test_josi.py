@@ -564,7 +564,7 @@ class JosiTestCase(unittest.TestCase):
         return [c for c in self.calls() if c["argv"][0] != "api"]
 
     def metadata_path(self) -> Path:
-        return self.repo / ".josi" / "project.json"
+        return self.repo / "josi.json"
 
     def planner_path(self) -> Path:
         return self.repo / ".josi" / "planner.json"
@@ -600,6 +600,144 @@ class JosiTestCase(unittest.TestCase):
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
+class ProjectConfigurationPathTests(JosiTestCase):
+    """Old projects must init again and manually transfer desired settings."""
+
+    def setUp(self):
+        super().setUp()
+        self.init_git()
+        self.legacy_path = self.repo / ".josi" / "project.json"
+        self.legacy_path.parent.mkdir()
+        self.metadata = {
+            "schema_version": 1,
+            "name": "root project",
+            "created_at": "2026-01-01T00:00:00Z",
+        }
+
+    def test_loader_reads_only_root_configuration_when_both_exist(self):
+        from josi.cli import load_project_metadata
+
+        self.metadata_path().write_text(json.dumps(self.metadata), encoding="utf-8")
+        for legacy in ("not JSON", json.dumps(dict(self.metadata, name="old project"))):
+            with self.subTest(legacy=legacy):
+                self.legacy_path.write_text(legacy, encoding="utf-8")
+                self.assertEqual(load_project_metadata(self.repo), self.metadata)
+
+    def test_loader_does_not_fall_back_to_old_configuration(self):
+        from josi.cli import MetadataError, load_project_metadata
+
+        self.legacy_path.write_text(json.dumps(self.metadata), encoding="utf-8")
+        for root in (None, "not JSON", json.dumps({"schema_version": 99})):
+            with self.subTest(root=root):
+                if root is not None:
+                    self.metadata_path().write_text(root, encoding="utf-8")
+                with self.assertRaises(MetadataError) as raised:
+                    load_project_metadata(self.repo)
+                self.assertIn(str(self.repo / "josi.json"), str(raised.exception))
+
+    def test_commands_use_root_configuration_when_old_file_is_invalid(self):
+        self.metadata_path().write_text(json.dumps(self.metadata), encoding="utf-8")
+        self.legacy_path.write_text("not JSON", encoding="utf-8")
+        for args in (("plan",), ("task", "list"), ("run", "list")):
+            with self.subTest(args=args):
+                result = self.run_josi(*args)
+                self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertTrue(self.create_calls())
+        self.assertTrue((self.repo / ".josi" / "tasks.db").is_file())
+        self.assertFalse((self.repo / "tasks.db").exists())
+        self.assertEqual(self.legacy_path.read_text(encoding="utf-8"), "not JSON")
+
+    def test_commands_require_root_configuration_even_when_old_file_exists(self):
+        self.legacy_path.write_text(json.dumps(self.metadata), encoding="utf-8")
+        before = self.legacy_path.read_bytes()
+        cases = (
+            ("plan",),
+            ("task", "list"),
+            ("task", "create", "--title", "Must not be created"),
+            ("task", "run", "t1"),
+            ("run", "list"),
+        )
+        for args in cases:
+            with self.subTest(args=args):
+                result = self.run_josi(*args)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("josi init", result.stderr)
+                self.assertIn("josi.json", result.stderr)
+                self.assertNotIn("Traceback", result.stderr)
+        self.assertEqual(self.calls(), [])
+        self.assertFalse(self.metadata_path().exists())
+        self.assertFalse((self.repo / ".josi" / "tasks.db").exists())
+        self.assertEqual(self.legacy_path.read_bytes(), before)
+
+    def test_init_ignores_old_configuration_without_migrating_settings(self):
+        old = dict(self.metadata, name="old project", worker_model="old/custom")
+        for legacy in (json.dumps(old), "not JSON"):
+            with self.subTest(legacy=legacy):
+                if self.metadata_path().exists():
+                    self.metadata_path().unlink()
+                self.legacy_path.write_text(legacy, encoding="utf-8")
+                result = self.run_josi("init")
+                self.assertEqual(result.returncode, 0, result.stderr)
+                metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
+                self.assertEqual(metadata["name"], "repo")
+                self.assertEqual(
+                    model_setting(metadata["worker_model"]),
+                    "openrouter/deepseek/deepseek-v4.1-flash#low",
+                )
+                self.assertEqual(self.legacy_path.read_text(encoding="utf-8"), legacy)
+
+    def test_reinit_preserves_root_customizations_and_never_writes_old_file(self):
+        result = self.run_josi("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
+        metadata.update(
+            name="My personal project",
+            worker_model={"model": "personal/worker", "effort": None},
+            validation={"commands": ["python -m unittest discover -s tests"]},
+            personal_setting={"theme": "dark"},
+        )
+        self.metadata_path().write_text(
+            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
+        )
+        before = self.metadata_path().read_bytes()
+        self.legacy_path.write_text("invalid old configuration", encoding="utf-8")
+        legacy_before = self.legacy_path.read_bytes()
+        for _ in range(2):
+            result = self.run_josi("init")
+            self.assertEqual(result.returncode, 0, result.stderr)
+            self.assertEqual(self.metadata_path().read_bytes(), before)
+            self.assertEqual(self.legacy_path.read_bytes(), legacy_before)
+        result = self.run_josi("init", "--worker-model", "personal/updated")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        metadata["worker_model"] = {"model": "personal/updated", "effort": None}
+        self.assertEqual(
+            json.loads(self.metadata_path().read_text(encoding="utf-8")), metadata
+        )
+        self.assertEqual(self.legacy_path.read_bytes(), legacy_before)
+
+    def test_reinit_adds_missing_root_ignore_entry_without_changing_others(self):
+        cases = (
+            b"# personal ignores\n.josi/\n*.log\n",
+            b"# no trailing newline\n.josi",
+            b"# already ignored\r\n.josi/\r\n/josi.json\r\nbuild/\r\n",
+            b"/josi.json\n# execution directory still needs ignoring\n",
+        )
+        for before in cases:
+            with self.subTest(before=before):
+                (self.repo / ".gitignore").write_bytes(before)
+                for _ in range(2):
+                    result = self.run_josi("init")
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                after = (self.repo / ".gitignore").read_bytes()
+                self.assertTrue(after.startswith(before))
+                self.assertEqual(after.splitlines().count(b"/josi.json"), 1)
+                lines = after.splitlines()
+                self.assertTrue(b".josi/" in lines or b".josi" in lines)
+                if b"/josi.json" in before.splitlines() and b".josi/" in before.splitlines():
+                    self.assertEqual(after, before)
+
+
+@unittest.skipUnless(shutil.which("git"), "git is required")
 class InitTests(JosiTestCase):
     def test_init_creates_metadata_and_gitignore(self):
         self.init_git()
@@ -619,8 +757,13 @@ class InitTests(JosiTestCase):
         self.assertEqual(metadata["base_branch"], unborn)
         self.assertIn("Base branch: " + unborn, result.stdout)
 
+        self.assertTrue((self.repo / "josi.json").is_file())
+        self.assertFalse((self.repo / ".josi" / "project.json").exists())
+        self.assertTrue((self.repo / ".josi" / "tasks.db").is_file())
+        self.assertFalse((self.repo / "tasks.db").exists())
         gitignore = (self.repo / ".gitignore").read_text(encoding="utf-8")
         self.assertIn(".josi/", gitignore.splitlines())
+        self.assertIn("/josi.json", gitignore.splitlines())
 
     def test_init_stores_default_models(self):
         self.init_git()
@@ -827,20 +970,24 @@ class InitTests(JosiTestCase):
         self.assertIn("*.log", gitignore)
         self.assertIn("build/", gitignore)
         self.assertEqual(gitignore.splitlines().count(".josi/"), 1)
+        self.assertEqual(gitignore.splitlines().count("/josi.json"), 1)
+        self.assertTrue(gitignore.startswith("*.log\nbuild/\n"))
 
     def test_init_without_gitignore_file(self):
         self.initialize()
-        self.assertEqual(
+        self.assertCountEqual(
             (self.repo / ".gitignore").read_text(encoding="utf-8").splitlines(),
-            [".josi/"],
+            [".josi/", "/josi.json"],
         )
 
     def test_init_preserves_gitignore_bytes_and_crlf(self):
         before = b"# Windows project\r\nbuild/\r\n"
         (self.repo / ".gitignore").write_bytes(before)
         self.initialize()
-        self.assertEqual(
-            (self.repo / ".gitignore").read_bytes(), before + b".josi/\n"
+        after = (self.repo / ".gitignore").read_bytes()
+        self.assertTrue(after.startswith(before))
+        self.assertCountEqual(
+            after[len(before):].splitlines(), [b".josi/", b"/josi.json"]
         )
 
     @unittest.skipIf(os.name == "nt", "trailing spaces in directory names are not portable")
@@ -852,7 +999,7 @@ class InitTests(JosiTestCase):
         )
         result = self.run_josi("init", cwd=spaced)
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertTrue((spaced / ".josi" / "project.json").is_file())
+        self.assertTrue((spaced / "josi.json").is_file())
         self.assertFalse(
             (self.repo / ".josi").exists(),
             "init must not write into the sibling directory 'repo'",
@@ -862,11 +1009,21 @@ class InitTests(JosiTestCase):
         before = b"\xff\xfe legacy\n"
         (self.repo / ".gitignore").write_bytes(before)
         self.initialize()
-        self.assertEqual(
-            (self.repo / ".gitignore").read_bytes(), before + b".josi/\n"
+        after = (self.repo / ".gitignore").read_bytes()
+        self.assertTrue(after.startswith(before))
+        self.assertCountEqual(
+            after[len(before):].splitlines(), [b".josi/", b"/josi.json"]
         )
 
     def test_init_reports_metadata_write_failure(self):
+        self.init_git()
+        self.metadata_path().mkdir()
+        result = self.run_josi("init")
+        self.assertNotEqual(result.returncode, 0)
+        self.assertIn("josi.json", result.stderr)
+        self.assertNotIn("Traceback", result.stderr)
+
+    def test_init_reports_state_directory_failure(self):
         self.init_git()
         (self.repo / ".josi").write_text("not a directory", encoding="utf-8")
         result = self.run_josi("init")
@@ -1267,7 +1424,7 @@ class PlanGuardTests(JosiTestCase):
     def test_plan_with_undecodable_metadata(self):
         self.init_git()
         (self.repo / ".josi").mkdir()
-        (self.repo / ".josi" / "project.json").write_bytes(b"\xff\xfe")
+        self.metadata_path().write_bytes(b"\xff\xfe")
         result = self.run_josi("plan")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("invalid Josi project metadata", result.stderr)
@@ -1285,7 +1442,7 @@ class PlanGuardTests(JosiTestCase):
     def test_plan_ignores_josi_metadata_outside_git(self):
         outside = self.base / "copied"
         (outside / ".josi").mkdir(parents=True)
-        (outside / ".josi" / "project.json").write_text(
+        (outside / "josi.json").write_text(
             json.dumps({"schema_version": 1, "name": "copied", "created_at": "x"}),
             encoding="utf-8",
         )

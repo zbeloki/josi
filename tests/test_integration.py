@@ -560,7 +560,7 @@ class RunMergeTests(IntegrationTestCase):
         # only the merge itself can refuse instead of silently replacing the
         # human's local data.
         (self.repo / ".gitignore").write_text(
-            ".josi/\nlocal-notes.txt\n", encoding="utf-8"
+            ".josi/\n/josi.json\nlocal-notes.txt\n", encoding="utf-8"
         )
         self.commit("ignore the local notes")
         human = "local settings\n"

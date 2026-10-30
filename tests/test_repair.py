@@ -795,41 +795,26 @@ class TaskResetTests(RepairTestCase):
         self.assertEqual(self.task_status(), "STAGED")
         self.assertIn("Worker attempt 1/3 (provider/model)", result.stdout)
 
-    def test_reset_discards_the_recorded_test_generation_outcome(self):
-        # The test-generation outcome record (.josi/testgen/tN) belongs to
-        # the branch and worktree a reset discards: the recorded decision
-        # is stale on a fresh branch, so it goes with them, and the next
-        # execution runs test generation again instead of skipping a stage
-        # that never ran there.
+    def test_reset_preserves_historical_test_generation_artifacts(self):
         marker = self.repo / ".josi" / "testgen" / "t1"
+        marker.parent.mkdir(parents=True)
+        historical = b'{"decision":"tests_written"}\n'
+        marker.write_bytes(historical)
         self.env["JOSI_FAKE_REVIEW_JSON"] = json.dumps(self.major("Broken."))
         self.make_task()
         self.assertNotEqual(self.run_task("t1").returncode, 0)
         self.assertEqual(self.task_status(), "NEEDS_HUMAN")
-        self.assertEqual(
-            json.loads(marker.read_text(encoding="utf-8")),
-            {"decision": "no_tests_needed"},
-        )
-        generations = len(self.generation_calls())
-
         self.env["JOSI_FAKE_REVIEW_JSON"] = json.dumps(self.approved())
         result = self.run_josi("task", "reset", "t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Reset task t1", result.stdout)
-        self.assertFalse(marker.exists())
-
-        # The next execution runs test generation again on the fresh branch.
+        self.assertTrue(marker.is_file(), "reset deleted a historical marker")
+        self.assertEqual(marker.read_bytes(), historical)
         result = self.run_task("t1")
         self.assertEqual(result.returncode, 0, result.stderr)
         self.assertEqual(self.task_status(), "STAGED")
-        self.assertEqual(
-            len(self.generation_calls()), generations + 1,
-            "the next execution must run test generation again",
-        )
-        self.assertEqual(
-            json.loads(marker.read_text(encoding="utf-8")),
-            {"decision": "no_tests_needed"},
-        )
+        self.assertTrue(marker.is_file(), "reset deleted a historical marker")
+        self.assertEqual(marker.read_bytes(), historical)
+        self.assertEqual(self.generation_calls(), [])
 
     def test_failed_worktree_cleanup_keeps_the_budget_and_the_state(self):
         # A locked worktree cannot be removed, so the reset fails during its

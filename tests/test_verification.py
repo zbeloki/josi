@@ -1002,92 +1002,46 @@ class Stage5IntegrationTests(VerificationTestCase):
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
-class TestWriterModelConfigTests(VerificationTestCase):
-    def test_missing_test_writer_model_fails_before_any_work(self):
+class ObsoleteModelConfigTests(VerificationTestCase):
+    def test_missing_test_writer_model_does_not_block_execution(self):
         self.remove_test_writer_model()
         self.make_task()
         result = self.run_task("t1")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("no test writer model", result.stderr)
-        self.assertIn("josi init --test-writer-model", result.stderr)
-        self.assertEqual(self.task_status(), "PENDING")
-        self.assertEqual(self.worker_calls(), [], "no worker may start")
-        self.assertEqual(self.reviewer_calls(), [], "no reviewer may start")
-        self.assertFalse((self.repo / ".josi" / "worktrees").exists())
-        self.assertEqual(
-            list((self.repo / ".josi" / "runs").glob("t1-*.log")), [],
-            "no stage may start without a test-writer model",
-        )
-        self.assertFalse(
-            (self.repo / ".josi" / "execution.lock").exists(),
-            "the lock must not be taken",
-        )
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.task_status(), "STAGED")
+        self.assertEqual(len(self.worker_calls()), 1)
+        self.assertEqual(len(self.reviewer_calls()), 1)
+        self.assertEqual(self.generation_calls(), [])
 
-    def test_missing_test_writer_model_precedes_the_execution_lock(self):
-        # With the lock held elsewhere, the run still reports the missing
-        # test-writer model instead of the lock conflict: the refusal happens
-        # before the lock is attempted.
+    def test_missing_test_writer_model_does_not_mask_execution_lock(self):
         self.remove_test_writer_model()
         self.make_task()
-        lock_path = self.repo / ".josi" / "execution.lock"
-        handle = open(lock_path, "a+b")
-        fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
-        try:
+        with open(self.repo / ".josi" / "execution.lock", "a+b") as handle:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
             result = self.run_task("t1")
-        finally:
-            handle.close()
-
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("no test writer model", result.stderr)
-        self.assertNotIn("already running", result.stderr)
+        self.assertIn("already running", result.stderr)
+        self.assertNotIn("test writer", result.stderr)
         self.assertEqual(self.task_status(), "PENDING")
         self.assertEqual(self.calls(), [])
 
-    def test_malformed_test_writer_model_in_metadata_is_rejected(self):
-        metadata = self.metadata()
-        metadata["test_writer_model"] = "not a model"
-        self.write_metadata(metadata)
-        self.make_task()
-        result = self.run_task("t1")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("invalid test writer model", result.stderr)
-        self.assertEqual(self.worker_calls(), [])
-        self.assertEqual(self.task_status(), "PENDING")
-
-    def test_invalid_test_writer_model_value_in_metadata_is_rejected(self):
-        metadata = self.metadata()
-        metadata["test_writer_model"] = 42
-        self.write_metadata(metadata)
-        self.make_task()
-        result = self.run_task("t1")
-        self.assertNotEqual(result.returncode, 0)
-        self.assertIn("invalid 'test_writer_model'", result.stderr)
-        self.assertEqual(self.worker_calls(), [])
-
-    def test_test_writer_model_is_stored_updated_and_preserved(self):
-        # init already stored the default during setUp; an explicit override
-        # updates only this setting.
-        self.assertEqual(
-            model_setting(self.metadata()["test_writer_model"]),
-            "openrouter/z-ai/glm-5.3#high",
-        )
-        result = self.run_josi("init", "--test-writer-model", "provider/writer")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Updated the test writer model", result.stdout)
-        self.assertEqual(model_setting(self.metadata()["test_writer_model"]), "provider/writer")
-        # The other model settings are untouched.
-        self.assertEqual(model_setting(self.metadata()["worker_model"]), "provider/model")
-        self.assertEqual(model_setting(self.metadata()["reviewer_model"]), "reviewer/model")
-
-        # A plain init never removes the configured test-writer model.
-        self.assertEqual(self.run_josi("init").returncode, 0)
-        self.assertEqual(model_setting(self.metadata()["test_writer_model"]), "provider/writer")
-
-        for value in ("", "model", "provider/", "/model", "two words/model"):
+    def test_obsolete_values_are_ignored_without_destructive_migration(self):
+        values = ("not a model", 42, None, [], {"model": []},
+                  {"model": "old/model", "effort": "invalid"})
+        for number, value in enumerate(values, 1):
             with self.subTest(value=value):
-                result = self.run_josi("init", "--test-writer-model", value)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("invalid test writer model", result.stderr)
+                metadata = self.metadata()
+                metadata["test_writer_model"] = value
+                self.write_metadata(metadata)
+                self.make_task()
+                for args in (("init",), ("plan",), ("task", "run", "t" + str(number))):
+                    result = self.run_josi(*args)
+                    self.assertEqual(result.returncode, 0, result.stderr)
+                    self.assertEqual(self.metadata()["test_writer_model"], value)
+                    self.assertNotIn("test writer model", result.stdout.lower())
+                result = self.run_josi("run", "merge", "r" + str(number))
+                self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(self.generation_calls(), [])
 
 
 if __name__ == "__main__":

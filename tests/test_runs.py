@@ -144,8 +144,6 @@ class TaskRunTestCase(JosiTestCase):
         return argv[argv.index("--agent") + 1] if "--agent" in argv else ""
 
     def worker_calls(self):
-        # The test writer also uses the build agent, but answers with JSON
-        # output; the worker turns are the plain transcript ones.
         return [
             call for call in self.calls()
             if call["argv"][:1] == ["run"] and self.agent_of(call) == "build"
@@ -159,7 +157,7 @@ class TaskRunTestCase(JosiTestCase):
         ]
 
     def generation_calls(self):
-        """The test-generation turns: the build agent answering with JSON."""
+        """Detect legacy test-writer invocations so regressions cannot hide."""
         return [
             call for call in self.calls()
             if call["argv"][:1] == ["run"] and self.agent_of(call) == "build"
@@ -409,8 +407,7 @@ class TerminalOutputTests(TaskRunTestCase):
             r"\[\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}[+-]\d{2}:\d{2}\]"
             r" Preparing worktree",
         )
-        # The worker's own log line ("... log: ...", not the test writer's
-        # "... tests log: ...") sits between the worker start and its finish.
+        # The worker log path sits between its start and finish events.
         worker_log = stdout.find("] log: ")
         self.assertGreater(worker_log, 0)
         self.assertLess(stdout.index("Starting worker"), worker_log)

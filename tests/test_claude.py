@@ -2,8 +2,8 @@
 
 A fake ``claude`` executable on ``PATH`` stands in for Claude Code: it records
 its argument vector, working directory, and stdin, and emulates the
-noninteractive ``-p --output-format stream-json`` turns of the worker, the test
-writer, and the reviewer. No real Claude process or model call is made.
+noninteractive ``-p --output-format stream-json`` worker and reviewer turns.
+No real Claude process or model call is made.
 """
 
 from __future__ import annotations
@@ -62,8 +62,18 @@ def main():
             '{"decision":"approved","findings":[]}',
         )
     elif prompt.startswith("Write the tests for this task"):
-        text = '{"decision":"no_tests_needed","reason":"none"}'
+        print("unexpected removed test-writer stage", file=sys.stderr)
+        return 97
     else:
+        with open("feature.py", "w", encoding="utf-8") as handle:
+            handle.write("def answer():\\n    return 42\\n")
+        with open("test_feature.py", "w", encoding="utf-8") as handle:
+            handle.write(
+                "import unittest\\nfrom feature import answer\\n"
+                "class FeatureTests(unittest.TestCase):\\n"
+                "    def test_answer(self):\\n        self.assertEqual(answer(), 42)\\n"
+            )
+        subprocess.run(["git", "add", "feature.py", "test_feature.py"], check=True)
         commit("worker-output.txt", "worker change\\n", "Fake Worker")
         text = "done"
     session = argv[argv.index("--session-id") + 1] if "--session-id" in argv \\
@@ -146,10 +156,7 @@ class ClaudeInitTests(ClaudeTestCase):
             metadata["escalation_worker_model"],
             {"model": "opus", "effort": "medium"},
         )
-        self.assertEqual(
-            metadata["test_writer_model"],
-            {"model": "sonnet", "effort": "medium"},
-        )
+        self.assertNotIn("test_writer_model", metadata)
         self.assertIn("Agent: claude", result.stdout)
         self.assertIn("Worker model: sonnet#low", result.stdout)
 
@@ -331,9 +338,9 @@ class ClaudeRunTests(ClaudeTestCase):
     def test_task_run_drives_claude_for_every_role(self):
         result = self.run_josi("task", "run", "t1")
         self.assertEqual(result.returncode, 0, result.stderr)
-        tests, worker, reviewer = self.claude_calls()
+        worker, reviewer = self.claude_calls()
 
-        for call in (tests, worker, reviewer):
+        for call in (worker, reviewer):
             argv = call["argv"]
             self.assertEqual(argv[0], "-p")
             self.assertEqual(
@@ -345,8 +352,6 @@ class ClaudeRunTests(ClaudeTestCase):
             self.assertTrue(call["stdin"].strip())
             self.assertNotIn(call["stdin"], argv)
 
-        self.assertEqual(self.flag(tests, "--model"), "sonnet")
-        self.assertEqual(self.flag(tests, "--effort"), "medium")
         self.assertEqual(self.flag(worker, "--model"), "sonnet")
         self.assertEqual(self.flag(worker, "--effort"), "low")
         self.assertEqual(self.flag(reviewer, "--model"), "opus")
@@ -366,12 +371,13 @@ class ClaudeRunTests(ClaudeTestCase):
     def test_each_session_starts_once_with_session_id(self):
         self.assertEqual(self.run_josi("task", "run", "t1").returncode, 0)
         sessions = [self.flag(c, "--session-id") for c in self.claude_calls()]
-        self.assertEqual(len(set(sessions)), 3)
+        self.assertEqual(len(set(sessions)), 2)
 
     def test_reviewer_format_retry_resumes_the_same_session(self):
         self.env["JOSI_FAKE_CLAUDE_REVIEW_JSON"] = "not json at all"
         result = self.run_josi("task", "run", "t1")
         self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(self.claude_calls()), 3)
         reviewer, retry = self.claude_calls()[-2:]
         self.assertIn("--session-id", reviewer["argv"])
         self.assertEqual(
@@ -382,7 +388,7 @@ class ClaudeRunTests(ClaudeTestCase):
     def test_usage_is_recorded_from_the_result_events(self):
         self.assertEqual(self.run_josi("task", "run", "t1").returncode, 0)
         shown = self.run_josi("task", "show", "t1")
-        self.assertIn("cost_total: 0.150000", shown.stdout)
+        self.assertIn("cost_total: 0.100000", shown.stdout)
         logs = sorted((self.repo / ".josi" / "runs").glob("t1-*.log"))
         text = "\n".join(path.read_text(encoding="utf-8") for path in logs)
         self.assertIn(

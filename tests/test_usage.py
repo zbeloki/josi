@@ -2,9 +2,8 @@
 
 The fake ``opencode`` reports configurable session usage (``GET
 /api/session/<id>``) and model pricing metadata (``GET /api/model``), so
-these tests verify that test generation, worker attempts, reviews, and
-format retries of either the reviewer or the test writer each record their
-own tokens and cost, that the
+these tests verify that worker attempts, reviews, and reviewer format retries
+each record their own tokens and cost, that historical stages and their
 records survive CLI invocations, and that missing data is never mistaken for
 zero. The transcripts and the terminal output stay exactly as before.
 """
@@ -17,7 +16,7 @@ import unittest
 
 from test_verification import VerificationTestCase
 
-from josi import tasks
+from josi import tasks, usage
 
 
 def token_counts(input, output=0, reasoning=0, cache_read=0, cache_write=0):
@@ -31,7 +30,7 @@ def token_counts(input, output=0, reasoning=0, cache_read=0, cache_write=0):
 
 # Pricing metadata for the models TaskRunTestCase configures: the worker
 # ``provider/model``, the reviewer ``reviewer/model``, the escalation
-# ``escalation/model``, and the test writer ``tests/model``.
+# ``escalation/model``.
 PRICING = [
     {"providerID": "provider", "modelID": "model", "variants": [],
      "cost": [{"input": 3.0, "output": 15.0,
@@ -42,22 +41,12 @@ PRICING = [
     {"providerID": "escalation", "modelID": "model", "variants": [],
      "cost": [{"input": 5.0, "output": 25.0,
                "cache": {"read": 0.5, "write": 6.25}}]},
-    {"providerID": "tests", "modelID": "model", "variants": [],
-     "cost": [{"input": 2.0, "output": 10.0,
-               "cache": {"read": 0.2, "write": 2.5}}]},
 ]
 
 
 @unittest.skipUnless(shutil.which("git"), "git is required")
 class UsageTestCase(VerificationTestCase):
     """A project whose fake OpenCode reports usage and pricing."""
-
-    def setUp(self):
-        super().setUp()
-        # The test-writer stage gets its own named model, so its usage rows
-        # and pricing are as uniform as the other stages'.
-        result = self.run_josi("init", "--test-writer-model", "tests/model")
-        self.assertEqual(result.returncode, 0, result.stderr)
 
     def set_pricing(self, models=None):
         self.env["JOSI_FAKE_MODEL_LIST"] = json.dumps(
@@ -146,7 +135,7 @@ class UsageCaptureTests(UsageTestCase):
 
         rows = self.usage_rows()
         self.assertEqual(
-            [row.stage for row in rows], ["test_writer", "worker", "review"]
+            [row.stage for row in rows], ["worker", "review"]
         )
         for row in rows:
             self.assertEqual(row.task_id, 1)
@@ -201,7 +190,7 @@ class UsageCaptureTests(UsageTestCase):
 
         rows = self.usage_rows()
         self.assertEqual(
-            [row.stage for row in rows], ["test_writer", "worker", "review"]
+            [row.stage for row in rows], ["worker", "review"]
         )
         for row in rows:
             self.assertEqual(row.usage_status, "unavailable")
@@ -214,7 +203,7 @@ class UsageCaptureTests(UsageTestCase):
             self.worker_logs()[-1].read_text(encoding="utf-8"),
         )
         totals = self.usage_totals()
-        self.assertEqual(totals["count"], 3)
+        self.assertEqual(totals["count"], 2)
         self.assertIsNone(totals["total"])
         self.assertFalse(totals["complete"])
 
@@ -228,11 +217,10 @@ class UsageCaptureTests(UsageTestCase):
             {"decision": "approved", "findings": []},
         ])
         self.env["JOSI_FAKE_REVIEW_COUNT_FILE"] = str(self.base / "review-count")
-        # One lookup per invocation: test writer, worker 1, review 1,
+        # One lookup per invocation: worker 1, review 1,
         # worker 2, review 2. Every session is fresh, so each value is that
         # invocation's own usage.
         self.set_session_sequence([
-            {"cost": 0.005, "tokens": token_counts(500)},
             {"cost": 0.01, "tokens": token_counts(1000)},
             {"cost": 0.02, "tokens": token_counts(2000)},
             {"cost": 0.03, "tokens": token_counts(3000)},
@@ -246,16 +234,16 @@ class UsageCaptureTests(UsageTestCase):
         self.assertEqual(
             [(row.stage, row.attempt) for row in rows],
             [
-                ("test_writer", 1), ("worker", 1), ("review", 1),
+                ("worker", 1), ("review", 1),
                 ("worker", 2), ("review", 2),
             ],
         )
         self.assertEqual(
             [row.input_tokens for row in rows],
-            [500, 1000, 2000, 3000, 4000],
+            [1000, 2000, 3000, 4000],
         )
         totals = self.usage_totals()
-        self.assertAlmostEqual(totals["total"], 0.105)
+        self.assertAlmostEqual(totals["total"], 0.10)
         self.assertTrue(totals["complete"])
 
     def test_review_format_retry_is_attributed_separately(self):
@@ -268,7 +256,6 @@ class UsageCaptureTests(UsageTestCase):
         # The reviewer session is reused for the retry, so its cumulative
         # totals grow: the second lookup's difference is the retry's usage.
         self.set_session_sequence([
-            {"cost": 0.005, "tokens": token_counts(500)},
             {"cost": 0.01, "tokens": token_counts(1000)},
             {"cost": 0.02, "tokens": token_counts(2000)},
             {"cost": 0.05, "tokens": token_counts(5000)},
@@ -281,61 +268,20 @@ class UsageCaptureTests(UsageTestCase):
         rows = self.usage_rows()
         self.assertEqual(
             [row.stage for row in rows],
-            ["test_writer", "worker", "review", "review_format_retry"],
+            ["worker", "review", "review_format_retry"],
         )
         # The retry's tokens are the difference between the two cumulative
         # reviewer lookups (5000 - 2000), not the raw second value.
         self.assertEqual(
-            [row.input_tokens for row in rows], [500, 1000, 2000, 3000]
+            [row.input_tokens for row in rows], [1000, 2000, 3000]
         )
-        self.assertAlmostEqual(rows[2].cost_total, 0.02)
-        self.assertAlmostEqual(rows[3].cost_total, 0.03)
+        self.assertAlmostEqual(rows[1].cost_total, 0.02)
+        self.assertAlmostEqual(rows[2].cost_total, 0.03)
 
         log = self.review_logs()[-1].read_text(encoding="utf-8")
         self.assertIn("format_retry: 1 of 1", log)
         self.assertEqual(log.count("usage: input="), 2)
 
-    def test_test_writer_format_retry_is_attributed_separately(self):
-        self.set_pricing()
-        decision = {"decision": "tests_written", "summary": "added"}
-        self.env["JOSI_FAKE_TESTS_SEQUENCE"] = json.dumps([
-            {"behavior": "commit",
-             "message": "Tests pass.\n\n" + json.dumps(decision)},
-            {"message": json.dumps(decision)},
-        ])
-        self.env["JOSI_FAKE_TESTS_COUNT_FILE"] = str(self.base / "tests-count")
-        # The test-writer session is reused for the retry, so its cumulative
-        # totals grow: the second lookup's difference is the retry's usage.
-        self.set_session_sequence([
-            {"cost": 0.005, "tokens": token_counts(500)},
-            {"cost": 0.01, "tokens": token_counts(1000)},
-            {"cost": 0.02, "tokens": token_counts(2000)},
-            {"cost": 0.05, "tokens": token_counts(5000)},
-        ])
-        self.make_task()
-        result = self.run_task("t1")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(
-            "Test writer output format invalid; retrying once", result.stdout
-        )
-
-        rows = self.usage_rows()
-        self.assertEqual(
-            [row.stage for row in rows],
-            ["test_writer", "test_writer_format_retry", "worker", "review"],
-        )
-        # The retry's tokens are the difference between the two cumulative
-        # test-writer lookups (1000 - 500); the worker and review sessions are
-        # fresh, so their lookups already are their own usage.
-        self.assertEqual(
-            [row.input_tokens for row in rows], [500, 500, 2000, 5000]
-        )
-        self.assertAlmostEqual(rows[0].cost_total, 0.005)
-        self.assertAlmostEqual(rows[1].cost_total, 0.005)
-
-        log = self.generation_logs()[-1].read_text(encoding="utf-8")
-        self.assertIn("format_retry: 1 of 1", log)
-        self.assertEqual(log.count("usage: input="), 2)
 
 
 class UsagePersistenceTests(UsageTestCase):
@@ -374,14 +320,54 @@ class UsagePersistenceTests(UsageTestCase):
         conn = tasks.connect(self.repo / ".josi" / "tasks.db")
         try:
             run_rows = tasks.run_usage(conn, 1)
-            self.assertEqual(len(run_rows), 3)
+            self.assertEqual(len(run_rows), 2)
             self.assertEqual(
                 [row.stage for row in run_rows],
-                ["test_writer", "worker", "review"],
+                ["worker", "review"],
             )
             self.assertEqual(tasks.run_usage(conn, 99), [])
         finally:
             conn.close()
+
+
+class HistoricalUsageTests(UsageTestCase):
+    def test_historical_test_writer_stages_survive_execution_and_count_in_totals(self):
+        self.make_task()
+        conn = tasks.connect(self.repo / ".josi/tasks.db")
+        try:
+            tasks.create_run(conn, "main", self.base_sha, [1])
+            for stage, cost, tokens in (("test_writer", 0.03, 300),
+                                        ("test_writer_format_retry", 0.01, 100)):
+                tasks.record_usage(conn, 1, 1, stage, 1, "old/writer", "old-session",
+                    usage.Usage(available=True, input_tokens=tokens, output_tokens=10,
+                                cost_total=cost, cost_input=cost / 2,
+                                cost_output=cost / 2, cost_source="reported"))
+        finally:
+            conn.close()
+        historical = self.usage_rows()
+        # A separate CLI invocation must open the old database and display
+        # both stage costs, even before any new worker executes.
+        for args in (("task", "show", "t1"), ("run", "show", "r1")):
+            shown = self.run_josi(*args)
+            self.assertEqual(shown.returncode, 0, shown.stderr)
+            self.assert_cost_summary(shown.stdout, historical, "complete")
+            self.assertEqual(self.cost_field(shown.stdout, "cost_total"), "0.040000")
+        self.set_pricing()
+        self.set_session_usage(0.02, token_counts(2000))
+        result = self.run_task("t1")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        records = self.usage_rows()
+        self.assertEqual(records[:2], historical)
+        self.assertEqual([r.stage for r in records], [
+            "test_writer", "test_writer_format_retry", "worker", "review",
+        ])
+        self.assertEqual([r.input_tokens for r in records], [300, 100, 2000, 2000])
+        self.assertEqual(self.run_usage_rows(), records)
+        self.assertAlmostEqual(self.usage_totals()["total"], 0.08)
+        for args in (("task", "show", "t1"), ("run", "show", "r1")):
+            shown = self.run_josi(*args)
+            self.assertEqual(shown.returncode, 0, shown.stderr)
+            self.assert_cost_summary(shown.stdout, records, "complete")
 
 
 class UsageSummaryTests(UsageTestCase):
@@ -398,7 +384,6 @@ class UsageSummaryTests(UsageTestCase):
         ])
         self.env["JOSI_FAKE_REVIEW_COUNT_FILE"] = str(self.base / "review-count")
         self.set_session_sequence([
-            {"cost": 0.005, "tokens": token_counts(500, output=50)},
             {"cost": 0.01, "tokens": token_counts(1000, output=100)},
             {"cost": 0.02, "tokens": token_counts(2000, output=200)},
             {"cost": 0.03, "tokens": token_counts(3000, output=300)},
@@ -409,7 +394,7 @@ class UsageSummaryTests(UsageTestCase):
 
         records = self.usage_rows()
         self.assertEqual([row.stage for row in records], [
-            "test_writer", "worker", "review", "worker", "review",
+            "worker", "review", "worker", "review",
         ])
         shown = self.run_josi("task", "show", "t1")
         self.assertEqual(shown.returncode, 0, shown.stderr)
@@ -417,7 +402,7 @@ class UsageSummaryTests(UsageTestCase):
         # The task totals are the sum of every attempt, and no per-invocation
         # token count leaks into the summary.
         self.assertAlmostEqual(
-            float(self.cost_field(shown.stdout, "cost_total")), 0.105
+            float(self.cost_field(shown.stdout, "cost_total")), 0.10
         )
         self.assert_no_usage_on_terminal(shown)
 
@@ -432,15 +417,14 @@ class UsageSummaryTests(UsageTestCase):
         self.assertEqual(self.run_task("t1").returncode, 0)
 
         records = self.usage_rows()
-        # The first invocation ran the test writer and a failing worker; the
-        # second ran the worker and the review, with the completed
-        # test-generation stage skipped.
-        self.assertEqual(len(records), 4, "both invocations keep their usage")
+        # The first invocation ran a failing worker; the second ran the
+        # worker and review.
+        self.assertEqual(len(records), 3, "both invocations keep their usage")
         shown = self.run_josi("task", "show", "t1")
         self.assertEqual(shown.returncode, 0, shown.stderr)
         self.assert_cost_summary(shown.stdout, records, "complete")
         self.assertAlmostEqual(
-            float(self.cost_field(shown.stdout, "cost_total")), 0.06
+            float(self.cost_field(shown.stdout, "cost_total")), 0.05
         )
         self.assert_no_usage_on_terminal(shown)
 
@@ -474,13 +458,13 @@ class UsageSummaryTests(UsageTestCase):
         self.assertEqual(first.returncode, 0, first.stderr)
         self.assert_cost_summary(first.stdout, first_rows, "complete")
         self.assertAlmostEqual(
-            float(self.cost_field(first.stdout, "cost_total")), 0.03
+            float(self.cost_field(first.stdout, "cost_total")), 0.02
         )
         second = self.run_josi("run", "show", "r2")
         self.assertEqual(second.returncode, 0, second.stderr)
         self.assert_cost_summary(second.stdout, second_rows, "complete")
         self.assertAlmostEqual(
-            float(self.cost_field(second.stdout, "cost_total")), 0.21
+            float(self.cost_field(second.stdout, "cost_total")), 0.14
         )
 
     def test_show_with_no_recorded_usage_is_not_a_confirmed_zero(self):
@@ -538,7 +522,7 @@ class UsageSummaryTests(UsageTestCase):
         shown = self.run_josi("task", "show", "t1")
         self.assertEqual(shown.returncode, 0, shown.stderr)
         self.assertEqual(
-            self.cost_field(shown.stdout, "cost_total"), "0.060000"
+            self.cost_field(shown.stdout, "cost_total"), "0.040000"
         )
         self.assertEqual(
             self.cost_field(shown.stdout, "cost_input"), "unavailable"

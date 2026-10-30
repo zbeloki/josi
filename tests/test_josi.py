@@ -39,6 +39,8 @@ Behaviour is controlled through environment variables:
 * ``JOSI_FAKE_SWITCH_EXIT`` - non-zero to make agent switching fail
 * ``JOSI_FAKE_TUI_EXIT``    - exit code for the interactive TUI invocation
 * ``JOSI_FAKE_RUN``         - worker behaviour on ``run``: commit (default),
+                              commit-tests (implementation and runnable tests),
+                              failing-tests (implementation and a failing assertion),
                               dirty (leave an uncommitted file), none, empty
                               (make an empty commit), detach (leave the
                               worktree on a detached HEAD), commit-index
@@ -84,25 +86,6 @@ Behaviour is controlled through environment variables:
                               ``commit`` (replace a tracked file and commit),
                               ``dirty`` (modify a tracked file), or
                               ``untracked`` (write a scratch file)
-* ``JOSI_FAKE_TESTS``       - test-writer behaviour on ``opencode run
-                              --format json`` with the build agent: none
-                              (default; change nothing and decide that no
-                              tests are needed), commit (commit a new
-                              ``test-output.txt``), dirty (leave an
-                              uncommitted file), untracked (leave an
-                              untracked file), or empty (make an empty
-                              commit)
-* ``JOSI_FAKE_TESTS_JSON``  - the final test-writer message (defaults to a
-                              ``no_tests_needed`` decision)
-* ``JOSI_FAKE_TESTS_EXIT``  - exit code for the test-writer invocation
-* ``JOSI_FAKE_TESTS_SEQUENCE`` - JSON list of per-invocation test-writer
-                              behaviours (a string behaviour or an object
-                              with optional ``behavior``, ``exit``, and
-                              ``message`` members) selected with
-                              ``JOSI_FAKE_TESTS_COUNT_FILE``; entries past
-                              the end fall back to ``JOSI_FAKE_TESTS``
-* ``JOSI_FAKE_TESTS_COUNT_FILE`` - file counting test-writer invocations;
-                              used with ``JOSI_FAKE_TESTS_SEQUENCE``
 * ``JOSI_FAKE_SESSION_USAGE`` - JSON object with the cumulative ``cost`` and
                               ``tokens`` reported by every session lookup
 * ``JOSI_FAKE_SESSION_USAGE_SEQUENCE`` - JSON list of per-lookup cumulative
@@ -211,67 +194,6 @@ def _worker_plan():
     return behavior, exit_code, wait_for, index
 
 
-def _tests_plan():
-    """Return ``(behavior, exit_code, message)`` for this test-writer turn.
-
-    ``message`` is the final message to print, or None to fall back to
-    ``JOSI_FAKE_TESTS_JSON``.
-    """
-    behavior = os.environ.get("JOSI_FAKE_TESTS", "none")
-    exit_code = int(os.environ.get("JOSI_FAKE_TESTS_EXIT", "0"))
-    message = None
-    index = _next_index(os.environ.get("JOSI_FAKE_TESTS_COUNT_FILE"))
-    item = _sequence_item("JOSI_FAKE_TESTS_SEQUENCE", index)
-    if isinstance(item, dict):
-        behavior = item.get("behavior", behavior)
-        exit_code = int(item.get("exit", exit_code))
-        message = item.get("message", message)
-    elif isinstance(item, str):
-        behavior = item
-    return behavior, exit_code, message
-
-
-def _run_test_writer():
-    """Emulate one noninteractive test-writer turn in the current directory."""
-    behavior, exit_code, message = _tests_plan()
-    if behavior == "commit":
-        with open("test-output.txt", "a", encoding="utf-8") as handle:
-            handle.write("test change\\n")
-        subprocess.run(["git", "add", "test-output.txt"], check=True)
-        subprocess.run(
-            ["git", "-c", "user.name=Fake Test Writer",
-             "-c", "user.email=test-writer@example.invalid",
-             "commit", "-m", "test writer: add tests"],
-            check=True, capture_output=True,
-        )
-    elif behavior == "dirty":
-        with open("test-output.txt", "a", encoding="utf-8") as handle:
-            handle.write("uncommitted tests\\n")
-    elif behavior == "untracked":
-        with open("test-scratch.txt", "w", encoding="utf-8") as handle:
-            handle.write("test scratch\\n")
-    elif behavior == "empty":
-        subprocess.run(
-            ["git", "-c", "user.name=Fake Test Writer",
-             "-c", "user.email=test-writer@example.invalid",
-             "commit", "--allow-empty", "-m", "test writer: empty commit"],
-            check=True, capture_output=True,
-        )
-    print(json.dumps({"type": "step_start",
-                      "part": {"type": "step-start"}}))
-    if message is None:
-        message = os.environ.get(
-            "JOSI_FAKE_TESTS_JSON",
-            '{"decision":"no_tests_needed","reason":"no tests required"}',
-        )
-    print(json.dumps({
-        "type": "text",
-        "part": {"type": "text", "messageID": "msg_fake_tests",
-                 "text": message},
-    }))
-    return exit_code
-
-
 def _run_reviewer():
     """Emulate one noninteractive reviewer turn with --format json output."""
     marker = os.environ.get("JOSI_FAKE_REVIEW_MARKER")
@@ -339,6 +261,30 @@ def _run_worker():
             ["git", "-c", "user.name=Fake Worker",
              "-c", "user.email=worker@example.invalid",
              "commit", "-m", "worker: implement task"],
+            check=True, capture_output=True,
+        )
+    elif behavior in ("commit-tests", "failing-tests", "extend-tests"):
+        with open("feature.py", "w", encoding="utf-8") as handle:
+            handle.write("def answer():\\n    return 42\\n")
+        expected = 41 if behavior == "failing-tests" else 42
+        with open("test_feature.py", "w", encoding="utf-8") as handle:
+            handle.write(
+                "import unittest\\nfrom feature import answer\\n\\n"
+                "class FeatureTests(unittest.TestCase):\\n"
+                "    def test_answer(self):\\n"
+                "        self.assertEqual(answer(), " + str(expected) + ")\\n"
+            )
+        if behavior == "extend-tests":
+            with open("test_feature.py", "a", encoding="utf-8") as handle:
+                handle.write(
+                    "    def test_answer_type(self):\\n"
+                    "        self.assertIsInstance(answer(), int)\\n"
+                )
+        subprocess.run(["git", "add", "feature.py", "test_feature.py"], check=True)
+        subprocess.run(
+            ["git", "-c", "user.name=Fake Worker",
+             "-c", "user.email=worker@example.invalid",
+             "commit", "-m", "worker: implement and test task"],
             check=True, capture_output=True,
         )
     elif behavior == "commit-index":
@@ -457,10 +403,9 @@ def main():
     if argv and argv[0] == "run":
         if "--agent" in argv and argv[argv.index("--agent") + 1] == "plan":
             return _run_reviewer()
-        # The test writer is the noninteractive turn that answers with a
-        # JSON decision while using the worker (build) agent.
-        if "--format" in argv:
-            return _run_test_writer()
+        if argv[-1].startswith("Write the tests for this task"):
+            print("unexpected removed test-writer stage", file=sys.stderr)
+            return 97
         return _run_worker()
 
     # Anything after the api and run handling is treated as the interactive
@@ -861,69 +806,37 @@ class InitTests(JosiTestCase):
             model_setting(metadata["escalation_worker_model"]), "openrouter/anthropic/claude-sonnet-5.5#medium"
         )
 
-    def test_init_stores_default_test_writer_model(self):
+    def test_init_exposes_only_execution_models(self):
         self.init_git()
         result = self.run_josi("init")
         self.assertEqual(result.returncode, 0, result.stderr)
-
         metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
         self.assertEqual(
-            model_setting(metadata["test_writer_model"]),
-            "openrouter/z-ai/glm-5.3#high",
+            {key for key in metadata if key.endswith("_model")},
+            {"worker_model", "reviewer_model", "escalation_worker_model"},
         )
-        self.assertIn(
-            "Test writer model: openrouter/z-ai/glm-5.3#high",
-            result.stdout,
-        )
+        self.assertNotIn("test writer", result.stdout.lower())
+        self.assertNotIn("test-writer", result.stdout.lower())
 
-    def test_reinit_fills_missing_test_writer_model(self):
-        self.initialize()
-        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
-        del metadata["test_writer_model"]
-        self.metadata_path().write_text(
-            json.dumps(metadata, indent=2) + "\n", encoding="utf-8"
-        )
-        result = self.run_josi("init")
+    def test_init_help_and_parser_remove_test_writer_option(self):
+        result = self.run_josi("init", "--help")
         self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn(
-            "Updated the test writer model to"
-            " openrouter/z-ai/glm-5.3#high",
-            result.stdout,
-        )
-        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
-        self.assertEqual(
-            model_setting(metadata["test_writer_model"]),
-            "openrouter/z-ai/glm-5.3#high",
-        )
-
-    def test_reinit_explicit_test_writer_model_updates_only_that_role(self):
-        self.initialize()
+        self.assertNotIn("--test-writer-model", result.stdout)
+        self.init_git()
         result = self.run_josi("init", "--test-writer-model", "provider/tests")
-        self.assertEqual(result.returncode, 0, result.stderr)
-        self.assertIn("Updated the test writer model to provider/tests", result.stdout)
-
-        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
-        self.assertEqual(model_setting(metadata["test_writer_model"]), "provider/tests")
-        self.assertEqual(
-            model_setting(metadata["worker_model"]), "openrouter/deepseek/deepseek-v4.1-flash#low"
-        )
-        self.assertEqual(
-            model_setting(metadata["reviewer_model"]), "openrouter/openai/gpt-6-luna#high"
-        )
-
-    def test_init_invalid_test_writer_model_is_rejected(self):
-        self.init_git()
-        for value in ("", "model", "provider/", "/model", "two words/model"):
-            with self.subTest(value=value):
-                result = self.run_josi("init", "--test-writer-model", value)
-                self.assertNotEqual(result.returncode, 0)
-                self.assertIn("invalid test writer model", result.stderr)
-        # A leading dash would be read as an option; with the "=" form it
-        # reaches josi and is rejected as invalid.
-        result = self.run_josi("init", "--test-writer-model=-flag/model")
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("invalid test writer model", result.stderr)
-        self.assertFalse((self.repo / ".josi").exists())
+        self.assertIn("unrecognized arguments", result.stderr)
+        self.assertFalse(self.metadata_path().exists())
+
+    def test_reinit_does_not_add_an_obsolete_model(self):
+        self.initialize()
+        metadata = json.loads(self.metadata_path().read_text(encoding="utf-8"))
+        metadata.pop("test_writer_model", None)
+        self.metadata_path().write_text(json.dumps(metadata), encoding="utf-8")
+        result = self.run_josi("init")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(json.loads(self.metadata_path().read_text()), metadata)
+        self.assertNotIn("test writer", result.stdout.lower())
 
     def test_init_adds_no_validation_commands(self):
         # Validation commands are the project's own configuration: init
@@ -940,7 +853,6 @@ class InitTests(JosiTestCase):
                 "schema_version", "name", "created_at", "base_branch",
                 "agent",
                 "worker_model", "reviewer_model", "escalation_worker_model",
-                "test_writer_model",
             },
         )
 

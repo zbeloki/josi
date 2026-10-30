@@ -17,10 +17,6 @@ FAKE_CODEX = FAKE_CLAUDE.replace('interactive = "-p" not in argv', 'interactive 
     'session = argv[argv.index("--session-id") + 1] if "--session-id" in argv \\\n        else argv[argv.index("--resume") + 1]',
     'session = argv[argv.index("resume") + 1] if "resume" in argv else __import__("uuid").uuid4().hex'
 )
-FAKE_CODEX = FAKE_CODEX.replace(
-    'elif prompt.startswith("Write the tests for this task"):',
-    'elif prompt.startswith("Write the tests for this task") or ("resume" in argv and "read-only" not in argv):',
-)
 start = FAKE_CODEX.index('    print(json.dumps({"type": "system"')
 end = FAKE_CODEX.index('    return int(', start)
 FAKE_CODEX = FAKE_CODEX[:start] + '''    if not os.environ.get("JOSI_FAKE_NO_THREAD"):
@@ -34,8 +30,6 @@ FAKE_CODEX = FAKE_CODEX[:start] + '''    if not os.environ.get("JOSI_FAKE_NO_THR
         return 0
     if os.environ.get("JOSI_FAKE_TAMPER") and "read-only" in argv:
         open("README.md", "w").write("changed")
-    if prompt.startswith("Write the tests for this task") or ("resume" in argv and "read-only" not in argv):
-        text = os.environ.get("JOSI_FAKE_TEST_JSON", text)
     print(json.dumps({"type":"item.completed", "item":{
         "type":"agent_message", "text":text}}))
     print(json.dumps({"type":"turn.completed", "usage":{
@@ -56,6 +50,10 @@ class CodexInitTests(CodexTestCase):
         self.commit_base()
         result = self.run_josi("init", "--agent", "codex")
         self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertEqual(set(agents.MODEL_KEYS), {
+            "worker_model", "reviewer_model", "escalation_worker_model",
+        })
+        self.assertNotIn("test_writer_model", self.metadata())
         for key in agents.MODEL_KEYS:
             name, effort = agents.DEFAULT_MODELS["codex"][key]
             self.assertEqual(self.metadata()[key], {"model":name, "effort":effort})
@@ -97,14 +95,13 @@ class CodexRunTests(CodexTestCase):
     def test_all_roles_and_usage(self):
         result = self.run_josi("task", "run", "t1")
         self.assertEqual(result.returncode, 0, result.stdout + result.stderr)
-        tests, worker, reviewer = self.calls()
-        for call in (tests, worker, reviewer):
+        worker, reviewer = self.calls()
+        for call in (worker, reviewer):
             self.assertEqual(call["argv"][:2], ["exec", "--json"])
             self.assertTrue(call["stdin"])
             self.assertEqual(call["argv"][-1], "-")
             self.assertEqual(self.flag(call, "--model"), "gpt-6.1-sol")
-        for call in (tests, worker):
-            self.assertIn("--dangerously-bypass-approvals-and-sandbox", call["argv"])
+        self.assertIn("--dangerously-bypass-approvals-and-sandbox", worker["argv"])
         self.assertIn('model_reasoning_effort="low"', worker["argv"])
         self.assertEqual(worker["cwd"], str(self.repo / ".josi/worktrees/t1"))
         self.assertEqual(self.flag(reviewer, "--sandbox"), "read-only")
@@ -118,6 +115,7 @@ class CodexRunTests(CodexTestCase):
         self.env["JOSI_FAKE_CLAUDE_REVIEW_JSON"] = "invalid"
         result = self.run_josi("task", "run", "t1")
         self.assertNotEqual(result.returncode, 0)
+        self.assertEqual(len(self.calls()), 3)
         first, retry = self.calls()[-2:]
         self.assertNotIn("resume", first["argv"])
         self.assertIn("resume", retry["argv"])
@@ -126,21 +124,13 @@ class CodexRunTests(CodexTestCase):
         self.assertIn("codex_thread: " + thread, logs)
         self.assertEqual(first["argv"][:-1], retry["argv"][:-3])
 
-    def test_test_writer_format_retry(self):
-        self.env["JOSI_FAKE_TEST_JSON"] = "invalid"
-        self.assertNotEqual(self.run_josi("task", "run", "t1").returncode, 0)
-        first, retry = self.calls()
-        self.assertIn("resume", retry["argv"])
-        self.assertIn("--dangerously-bypass-approvals-and-sandbox", retry["argv"])
-        self.assertEqual(self.git("rev-parse", "josi/t1").stdout, self.git("rev-parse", "main").stdout)
-
     def test_missing_thread_cannot_resume(self):
         self.env["JOSI_FAKE_NO_THREAD"] = "1"
         self.env["JOSI_FAKE_CLAUDE_REVIEW_JSON"] = "invalid"
         result = self.run_josi("task", "run", "t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("no thread.started", result.stdout + result.stderr)
-        self.assertEqual(len(self.calls()), 3)
+        self.assertEqual(len(self.calls()), 2)
 
     def test_escalation(self):
         self.env["JOSI_FAKE_CLAUDE_REVIEW_JSON"] = json.dumps({"decision":"changes_requested", "findings":[{"severity":"major", "description":"Broken", "scenario":"Normal usage", "impact":"Fails", "location":"worker-output.txt"}]})
@@ -163,7 +153,7 @@ class CodexRunTests(CodexTestCase):
         result = self.run_josi("task", "run", "t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertEqual(len(self.calls()), 1)
-        self.assertIn("no text output", result.stdout + result.stderr)
+        self.assertIn("incomplete event stream", result.stdout + result.stderr)
 
     def test_incomplete_worker_cannot_succeed_after_committing(self):
         self.env["JOSI_FAKE_EVENTS"] = "broken"
@@ -171,7 +161,7 @@ class CodexRunTests(CodexTestCase):
         result = self.run_josi("task", "run", "t1")
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("incomplete event stream", result.stdout + result.stderr)
-        self.assertEqual(len(self.calls()), 2)
+        self.assertEqual(len(self.calls()), 1)
 
     def test_failed_event_with_zero_exit_status(self):
         self.env["JOSI_FAKE_EVENTS"] = '{"type":"turn.failed","error":{"message":"offline"}}'

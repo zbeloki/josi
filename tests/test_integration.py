@@ -1067,6 +1067,108 @@ class PartialIntegrationTests(IntegrationTestCase):
         finally:
             conn.close()
 
+    def test_reset_first_partial_merge_then_fresh_run(self):
+        from josi import execution
+
+        self.create("Successful work")
+        self.create("Interrupted work")
+        self.create("Unstarted dependent", "--depends-on", "t1")
+        marker = self.base / "worker.pid"
+        release = self.base / "worker.release"
+        count = self.base / "worker.count"
+        self.addCleanup(self.kill_pid, marker)
+        self.env["JOSI_FAKE_RUN_MARKER"] = str(marker)
+        self.env["JOSI_FAKE_RUN_COUNT_FILE"] = str(count)
+        self.env["JOSI_FAKE_RUN_SEQUENCE"] = json.dumps([
+            "commit", "commit", {"wait_for": str(release)},
+        ])
+        self.env["JOSI_FAKE_REVIEW_COUNT_FILE"] = str(self.base / "review.count")
+        self.env["JOSI_FAKE_REVIEW_SEQUENCE"] = json.dumps([
+            {"decision": "approved", "findings": []}, MAJOR,
+        ])
+        parent = subprocess.Popen(
+            [sys.executable, "-m", "josi", "task", "run", "--all"],
+            cwd=str(self.repo), env=self.env,
+            stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+        )
+        try:
+            deadline = time.time() + 30
+            while time.time() < deadline:
+                if len(self.worker_calls()) == 3 and self.task_status("t2") == "RUNNING":
+                    break
+                time.sleep(0.05)
+            else:
+                self.fail("the second task never started")
+            parent.kill()
+            parent.communicate(timeout=30)
+        finally:
+            if parent.poll() is None:
+                parent.kill()
+                parent.communicate(timeout=30)
+            release.write_text("go", encoding="utf-8")
+        self.assertTrue(self.wait_for_lock_release())
+        self.assertEqual(self.worker_cwds(), ["t1", "t2", "t2"])
+        self.assertEqual(self.task_status("t1"), "STAGED")
+        self.assertEqual(self.task_status("t2"), "RUNNING")
+        self.assertEqual(self.task_status("t3"), "PENDING")
+        old_tip = self.rev("josi/t2")
+        staged_tip = self.rev("josi/run/r1")
+        self.assertNotEqual(old_tip, staged_tip)
+        josi_dir = self.repo / ".josi"
+        self.assertEqual(execution.attempt_state(josi_dir, 2)[0], 1)
+        self.assertTrue(execution.attempt_state(josi_dir, 2)[1])
+
+        refused = self.partial()
+        self.assertNotEqual(refused.returncode, 0)
+        self.assertIn("t2 (RUNNING)", refused.stderr)
+        self.assertIn("josi task reset", refused.stderr)
+        self.assertEqual(self.rev("main"), self.base_sha)
+        self.assertEqual(self.run_status(), "RUNNING")
+
+        # User-equivalent intervention only in this disposable repository.
+        reset = self.run_josi("task", "reset", "t2")
+        self.assertEqual(reset.returncode, 0, reset.stderr)
+        self.assertEqual(self.task_status("t2"), "PENDING")
+        self.assertIsNone(execution.attempt_state(josi_dir, 2))
+        self.assertFalse(self.worktree("t2").exists())
+        self.assertNotEqual(self.git("show-ref", "--verify", "refs/heads/josi/t2",
+                                     check=False).returncode, 0)
+        merged = self.partial()
+        self.assertEqual(merged.returncode, 0, merged.stderr)
+        self.assertEqual(self.rev("main"), staged_tip)
+        self.assertEqual(self.task_status("t1"), "DONE")
+        for task_id in ("t2", "t3"):
+            self.assertEqual(self.task_status(task_id), "PENDING")
+        old_run = self.run_show()
+        self.assertEqual(old_run["status"], "INTEGRATED")
+        self.assertEqual(old_run["partially_integrated"], "true")
+
+        result = self.run_task("--all")
+        self.assertEqual(result.returncode, 0, result.stderr)
+        self.assertIn("Created run r2", result.stdout)
+        self.assertEqual(self.run_status("r2"), "COMPLETE")
+        self.assertEqual(self.worker_cwds(), ["t1", "t2", "t2", "t2", "t3"])
+        self.assertEqual(execution.attempt_state(josi_dir, 2), (1, ""))
+        self.assertEqual(self.rev("josi/t2~1"), staged_tip)
+        self.assertNotEqual(self.git("merge-base", "--is-ancestor", old_tip,
+                                     "josi/t2", check=False).returncode, 0)
+        self.assertEqual(self.task_status("t1"), "DONE")
+        for task_id in ("t2", "t3"):
+            self.assertEqual(self.task_status(task_id), "STAGED")
+        self.assertEqual(self.rev("josi/run/r1"), staged_tip)
+        shown = self.run_show()
+        for field in ("status", "partially_integrated", "final_commit"):
+            self.assertEqual(shown[field], old_run[field])
+        conn = tasks.connect(josi_dir / "tasks.db")
+        try:
+            self.assertEqual([task.id for task in tasks.selected_tasks(conn, 1)], [1, 2, 3])
+            self.assertEqual([task.id for task in tasks.selected_tasks(conn, 2)], [2, 3])
+            old = tasks.get_run(conn, 1)
+            self.assertEqual(old.expected_commit, staged_tip)
+            self.assertEqual(old.final_commit, staged_tip)
+        finally:
+            conn.close()
+
     def test_all_unsafe_selected_statuses_require_explicit_reset(self):
         self.interrupted_run()
         before = self.git("rev-parse", "main").stdout

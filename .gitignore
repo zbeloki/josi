@@ -9,3 +9,5 @@ dist/
 .josi/
 /venv/
 /.opencode/
+/.codex
+/josi.json
